@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+
+# Build and Distribution
+build/
+dist/
+installer_output/
+*.spec.bak
+
+# Database and sessions
+*.db
+*.sqlite3
+app_data.db
+sessions/
+app_media/
+
+# Logs and temp files
+*.log
+test_out.txt
+.pytest_cache/
+.coverage
+htmlcov/
+
+# OS generated
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store
