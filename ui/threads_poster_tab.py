@@ -173,6 +173,25 @@ class ThreadsPosterTab(QWidget):
         self.combo_accounts.setMinimumHeight(32)
         row_acc.addWidget(self.combo_accounts, stretch=1)
 
+        btn_quick_login = QPushButton("➕ Đăng Nhập TK")
+        btn_quick_login.setCursor(Qt.PointingHandCursor)
+        btn_quick_login.setToolTip("Mở trình duyệt để đăng nhập tài khoản Threads mới")
+        btn_quick_login.setStyleSheet("""
+            QPushButton {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #6366f1, stop:1 #8b5cf6);
+                color: #ffffff;
+                font-weight: bold;
+                border-radius: 6px;
+                padding: 6px 12px;
+                font-size: 11px;
+            }
+            QPushButton:hover {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #4f46e5, stop:1 #7c3aed);
+            }
+        """)
+        btn_quick_login.clicked.connect(self.on_quick_login_clicked)
+        row_acc.addWidget(btn_quick_login)
+
         row_acc.addSpacing(25)
         
         lbl_mode = QLabel("Chế Độ Thực Thi:")
@@ -666,18 +685,27 @@ class ThreadsPosterTab(QWidget):
         main_splitter.setSizes([460, 240])
         layout.addWidget(main_splitter)
 
+    def on_quick_login_clicked(self):
+        parent_win = self.window()
+        if hasattr(parent_win, 'threads_tabs'):
+            parent_win.threads_tabs.setCurrentIndex(0)
+            if hasattr(parent_win, 'threads_account_tab'):
+                parent_win.threads_account_tab.on_browser_login()
+
     def load_accounts(self):
         accounts = self.db.get_threads_accounts()
         cur_uid = self.combo_accounts.currentData()
         self.combo_accounts.blockSignals(True)
         self.combo_accounts.clear()
-        target_idx = 0
-        for i, a in enumerate(accounts):
-            name_str = a.get("name") or a.get("username") or f"UID: {a.get('uid')}"
-            self.combo_accounts.addItem(f"{name_str} ({a['uid']})", a["uid"])
-            if cur_uid and a["uid"] == cur_uid:
-                target_idx = i
-        if accounts:
+        if not accounts:
+            self.combo_accounts.addItem("⚠️ Chưa có tài khoản Threads (Bấm '➕ Đăng Nhập TK')", None)
+        else:
+            target_idx = 0
+            for i, a in enumerate(accounts):
+                name_str = a.get("name") or a.get("username") or f"UID: {a.get('uid')}"
+                self.combo_accounts.addItem(f"{name_str} ({a['uid']})", a["uid"])
+                if cur_uid and a["uid"] == cur_uid:
+                    target_idx = i
             self.combo_accounts.setCurrentIndex(target_idx)
         self.combo_accounts.blockSignals(False)
 

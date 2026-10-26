@@ -15,6 +15,10 @@ class ThreadsBrowserLoginWorker(QThread):
     def __init__(self, proxy: str = ""):
         super().__init__()
         self.proxy = proxy
+        self.is_cancelled = False
+
+    def cancel(self):
+        self.is_cancelled = True
 
     def run(self):
         try:
@@ -25,7 +29,13 @@ class ThreadsBrowserLoginWorker(QThread):
             def callback(msg):
                 self.progress_signal.emit(msg)
 
-            result = loop.run_until_complete(engine.login_via_browser(self.proxy, progress_callback=callback))
+            result = loop.run_until_complete(
+                engine.login_via_browser(
+                    self.proxy,
+                    progress_callback=callback,
+                    is_cancelled_fn=lambda: self.is_cancelled
+                )
+            )
             loop.close()
             self.finished_signal.emit(result)
         except Exception as e:
@@ -194,17 +204,23 @@ class ThreadsAccountTab(QWidget):
     def on_browser_login(self):
         proxy = self.txt_proxy.text().strip()
 
-        self.progress_dialog = QProgressDialog("Đang chuẩn bị trình duyệt Threads...", "Hủy", 0, 0, self)
-        self.progress_dialog.setWindowModality(Qt.WindowModal)
+        self.progress_dialog = QProgressDialog(
+            "Đang mở trình duyệt Threads...\n(Vui lòng xem cửa sổ trình duyệt trên màn hình hoặc thanh tác vụ Taskbar để đăng nhập)",
+            "Hủy", 0, 0, self
+        )
+        self.progress_dialog.setWindowTitle("Đăng Nhập Threads Trực Tiếp")
+        self.progress_dialog.setWindowModality(Qt.NonModal)
         self.progress_dialog.show()
 
         self.browser_worker = ThreadsBrowserLoginWorker(proxy=proxy)
         self.browser_worker.progress_signal.connect(self.progress_dialog.setLabelText)
         self.browser_worker.finished_signal.connect(self.on_browser_login_finished)
+        self.progress_dialog.canceled.connect(self.browser_worker.cancel)
         self.browser_worker.start()
 
     def on_browser_login_finished(self, result: dict):
-        self.progress_dialog.close()
+        if hasattr(self, 'progress_dialog') and self.progress_dialog:
+            self.progress_dialog.close()
         if result.get("success"):
             uid = result["uid"]
             username = result.get("username", "")
@@ -222,14 +238,17 @@ class ThreadsAccountTab(QWidget):
             self.txt_cookie.clear()
             self.txt_proxy.clear()
         else:
-            QMessageBox.warning(self, "Thông Báo Đăng Nhập", result.get("message", "Đăng nhập Threads chưa hoàn tất."))
+            msg = result.get("message", "Đăng nhập Threads chưa hoàn tất.")
+            if "hủy" not in msg.lower():
+                QMessageBox.warning(self, "Thông Báo Đăng Nhập", msg)
 
     def on_open_browser(self, acc: dict):
         self.progress_dialog = QProgressDialog(
-            f"Trình duyệt Threads đang mở cho tài khoản {acc.get('name', '')}!\nSau khi xong, ĐÓNG CỬA SỔ TRÌNH DUYỆT để lưu phiên...",
+            f"Trình duyệt Threads đang mở cho tài khoản {acc.get('name', '')}!\nSau khi xem xong, ĐÓNG CỬA SỔ TRÌNH DUYỆT để đồng bộ lại phiên...",
             "Đóng", 0, 0, self
         )
-        self.progress_dialog.setWindowModality(Qt.WindowModal)
+        self.progress_dialog.setWindowTitle("Mở Trình Duyệt Threads")
+        self.progress_dialog.setWindowModality(Qt.NonModal)
         self.progress_dialog.show()
 
         self.open_worker = ThreadsOpenBrowserWorker(acc["cookie"], proxy=acc.get("proxy", ""), uid=acc.get("uid", ""))
@@ -238,7 +257,8 @@ class ThreadsAccountTab(QWidget):
         self.open_worker.start()
 
     def on_open_browser_finished(self, res: dict):
-        self.progress_dialog.close()
+        if hasattr(self, 'progress_dialog') and self.progress_dialog:
+            self.progress_dialog.close()
         if res.get("cookie") and res.get("uid"):
             self.db.update_threads_cookie(res["uid"], res["cookie"])
             self.load_accounts()

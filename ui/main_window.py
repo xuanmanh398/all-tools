@@ -470,10 +470,14 @@ class MainWindow(QMainWindow):
 
         self.setCentralWidget(central_widget)
 
-        # Khởi tạo mặc định: Nền tảng Threads, Tab Đăng bài
+        # Khởi tạo mặc định: Nền tảng Threads (Nếu chưa có tài khoản thì chuyển ngay sang tab cấu hình tài khoản)
         self.switch_platform("threads")
-        self.threads_tabs.setCurrentIndex(1)
-        self.set_active_nav("post")
+        if len(self.db.get_threads_accounts()) > 0:
+            self.threads_tabs.setCurrentIndex(1)
+            self.set_active_nav("post")
+        else:
+            self.threads_tabs.setCurrentIndex(0)
+            self.set_active_nav("acc")
         self.update_license_display()
 
         # Định kỳ tự động kiểm tra trạng thái bản quyền trực tuyến mỗi 60 giây

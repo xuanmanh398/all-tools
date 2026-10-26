@@ -97,12 +97,16 @@ class ThreadsAutomationEngine:
         headless: bool = False,
         uid: str = ""
     ) -> tuple[Browser, BrowserContext]:
-        """Khởi tạo trình duyệt cho Threads với đa tầng fallback (Chromium -> Edge -> Chrome)."""
+        """Khởi tạo trình duyệt cho Threads với 5 tầng fallback siêu bền (Chromium -> Edge -> Chrome -> System Executable)."""
         launch_args = [
             "--disable-notifications",
             "--disable-blink-features=AutomationControlled",
             "--no-sandbox",
-            "--start-maximized"
+            "--start-maximized",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-infobars",
+            "--disable-session-crashed-bubble"
         ]
 
         proxy_config = None
@@ -125,7 +129,21 @@ class ThreadsAutomationEngine:
             except Exception:
                 browser = None
 
-        # Chiến lược 2: Playwright Chromium mặc định
+        # Chiến lược 2: Microsoft Edge (100% có sẵn trên Windows 10/11)
+        if browser is None:
+            try:
+                browser = await playwright.chromium.launch(channel="msedge", headless=headless, args=launch_args, proxy=proxy_config)
+            except Exception:
+                browser = None
+
+        # Chiến lược 3: Google Chrome (Kênh channel chính thức)
+        if browser is None:
+            try:
+                browser = await playwright.chromium.launch(channel="chrome", headless=headless, args=launch_args, proxy=proxy_config)
+            except Exception:
+                browser = None
+
+        # Chiến lược 4: Playwright Chromium mặc định
         if browser is None:
             try:
                 clean_kwargs = {"headless": headless, "args": launch_args, "proxy": proxy_config}
@@ -133,22 +151,34 @@ class ThreadsAutomationEngine:
             except Exception:
                 browser = None
 
-        # Chiến lược 3: Microsoft Edge (100% có sẵn trên Windows 10/11)
+        # Chiến lược 5: Tìm kiếm trực tiếp đường dẫn msedge.exe hoặc chrome.exe phổ biến trên Windows
         if browser is None:
-            try:
-                browser = await playwright.chromium.launch(channel="msedge", headless=headless, args=launch_args, proxy=proxy_config)
-            except Exception:
-                browser = None
+            common_paths = [
+                r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+                r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+                os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\Edge\Application\msedge.exe"),
+                r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+                r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+                os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+                r"C:\Program Files\CocCoc\Browser\Application\browser.exe",
+                os.path.expandvars(r"%LOCALAPPDATA%\CocCoc\Browser\Application\browser.exe")
+            ]
+            for p_path in common_paths:
+                if os.path.exists(p_path):
+                    try:
+                        browser = await playwright.chromium.launch(
+                            executable_path=p_path,
+                            headless=headless,
+                            args=launch_args,
+                            proxy=proxy_config
+                        )
+                        if browser:
+                            break
+                    except Exception:
+                        pass
 
-        # Chiến lược 4: Google Chrome
         if browser is None:
-            try:
-                browser = await playwright.chromium.launch(channel="chrome", headless=headless, args=launch_args, proxy=proxy_config)
-            except Exception:
-                browser = None
-
-        if browser is None:
-            raise RuntimeError("Không thể khởi chạy trình duyệt trên máy tính. Vui lòng đảm bảo đã cài Microsoft Edge hoặc Chrome.")
+            raise RuntimeError("Không thể khởi chạy trình duyệt trên máy tính. Vui lòng đảm bảo máy tính đã cài Microsoft Edge hoặc Google Chrome.")
 
         session_file = get_threads_session_file_path(uid) if uid else None
         storage_state = session_file if (session_file and os.path.exists(session_file)) else None
@@ -156,7 +186,7 @@ class ThreadsAutomationEngine:
         user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
         context = await browser.new_context(
             storage_state=storage_state,
-            viewport={"width": 1280, "height": 800},
+            viewport=None,
             user_agent=user_agent,
             locale="vi-VN"
         )
@@ -172,10 +202,11 @@ class ThreadsAutomationEngine:
     async def login_via_browser(
         self,
         proxy: str = "",
-        progress_callback: Optional[Callable[[str], None]] = None
+        progress_callback: Optional[Callable[[str], None]] = None,
+        is_cancelled_fn: Optional[Callable[[], bool]] = None
     ) -> Dict[str, Any]:
         """
-        Mở trình duyệt trực tiếp (Headful) tại Threads.net để người dùng tự đăng nhập.
+        Mở trình duyệt trực tiếp (Headful) tại Threads.net / Threads.com để người dùng tự đăng nhập.
         Tự động phát hiện khi đăng nhập thành công và trích xuất Session Cookie.
         """
         browser = None
@@ -188,13 +219,37 @@ class ThreadsAutomationEngine:
                 if progress_callback:
                     progress_callback("Đang mở Threads... Vui lòng đăng nhập tài khoản Threads trên trình duyệt.")
 
-                await page.goto("https://www.threads.net/login", wait_until="domcontentloaded")
+                # Thử mở trang login của Threads / Instagram
+                try:
+                    await page.goto("https://www.threads.net/login", wait_until="domcontentloaded", timeout=45000)
+                except Exception:
+                    try:
+                        await page.goto("https://www.threads.com/login", wait_until="domcontentloaded", timeout=45000)
+                    except Exception:
+                        try:
+                            await page.goto("https://www.threads.net/", wait_until="domcontentloaded", timeout=45000)
+                        except Exception:
+                            pass
+
+                try:
+                    await page.bring_to_front()
+                except Exception:
+                    pass
 
                 start_time = time.time()
-                max_wait_sec = 300  # 5 phút tối đa
+                max_wait_sec = 600  # 10 phút tối đa để người dùng thoải mái thao tác
 
                 while time.time() - start_time < max_wait_sec:
-                    if page.is_closed():
+                    if is_cancelled_fn and is_cancelled_fn():
+                        try:
+                            await context.close()
+                            await browser.close()
+                        except Exception:
+                            pass
+                        return {"success": False, "message": "Người dùng đã hủy đăng nhập."}
+
+                    # Kiểm tra nếu người dùng đã đóng tất cả các tab
+                    if len(context.pages) == 0:
                         try:
                             await context.close()
                             await browser.close()
@@ -204,28 +259,40 @@ class ThreadsAutomationEngine:
 
                     cookies = await context.cookies()
                     uid = self.extract_uid_from_cookie(cookies)
-                    current_url = page.url
+                    
+                    # Lấy URL của trang đầu tiên còn mở
+                    current_url = ""
+                    try:
+                        for p in context.pages:
+                            if not p.is_closed():
+                                current_url = p.url
+                                break
+                    except Exception:
+                        pass
 
                     # Khi đã có ds_user_id hoặc sessionid và không còn ở trang login
                     has_session = any(c.get("name") in ("sessionid", "ds_user_id") for c in cookies)
-                    if has_session and "login" not in current_url:
+                    if has_session and ("login" not in current_url.lower()):
                         if progress_callback:
                             progress_callback("Đã phát hiện đăng nhập thành công! Đang lưu phiên làm việc...")
 
                         cookie_parts = []
                         for c in cookies:
-                            if "threads.net" in c.get("domain", "") or "instagram.com" in c.get("domain", ""):
+                            domain = c.get("domain", "")
+                            if "threads." in domain or "instagram.com" in domain:
                                 cookie_parts.append(f"{c['name']}={c['value']}")
                         cookie_str = "; ".join(cookie_parts)
 
                         username = f"user_{uid}" if uid else "threads_user"
                         try:
-                            # Tìm username hiển thị trên giao diện Threads
-                            user_elem = await page.query_selector('a[href^="/@"]')
-                            if user_elem:
-                                href = await user_elem.get_attribute("href")
-                                if href and href.startswith("/@"):
-                                    username = href.replace("/@", "").strip("/").strip()
+                            for p in context.pages:
+                                if not p.is_closed():
+                                    user_elem = await p.query_selector('a[href^="/@"]')
+                                    if user_elem:
+                                        href = await user_elem.get_attribute("href")
+                                        if href and href.startswith("/@"):
+                                            username = href.replace("/@", "").strip("/").strip()
+                                            break
                         except Exception:
                             pass
 
@@ -251,14 +318,14 @@ class ThreadsAutomationEngine:
                             "cookie": cookie_str
                         }
 
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(1.5)
 
                 try:
                     await context.close()
                     await browser.close()
                 except Exception:
                     pass
-                return {"success": False, "message": "Quá thời gian chờ đăng nhập Threads (5 phút)."}
+                return {"success": False, "message": "Quá thời gian chờ đăng nhập Threads (10 phút)."}
 
         except Exception as e:
             try:
@@ -288,7 +355,18 @@ class ThreadsAutomationEngine:
             async with async_playwright() as p:
                 browser, context = await self.create_context(p, cookies, proxy=proxy, headless=False, uid=uid)
                 page = await context.new_page()
-                await page.goto("https://www.threads.net/", wait_until="domcontentloaded")
+                try:
+                    await page.goto("https://www.threads.net/", wait_until="domcontentloaded", timeout=45000)
+                except Exception:
+                    try:
+                        await page.goto("https://www.threads.com/", wait_until="domcontentloaded", timeout=45000)
+                    except Exception:
+                        pass
+
+                try:
+                    await page.bring_to_front()
+                except Exception:
+                    pass
 
                 if progress_callback:
                     progress_callback("Trình duyệt Threads đã mở thành công!\nĐóng cửa sổ trình duyệt khi hoàn tất để đồng bộ.")
@@ -304,7 +382,7 @@ class ThreadsAutomationEngine:
                         session_file = get_threads_session_file_path(uid)
                         await context.storage_state(path=session_file)
                     current_cookies = await context.cookies()
-                    parts = [f"{c['name']}={c['value']}" for c in current_cookies if "threads.net" in c.get("domain", "") or "instagram.com" in c.get("domain", "")]
+                    parts = [f"{c['name']}={c['value']}" for c in current_cookies if "threads." in c.get("domain", "") or "instagram.com" in c.get("domain", "")]
                     new_cookie_str = "; ".join(parts)
                 except Exception:
                     pass
