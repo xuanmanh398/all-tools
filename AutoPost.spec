@@ -38,6 +38,7 @@ hiddenimports = [
     'core.database',
     'core.fb_automation',
     'core.threads_automation',
+    'core.threads_worker',
     'core.license_manager',
     'core.spintax_parser',
     'ui',

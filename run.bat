@@ -1,10 +1,15 @@
 @echo off
-title FB Group Auto-Poster
+chcp 65001 >nul
+set NODE_OPTIONS=
+title FB Group Auto-Poster & Threads Mass Post
 
 echo ========================================================
 echo         FB GROUP AUTO-POSTER - BOOTSTRAPPER
 echo ========================================================
 echo.
+
+:: Dọn dẹp tiến trình node.exe cũ nếu bị kẹt
+taskkill /F /IM "node.exe" /T >nul 2>&1
 
 if exist .venv goto ACTIVATED
 

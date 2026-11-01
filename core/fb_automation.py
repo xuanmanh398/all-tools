@@ -5,7 +5,21 @@ import os
 import time
 import base64
 import mimetypes
+import subprocess
 from typing import List, Dict, Any, Optional, Callable
+
+os.environ.pop("NODE_OPTIONS", None)
+try:
+    import playwright._impl._driver as _pw_driver
+    _orig_get_driver_env = _pw_driver.get_driver_env
+    def _clean_get_driver_env():
+        env = _orig_get_driver_env()
+        env.pop("NODE_OPTIONS", None)
+        return env
+    _pw_driver.get_driver_env = _clean_get_driver_env
+except Exception:
+    pass
+
 from playwright.async_api import async_playwright, Page, BrowserContext, Browser
 from core.spintax_parser import SpintaxParser
 from core.anti_spam import AntiSpamManager, AntiSpamConfig
@@ -203,35 +217,70 @@ class FBAutomationEngine:
         if executable_path and os.path.exists(executable_path):
             try:
                 launch_kwargs["executable_path"] = executable_path
-                browser = await playwright.chromium.launch(**launch_kwargs)
+                browser = await asyncio.wait_for(playwright.chromium.launch(**launch_kwargs), timeout=8)
             except Exception as e:
                 print(f"[WARNING] Không thể mở trình duyệt từ executable_path ({executable_path}): {e}")
                 browser = None
 
-        # Chiến lược 2: Playwright Chromium mặc định
+        # Chiến lược 2: Microsoft Edge hệ thống (sẵn có 100% trên Windows 10/11)
         if browser is None:
             try:
-                clean_kwargs = {"headless": headless, "args": launch_args, "proxy": proxy_config}
-                browser = await playwright.chromium.launch(**clean_kwargs)
-            except Exception as e:
-                print(f"[WARNING] Playwright Chromium mặc định không khả dụng: {e}")
-                browser = None
-
-        # Chiến lược 3: Microsoft Edge hệ thống (sẵn có 100% trên Windows 10/11)
-        if browser is None:
-            try:
-                browser = await playwright.chromium.launch(channel="msedge", headless=headless, args=launch_args, proxy=proxy_config)
+                browser = await asyncio.wait_for(
+                    playwright.chromium.launch(channel="msedge", headless=headless, args=launch_args, proxy=proxy_config),
+                    timeout=8
+                )
             except Exception as e:
                 print(f"[WARNING] Trình duyệt Edge không khả dụng: {e}")
                 browser = None
 
-        # Chiến lược 4: Google Chrome hệ thống
+        # Chiến lược 3: Google Chrome hệ thống
         if browser is None:
             try:
-                browser = await playwright.chromium.launch(channel="chrome", headless=headless, args=launch_args, proxy=proxy_config)
+                browser = await asyncio.wait_for(
+                    playwright.chromium.launch(channel="chrome", headless=headless, args=launch_args, proxy=proxy_config),
+                    timeout=8
+                )
             except Exception as e:
                 print(f"[WARNING] Google Chrome không khả dụng: {e}")
                 browser = None
+
+        # Chiến lược 4: Playwright Chromium mặc định
+        if browser is None:
+            try:
+                clean_kwargs = {"headless": headless, "args": launch_args, "proxy": proxy_config}
+                browser = await asyncio.wait_for(playwright.chromium.launch(**clean_kwargs), timeout=8)
+            except Exception as e:
+                print(f"[WARNING] Playwright Chromium mặc định không khả dụng: {e}")
+                browser = None
+
+        # Chiến lược 5: Tìm kiếm trực tiếp đường dẫn msedge.exe hoặc chrome.exe phổ biến trên Windows
+        if browser is None:
+            common_paths = [
+                r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+                r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+                os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\Edge\Application\msedge.exe"),
+                r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+                r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+                os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+                r"C:\Program Files\CocCoc\Browser\Application\browser.exe",
+                os.path.expandvars(r"%LOCALAPPDATA%\CocCoc\Browser\Application\browser.exe")
+            ]
+            for p_path in common_paths:
+                if os.path.exists(p_path):
+                    try:
+                        browser = await asyncio.wait_for(
+                            playwright.chromium.launch(
+                                executable_path=p_path,
+                                headless=headless,
+                                args=launch_args,
+                                proxy=proxy_config
+                            ),
+                            timeout=8
+                        )
+                        if browser:
+                            break
+                    except Exception:
+                        pass
 
         if browser is None:
             raise RuntimeError("Không thể khởi chạy trình duyệt (Chromium, Edge hoặc Chrome). Vui lòng đảm bảo máy tính đã cài Microsoft Edge hoặc Google Chrome.")

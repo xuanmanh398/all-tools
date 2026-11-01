@@ -2,6 +2,32 @@ import sys
 import os
 import subprocess
 
+# Xóa bỏ NODE_OPTIONS độc hại từ môi trường hệ thống (ví dụ preload-hook.mjs của OpenClaw)
+# gây hỏng giao thức Pipe nhị phân của Playwright node.exe driver
+os.environ.pop("NODE_OPTIONS", None)
+os.environ["PYTHONIOENCODING"] = "utf-8"
+
+if sys.stdout is not None and hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+if sys.stderr is not None and hasattr(sys.stderr, "reconfigure"):
+    try:
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+try:
+    import playwright._impl._driver as _pw_driver
+    _orig_get_driver_env = _pw_driver.get_driver_env
+    def _clean_get_driver_env():
+        env = _orig_get_driver_env()
+        env.pop("NODE_OPTIONS", None)
+        return env
+    _pw_driver.get_driver_env = _clean_get_driver_env
+except Exception:
+    pass
+
 # Xác định đường dẫn gốc của ứng dụng (hỗ trợ PyInstaller frozen exe)
 if getattr(sys, 'frozen', False):
     APP_DIR = os.path.dirname(sys.executable)
@@ -11,11 +37,32 @@ else:
 # Thiết lập đường dẫn trình duyệt Playwright từ APP_DIR
 local_ms_playwright = os.path.join(APP_DIR, "ms-playwright")
 internal_ms_playwright = os.path.join(APP_DIR, "_internal", "ms-playwright")
+user_ms_playwright = os.path.join(os.environ.get("LOCALAPPDATA", ""), "ms-playwright")
 
 if os.path.exists(local_ms_playwright):
     os.environ["PLAYWRIGHT_BROWSERS_PATH"] = local_ms_playwright
 elif os.path.exists(internal_ms_playwright):
     os.environ["PLAYWRIGHT_BROWSERS_PATH"] = internal_ms_playwright
+elif os.path.exists(user_ms_playwright):
+    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = user_ms_playwright
+
+if len(sys.argv) > 1 and sys.argv[1] == "--threads-worker":
+    sys.argv.pop(1)
+    from core.threads_worker import main as worker_main
+    worker_main()
+    sys.exit(0)
+
+
+if sys.stdout is None:
+    try:
+        sys.stdout = open(os.devnull, "w", encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+if sys.stderr is None:
+    try:
+        sys.stderr = open(os.devnull, "w", encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 # Xác định thư mục dữ liệu an toàn có quyền ghi (chống lỗi C:\Program Files quyền Read-Only)
 from core.database import get_app_data_dir

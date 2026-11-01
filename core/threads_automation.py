@@ -3,7 +3,21 @@ import json
 import re
 import os
 import time
+import subprocess
 from typing import List, Dict, Any, Optional, Callable
+
+os.environ.pop("NODE_OPTIONS", None)
+try:
+    import playwright._impl._driver as _pw_driver
+    _orig_get_driver_env = _pw_driver.get_driver_env
+    def _clean_get_driver_env():
+        env = _orig_get_driver_env()
+        env.pop("NODE_OPTIONS", None)
+        return env
+    _pw_driver.get_driver_env = _clean_get_driver_env
+except Exception:
+    pass
+
 from playwright.async_api import async_playwright, Page, BrowserContext, Browser
 from core.spintax_parser import SpintaxParser
 from core.database import get_app_data_dir
@@ -102,11 +116,7 @@ class ThreadsAutomationEngine:
             "--disable-notifications",
             "--disable-blink-features=AutomationControlled",
             "--no-sandbox",
-            "--start-maximized",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-infobars",
-            "--disable-session-crashed-bubble"
+            "--start-maximized"
         ]
 
         proxy_config = None
@@ -117,38 +127,59 @@ class ThreadsAutomationEngine:
         launch_kwargs = {
             "headless": headless,
             "args": launch_args,
-            "proxy": proxy_config
         }
+        if proxy_config:
+            launch_kwargs["proxy"] = proxy_config
 
         browser = None
         # Chiến lược 1: Thử executable_path tìm thấy
         if executable_path and os.path.exists(executable_path):
             try:
+                print(f"[THREADS] Đang thử mở trình duyệt (Chiến lược 1: {executable_path})...")
                 launch_kwargs["executable_path"] = executable_path
-                browser = await playwright.chromium.launch(**launch_kwargs)
-            except Exception:
+                browser = await asyncio.wait_for(playwright.chromium.launch(**launch_kwargs), timeout=10)
+                print("[THREADS] ✅ Chiến lược 1 mở trình duyệt thành công!")
+            except Exception as e:
+                print(f"[THREADS] ⚠️ Chiến lược 1 không khả dụng: {e}")
                 browser = None
 
         # Chiến lược 2: Microsoft Edge (100% có sẵn trên Windows 10/11)
         if browser is None:
             try:
-                browser = await playwright.chromium.launch(channel="msedge", headless=headless, args=launch_args, proxy=proxy_config)
-            except Exception:
+                print("[THREADS] Đang thử mở Microsoft Edge hệ thống (Chiến lược 2)...")
+                edge_kwargs = {"channel": "msedge", "headless": headless, "args": launch_args}
+                if proxy_config:
+                    edge_kwargs["proxy"] = proxy_config
+                browser = await asyncio.wait_for(playwright.chromium.launch(**edge_kwargs), timeout=10)
+                print("[THREADS] ✅ Chiến lược 2 (Microsoft Edge) thành công!")
+            except Exception as e:
+                print(f"[THREADS] ⚠️ Chiến lược 2 (Edge) không khả dụng: {e}")
                 browser = None
 
         # Chiến lược 3: Google Chrome (Kênh channel chính thức)
         if browser is None:
             try:
-                browser = await playwright.chromium.launch(channel="chrome", headless=headless, args=launch_args, proxy=proxy_config)
-            except Exception:
+                print("[THREADS] Đang thử mở Google Chrome hệ thống (Chiến lược 3)...")
+                chrome_kwargs = {"channel": "chrome", "headless": headless, "args": launch_args}
+                if proxy_config:
+                    chrome_kwargs["proxy"] = proxy_config
+                browser = await asyncio.wait_for(playwright.chromium.launch(**chrome_kwargs), timeout=10)
+                print("[THREADS] ✅ Chiến lược 3 (Google Chrome) thành công!")
+            except Exception as e:
+                print(f"[THREADS] ⚠️ Chiến lược 3 (Chrome) không khả dụng: {e}")
                 browser = None
 
         # Chiến lược 4: Playwright Chromium mặc định
         if browser is None:
             try:
-                clean_kwargs = {"headless": headless, "args": launch_args, "proxy": proxy_config}
-                browser = await playwright.chromium.launch(**clean_kwargs)
-            except Exception:
+                print("[THREADS] Đang thử mở Playwright Chromium mặc định (Chiến lược 4)...")
+                clean_kwargs = {"headless": headless, "args": launch_args}
+                if proxy_config:
+                    clean_kwargs["proxy"] = proxy_config
+                browser = await asyncio.wait_for(playwright.chromium.launch(**clean_kwargs), timeout=10)
+                print("[THREADS] ✅ Chiến lược 4 thành công!")
+            except Exception as e:
+                print(f"[THREADS] ⚠️ Chiến lược 4 không khả dụng: {e}")
                 browser = None
 
         # Chiến lược 5: Tìm kiếm trực tiếp đường dẫn msedge.exe hoặc chrome.exe phổ biến trên Windows
@@ -166,29 +197,37 @@ class ThreadsAutomationEngine:
             for p_path in common_paths:
                 if os.path.exists(p_path):
                     try:
-                        browser = await playwright.chromium.launch(
-                            executable_path=p_path,
-                            headless=headless,
-                            args=launch_args,
-                            proxy=proxy_config
-                        )
+                        print(f"[THREADS] Đang thử đường dẫn trực tiếp: {p_path}...")
+                        p_kwargs = {"executable_path": p_path, "headless": headless, "args": launch_args}
+                        if proxy_config:
+                            p_kwargs["proxy"] = proxy_config
+                        browser = await asyncio.wait_for(playwright.chromium.launch(**p_kwargs), timeout=10)
                         if browser:
+                            print(f"[THREADS] ✅ Khởi chạy thành công từ: {p_path}")
                             break
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        print(f"[THREADS] ⚠️ Lỗi mở từ {p_path}: {e}")
 
         if browser is None:
             raise RuntimeError("Không thể khởi chạy trình duyệt trên máy tính. Vui lòng đảm bảo máy tính đã cài Microsoft Edge hoặc Google Chrome.")
 
         session_file = get_threads_session_file_path(uid) if uid else None
-        storage_state = session_file if (session_file and os.path.exists(session_file)) else None
+        storage_state = None
+        if session_file and os.path.exists(session_file):
+            try:
+                with open(session_file, "r", encoding="utf-8") as f:
+                    s_data = json.load(f)
+                    if s_data.get("cookies"):
+                        storage_state = session_file
+            except Exception:
+                storage_state = None
 
-        user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
         context = await browser.new_context(
             storage_state=storage_state,
-            viewport=None,
-            user_agent=user_agent,
-            locale="vi-VN"
+            viewport={"width": 1280, "height": 800},
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+            locale="vi-VN",
+            timezone_id="Asia/Ho_Chi_Minh"
         )
 
         if cookies:
@@ -212,22 +251,37 @@ class ThreadsAutomationEngine:
         browser = None
         context = None
         try:
+            if progress_callback:
+                progress_callback("Đang chuẩn bị trình duyệt...")
+
             async with async_playwright() as p:
+                if progress_callback:
+                    progress_callback("Đang kết nối hệ thống trình duyệt...")
+
                 browser, context = await self.create_context(p, cookies=[], proxy=proxy, headless=False)
+                
+                if progress_callback:
+                    progress_callback("Trình duyệt đã khởi chạy! Đang mở trang Threads...")
+
                 page = await context.new_page()
+                try:
+                    await page.bring_to_front()
+                except Exception:
+                    pass
 
                 if progress_callback:
-                    progress_callback("Đang mở Threads... Vui lòng đăng nhập tài khoản Threads trên trình duyệt.")
+                    progress_callback("Đang tải trang đăng nhập Threads... Vui lòng xem cửa sổ trình duyệt!")
+                print("[THREADS] Cửa sổ trình duyệt đã bật lên! Đang mở threads.net/login...")
 
-                # Thử mở trang login của Threads / Instagram
+                # Thử mở trang login của Threads / Instagram (commit để hiện cửa sổ ngay lập tức)
                 try:
-                    await page.goto("https://www.threads.net/login", wait_until="domcontentloaded", timeout=45000)
+                    await page.goto("https://www.threads.net/login", wait_until="commit", timeout=25000)
                 except Exception:
                     try:
-                        await page.goto("https://www.threads.com/login", wait_until="domcontentloaded", timeout=45000)
+                        await page.goto("https://www.threads.com/login", wait_until="commit", timeout=25000)
                     except Exception:
                         try:
-                            await page.goto("https://www.threads.net/", wait_until="domcontentloaded", timeout=45000)
+                            await page.goto("https://www.threads.net/", wait_until="commit", timeout=25000)
                         except Exception:
                             pass
 
@@ -235,6 +289,9 @@ class ThreadsAutomationEngine:
                     await page.bring_to_front()
                 except Exception:
                     pass
+
+                if progress_callback:
+                    progress_callback("Cửa sổ Threads đã sẵn sàng! Bạn hãy đăng nhập tài khoản của mình.")
 
                 start_time = time.time()
                 max_wait_sec = 600  # 10 phút tối đa để người dùng thoải mái thao tác
@@ -342,7 +399,8 @@ class ThreadsAutomationEngine:
         cookie_str: str,
         proxy: str = "",
         uid: str = "",
-        progress_callback: Optional[Callable[[str], None]] = None
+        progress_callback: Optional[Callable[[str], None]] = None,
+        is_cancelled_fn: Optional[Callable[[], bool]] = None
     ) -> Dict[str, Any]:
         """Mở trình duyệt trực tiếp với tài khoản Threads đã lưu để người dùng quan sát/thao tác."""
         cookies = self.parse_cookie_string(cookie_str)
@@ -352,14 +410,35 @@ class ThreadsAutomationEngine:
         browser = None
         context = None
         try:
+            if progress_callback:
+                progress_callback("Đang chuẩn bị trình duyệt Threads...")
+            print(f"[THREADS] Bắt đầu mở trình duyệt cho tài khoản UID: {uid}...")
+
             async with async_playwright() as p:
+                if progress_callback:
+                    progress_callback("Đang kết nối hệ thống trình duyệt...")
+
                 browser, context = await self.create_context(p, cookies, proxy=proxy, headless=False, uid=uid)
+                
+                if progress_callback:
+                    progress_callback("Trình duyệt đã khởi chạy! Đang tạo tab mới...")
+                print("[THREADS] Trình duyệt đã kết nối! Đang tạo tab mới...")
+
                 page = await context.new_page()
                 try:
-                    await page.goto("https://www.threads.net/", wait_until="domcontentloaded", timeout=45000)
+                    await page.bring_to_front()
+                except Exception:
+                    pass
+
+                if progress_callback:
+                    progress_callback("Cửa sổ đã sẵn sàng! Đang tải Threads...")
+                print("[THREADS] Cửa sổ trình duyệt đã hiển thị! Đang tải trang threads.net...")
+
+                try:
+                    await page.goto("https://www.threads.net/", wait_until="commit", timeout=25000)
                 except Exception:
                     try:
-                        await page.goto("https://www.threads.com/", wait_until="domcontentloaded", timeout=45000)
+                        await page.goto("https://www.threads.com/", wait_until="commit", timeout=25000)
                     except Exception:
                         pass
 
@@ -370,9 +449,14 @@ class ThreadsAutomationEngine:
 
                 if progress_callback:
                     progress_callback("Trình duyệt Threads đã mở thành công!\nĐóng cửa sổ trình duyệt khi hoàn tất để đồng bộ.")
+                print("[THREADS] Đã mở trang Threads. Đang chờ người dùng đóng trình duyệt...")
 
                 while True:
+                    if is_cancelled_fn and is_cancelled_fn():
+                        print("[THREADS] Người dùng đã bấm hủy mở trình duyệt.")
+                        break
                     if len(context.pages) == 0:
+                        print("[THREADS] Người dùng đã đóng tất cả các tab trình duyệt.")
                         break
                     await asyncio.sleep(1)
 

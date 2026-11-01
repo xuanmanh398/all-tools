@@ -1,4 +1,8 @@
-import asyncio
+import sys
+import os
+import time
+import json
+import subprocess
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QTableWidget,
     QTableWidgetItem, QHeaderView, QLabel, QTextEdit, QLineEdit,
@@ -6,7 +10,17 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, QThread, Signal
 from core.database import Database
-from core.threads_automation import ThreadsAutomationEngine
+from core.threads_automation import ThreadsAutomationEngine, get_threads_session_file_path
+
+
+def get_worker_command(args_list):
+    """Xác định lệnh gọi worker chính xác cho cả dev mode (python) và frozen exe."""
+    if getattr(sys, 'frozen', False):
+        return [sys.executable, "--threads-worker"] + args_list
+    else:
+        main_py = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "main.py")
+        return [sys.executable, "-u", main_py, "--threads-worker"] + args_list
+
 
 class ThreadsBrowserLoginWorker(QThread):
     progress_signal = Signal(str)
@@ -15,31 +29,75 @@ class ThreadsBrowserLoginWorker(QThread):
     def __init__(self, proxy: str = ""):
         super().__init__()
         self.proxy = proxy
+        self.proc = None
         self.is_cancelled = False
 
     def cancel(self):
         self.is_cancelled = True
+        if self.proc:
+            try:
+                self.proc.terminate()
+            except Exception:
+                pass
+            try:
+                self.proc.kill()
+            except Exception:
+                pass
 
     def run(self):
         try:
-            engine = ThreadsAutomationEngine()
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
+            self.progress_signal.emit("Đang chuẩn bị trình duyệt Threads...")
+            cmd = get_worker_command(["login", self.proxy])
+            print(f"[THREADS] Khởi chạy tiến trình độc lập: {' '.join(cmd)}")
 
-            def callback(msg):
-                self.progress_signal.emit(msg)
+            env = os.environ.copy()
+            env.pop("NODE_OPTIONS", None)
 
-            result = loop.run_until_complete(
-                engine.login_via_browser(
-                    self.proxy,
-                    progress_callback=callback,
-                    is_cancelled_fn=lambda: self.is_cancelled
-                )
+            self.proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                env=env
             )
-            loop.close()
-            self.finished_signal.emit(result)
+
+            result_data = None
+            for line in self.proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                if line.startswith("PROGRESS:"):
+                    msg = line[len("PROGRESS:"):].strip()
+                    self.progress_signal.emit(msg)
+                elif line.startswith("RESULT:"):
+                    try:
+                        result_data = json.loads(line[len("RESULT:"):].strip())
+                    except Exception:
+                        pass
+                    break
+                else:
+                    print(f"[WORKER] {line}")
+
+            try:
+                self.proc.wait(timeout=3)
+            except Exception:
+                try:
+                    self.proc.kill()
+                except Exception:
+                    pass
+            if self.is_cancelled:
+                self.finished_signal.emit({"success": False, "message": "Người dùng đã hủy đăng nhập."})
+            elif result_data:
+                self.finished_signal.emit(result_data)
+            else:
+                self.finished_signal.emit({"success": False, "message": "Tiến trình trình duyệt đã kết thúc."})
+
         except Exception as e:
-            self.finished_signal.emit({"success": False, "message": f"Lỗi khởi chạy trình duyệt Threads: {str(e)}"})
+            self.finished_signal.emit({"success": False, "message": f"Lỗi khởi chạy tiến trình: {str(e)}"})
 
 
 class ThreadsOpenBrowserWorker(QThread):
@@ -51,28 +109,93 @@ class ThreadsOpenBrowserWorker(QThread):
         self.cookie_str = cookie_str
         self.proxy = proxy
         self.uid = uid
+        self.proc = None
+        self.is_cancelled = False
+
+    def cancel(self):
+        self.is_cancelled = True
+        if self.proc:
+            try:
+                self.proc.terminate()
+            except Exception:
+                pass
+            try:
+                self.proc.kill()
+            except Exception:
+                pass
 
     def run(self):
+        cookie_file = None
         try:
-            engine = ThreadsAutomationEngine()
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
+            self.progress_signal.emit("Đang chuẩn bị trình duyệt Threads...")
+            
+            temp_cookie_path = ""
+            if self.cookie_str:
+                from core.database import get_app_data_dir
+                temp_dir = os.path.join(get_app_data_dir(), "temp")
+                os.makedirs(temp_dir, exist_ok=True)
+                temp_cookie_path = os.path.join(temp_dir, f"open_{self.uid or 'temp'}.txt")
+                with open(temp_cookie_path, "w", encoding="utf-8") as f:
+                    f.write(self.cookie_str)
+                cookie_file = temp_cookie_path
 
-            def callback(msg):
-                self.progress_signal.emit(msg)
+            cmd = get_worker_command(["open", self.uid, self.proxy, temp_cookie_path])
+            print(f"[THREADS] Khởi chạy tiến trình mở trình duyệt: {' '.join(cmd)}")
 
-            res = loop.run_until_complete(
-                engine.open_browser_with_cookie(
-                    self.cookie_str,
-                    proxy=self.proxy,
-                    uid=self.uid,
-                    progress_callback=callback
-                )
+            env = os.environ.copy()
+            env.pop("NODE_OPTIONS", None)
+
+            self.proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                env=env
             )
-            loop.close()
-            self.finished_signal.emit(res)
+
+            result_data = None
+            for line in self.proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                if line.startswith("PROGRESS:"):
+                    msg = line[len("PROGRESS:"):].strip()
+                    self.progress_signal.emit(msg)
+                elif line.startswith("RESULT:"):
+                    try:
+                        result_data = json.loads(line[len("RESULT:"):].strip())
+                    except Exception:
+                        pass
+                    break
+                else:
+                    print(f"[WORKER] {line}")
+
+            try:
+                self.proc.wait(timeout=3)
+            except Exception:
+                try:
+                    self.proc.kill()
+                except Exception:
+                    pass
+            if self.is_cancelled:
+                self.finished_signal.emit({"success": False, "message": "Người dùng đã đóng trình duyệt."})
+            elif result_data:
+                self.finished_signal.emit(result_data)
+            else:
+                self.finished_signal.emit({"success": False, "message": "Tiến trình trình duyệt đã kết thúc."})
+
         except Exception as e:
-            self.finished_signal.emit({"success": False, "message": f"Lỗi khi mở trình duyệt Threads: {str(e)}"})
+            self.finished_signal.emit({"success": False, "message": f"Lỗi khởi chạy tiến trình: {str(e)}"})
+        finally:
+            if cookie_file and os.path.exists(cookie_file):
+                try:
+                    os.remove(cookie_file)
+                except Exception:
+                    pass
 
 
 class ThreadsAccountTab(QWidget):
@@ -244,8 +367,8 @@ class ThreadsAccountTab(QWidget):
 
     def on_open_browser(self, acc: dict):
         self.progress_dialog = QProgressDialog(
-            f"Trình duyệt Threads đang mở cho tài khoản {acc.get('name', '')}!\nSau khi xem xong, ĐÓNG CỬA SỔ TRÌNH DUYỆT để đồng bộ lại phiên...",
-            "Đóng", 0, 0, self
+            f"Đang chuẩn bị mở trình duyệt cho tài khoản {acc.get('name', '')}...",
+            "Hủy", 0, 0, self
         )
         self.progress_dialog.setWindowTitle("Mở Trình Duyệt Threads")
         self.progress_dialog.setWindowModality(Qt.NonModal)
@@ -254,6 +377,7 @@ class ThreadsAccountTab(QWidget):
         self.open_worker = ThreadsOpenBrowserWorker(acc["cookie"], proxy=acc.get("proxy", ""), uid=acc.get("uid", ""))
         self.open_worker.progress_signal.connect(self.progress_dialog.setLabelText)
         self.open_worker.finished_signal.connect(self.on_open_browser_finished)
+        self.progress_dialog.canceled.connect(self.open_worker.cancel)
         self.open_worker.start()
 
     def on_open_browser_finished(self, res: dict):
@@ -262,6 +386,10 @@ class ThreadsAccountTab(QWidget):
         if res.get("cookie") and res.get("uid"):
             self.db.update_threads_cookie(res["uid"], res["cookie"])
             self.load_accounts()
+        if not res.get("success"):
+            msg = res.get("message", "Không thể mở trình duyệt Threads.")
+            if "hủy" not in msg.lower():
+                QMessageBox.warning(self, "Thông Báo", msg)
 
     def on_add_manual(self):
         cookie = self.txt_cookie.toPlainText().strip()
