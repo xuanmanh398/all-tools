@@ -1,5 +1,6 @@
 @echo off
 chcp 65001 >nul
+set NODE_OPTIONS=
 title Đang Đóng Gói Và Cập Nhật Auto Post v1.0
 
 echo ========================================================
