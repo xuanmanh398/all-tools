@@ -45,7 +45,7 @@ class ThreadsAutomationEngine:
     Hỗ trợ Đăng nhập trực tiếp, Đăng bài mới, và Bình luận vào bài viết mục tiêu.
     """
 
-    def __init__(self, db: Any = None):
+    def __init__(self, db: Any = None, browser_channel: str = "msedge"):
         if db is not None:
             self.db = db
         else:
@@ -54,6 +54,7 @@ class ThreadsAutomationEngine:
                 self.db = Database()
             except Exception:
                 self.db = None
+        self.browser_channel = browser_channel or "msedge"
 
     @staticmethod
     def parse_cookie_string(cookie_str: str) -> List[Dict[str, Any]]:
@@ -110,104 +111,126 @@ class ThreadsAutomationEngine:
         cookies: List[Dict[str, Any]],
         proxy: Optional[str] = None,
         headless: bool = False,
-        uid: str = ""
+        uid: str = "",
+        browser_channel: Optional[str] = None
     ) -> tuple[Browser, BrowserContext]:
-        """Khởi tạo trình duyệt cho Threads với 5 tầng fallback siêu bền (Chromium -> Edge -> Chrome -> System Executable)."""
+        """
+        Khởi tạo trình duyệt riêng biệt cho Threads (Mặc định Microsoft Edge - Cửa sổ Bên Phải)
+        để chạy song song độc lập với Facebook mà không bị xung đột tiến trình hay cấu hình.
+        """
+        channel = (browser_channel or getattr(self, "browser_channel", "msedge") or "msedge").lower()
+        if "chrome" in channel:
+            pref = "chrome"
+        elif "chromium" in channel:
+            pref = "chromium"
+        else:
+            pref = "msedge"
+
         launch_args = [
             "--disable-notifications",
             "--disable-blink-features=AutomationControlled",
             "--no-sandbox",
-            "--start-maximized"
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-background-networking",
+            "--disable-sync",
+            "--remote-debugging-port=0"
         ]
+
+        if not headless:
+            # Tự động canh lề nửa BÊN PHẢI màn hình để chạy song song cạnh Facebook (nửa bên trái)
+            launch_args.extend([
+                "--window-position=960,0",
+                "--window-size=960,1030"
+            ])
+        else:
+            launch_args.append("--start-maximized")
 
         proxy_config = None
         if proxy and proxy.strip():
             proxy_config = {"server": proxy.strip()}
 
         executable_path = FBAutomationEngine.get_chromium_executable_path(headless=headless)
-        launch_kwargs = {
-            "headless": headless,
-            "args": launch_args,
-        }
-        if proxy_config:
-            launch_kwargs["proxy"] = proxy_config
 
         browser = None
-        # Chiến lược 1: Thử executable_path tìm thấy
-        if executable_path and os.path.exists(executable_path):
-            try:
-                print(f"[THREADS] Đang thử mở trình duyệt (Chiến lược 1: {executable_path})...")
-                launch_kwargs["executable_path"] = executable_path
-                browser = await asyncio.wait_for(playwright.chromium.launch(**launch_kwargs), timeout=10)
-                print("[THREADS] ✅ Chiến lược 1 mở trình duyệt thành công!")
-            except Exception as e:
-                print(f"[THREADS] ⚠️ Chiến lược 1 không khả dụng: {e}")
-                browser = None
 
-        # Chiến lược 2: Microsoft Edge (100% có sẵn trên Windows 10/11)
-        if browser is None:
+        async def try_edge():
             try:
-                print("[THREADS] Đang thử mở Microsoft Edge hệ thống (Chiến lược 2)...")
-                edge_kwargs = {"channel": "msedge", "headless": headless, "args": launch_args}
-                if proxy_config:
-                    edge_kwargs["proxy"] = proxy_config
-                browser = await asyncio.wait_for(playwright.chromium.launch(**edge_kwargs), timeout=10)
-                print("[THREADS] ✅ Chiến lược 2 (Microsoft Edge) thành công!")
-            except Exception as e:
-                print(f"[THREADS] ⚠️ Chiến lược 2 (Edge) không khả dụng: {e}")
-                browser = None
-
-        # Chiến lược 3: Google Chrome (Kênh channel chính thức)
-        if browser is None:
-            try:
-                print("[THREADS] Đang thử mở Google Chrome hệ thống (Chiến lược 3)...")
-                chrome_kwargs = {"channel": "chrome", "headless": headless, "args": launch_args}
-                if proxy_config:
-                    chrome_kwargs["proxy"] = proxy_config
-                browser = await asyncio.wait_for(playwright.chromium.launch(**chrome_kwargs), timeout=10)
-                print("[THREADS] ✅ Chiến lược 3 (Google Chrome) thành công!")
-            except Exception as e:
-                print(f"[THREADS] ⚠️ Chiến lược 3 (Chrome) không khả dụng: {e}")
-                browser = None
-
-        # Chiến lược 4: Playwright Chromium mặc định
-        if browser is None:
-            try:
-                print("[THREADS] Đang thử mở Playwright Chromium mặc định (Chiến lược 4)...")
-                clean_kwargs = {"headless": headless, "args": launch_args}
-                if proxy_config:
-                    clean_kwargs["proxy"] = proxy_config
-                browser = await asyncio.wait_for(playwright.chromium.launch(**clean_kwargs), timeout=10)
-                print("[THREADS] ✅ Chiến lược 4 thành công!")
-            except Exception as e:
-                print(f"[THREADS] ⚠️ Chiến lược 4 không khả dụng: {e}")
-                browser = None
-
-        # Chiến lược 5: Tìm kiếm trực tiếp đường dẫn msedge.exe hoặc chrome.exe phổ biến trên Windows
-        if browser is None:
-            common_paths = [
+                return await asyncio.wait_for(
+                    playwright.chromium.launch(channel="msedge", headless=headless, args=launch_args, proxy=proxy_config),
+                    timeout=8
+                )
+            except Exception:
+                pass
+            edge_paths = [
                 r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
                 r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-                os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\Edge\Application\msedge.exe"),
+                os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\Edge\Application\msedge.exe")
+            ]
+            for ep in edge_paths:
+                if os.path.exists(ep):
+                    try:
+                        return await asyncio.wait_for(
+                            playwright.chromium.launch(executable_path=ep, headless=headless, args=launch_args, proxy=proxy_config),
+                            timeout=8
+                        )
+                    except Exception:
+                        pass
+            return None
+
+        async def try_chrome():
+            try:
+                return await asyncio.wait_for(
+                    playwright.chromium.launch(channel="chrome", headless=headless, args=launch_args, proxy=proxy_config),
+                    timeout=8
+                )
+            except Exception:
+                pass
+            chrome_paths = [
                 r"C:\Program Files\Google\Chrome\Application\chrome.exe",
                 r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-                os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
-                r"C:\Program Files\CocCoc\Browser\Application\browser.exe",
-                os.path.expandvars(r"%LOCALAPPDATA%\CocCoc\Browser\Application\browser.exe")
+                os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe")
             ]
-            for p_path in common_paths:
-                if os.path.exists(p_path):
+            for cp in chrome_paths:
+                if os.path.exists(cp):
                     try:
-                        print(f"[THREADS] Đang thử đường dẫn trực tiếp: {p_path}...")
-                        p_kwargs = {"executable_path": p_path, "headless": headless, "args": launch_args}
-                        if proxy_config:
-                            p_kwargs["proxy"] = proxy_config
-                        browser = await asyncio.wait_for(playwright.chromium.launch(**p_kwargs), timeout=10)
-                        if browser:
-                            print(f"[THREADS] ✅ Khởi chạy thành công từ: {p_path}")
-                            break
-                    except Exception as e:
-                        print(f"[THREADS] ⚠️ Lỗi mở từ {p_path}: {e}")
+                        return await asyncio.wait_for(
+                            playwright.chromium.launch(executable_path=cp, headless=headless, args=launch_args, proxy=proxy_config),
+                            timeout=8
+                        )
+                    except Exception:
+                        pass
+            return None
+
+        async def try_chromium():
+            if executable_path and os.path.exists(executable_path):
+                try:
+                    return await asyncio.wait_for(
+                        playwright.chromium.launch(executable_path=executable_path, headless=headless, args=launch_args, proxy=proxy_config),
+                        timeout=8
+                    )
+                except Exception:
+                    pass
+            try:
+                return await asyncio.wait_for(
+                    playwright.chromium.launch(headless=headless, args=launch_args, proxy=proxy_config),
+                    timeout=8
+                )
+            except Exception:
+                return None
+
+        # Thứ tự chiến lược khởi chạy
+        if pref == "msedge":
+            strategies = [try_edge, try_chrome, try_chromium]
+        elif pref == "chrome":
+            strategies = [try_chrome, try_edge, try_chromium]
+        else:
+            strategies = [try_chromium, try_edge, try_chrome]
+
+        for strat in strategies:
+            browser = await strat()
+            if browser:
+                break
 
         if browser is None:
             raise RuntimeError("Không thể khởi chạy trình duyệt trên máy tính. Vui lòng đảm bảo máy tính đã cài Microsoft Edge hoặc Google Chrome.")

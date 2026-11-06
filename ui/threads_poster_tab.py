@@ -42,7 +42,8 @@ class ThreadsActionWorker(QThread):
         excel_posts: list = None,
         loop_forever: bool = True,
         min_likes: int = 0,
-        human_simulation: bool = True
+        human_simulation: bool = True,
+        browser_channel: str = "msedge"
     ):
         super().__init__()
         self.db = db
@@ -57,6 +58,7 @@ class ThreadsActionWorker(QThread):
         self.loop_forever = loop_forever
         self.min_likes = min_likes
         self.human_simulation = human_simulation
+        self.browser_channel = browser_channel or "msedge"
         self.is_paused = False
         self.is_stopped = False
 
@@ -87,7 +89,7 @@ class ThreadsActionWorker(QThread):
             self.log_signal.emit(time.strftime("%H:%M:%S"), self.action_mode, "-", "FAILED", "Không tìm thấy tài khoản Threads trong CSDL!")
             return
 
-        engine = ThreadsAutomationEngine(db=self.db)
+        engine = ThreadsAutomationEngine(db=self.db, browser_channel=self.browser_channel)
         cookie_str = acc.get("cookie", "")
         proxy = acc.get("proxy", "")
 
@@ -726,6 +728,17 @@ class ThreadsPosterTab(QWidget):
         self.combo_browser_mode.addItem("Chạy Ngầm Hệ Thống (Headless)", True)
         c3_layout.addWidget(self.combo_browser_mode)
 
+        lbl_engine = QLabel("🌐 Trình Duyệt Chạy:")
+        lbl_engine.setStyleSheet("color: #94a3b8; font-size: 11px; font-weight: 600; border: none; background: transparent;")
+        c3_layout.addWidget(lbl_engine)
+
+        self.combo_browser_engine = QComboBox()
+        self.combo_browser_engine.setFixedHeight(36)
+        self.combo_browser_engine.addItem("🌐 Microsoft Edge (Mặc định Threads - Chạy song song độc lập)", "msedge")
+        self.combo_browser_engine.addItem("🌐 Google Chrome", "chrome")
+        self.combo_browser_engine.addItem("🌐 Playwright Chromium", "chromium")
+        c3_layout.addWidget(self.combo_browser_engine)
+
         self.chk_loop_forever = QCheckBox("Đăng vòng lặp liên tục (1 ➔ N ➔ 1)")
         self.chk_loop_forever.setChecked(True)
         c3_layout.addWidget(self._create_check_row(self.chk_loop_forever))
@@ -1163,7 +1176,8 @@ class ThreadsPosterTab(QWidget):
             excel_posts=list(self.excel_posts),
             loop_forever=loop_forever,
             min_likes=self.spin_min_likes.value() if mode == "COMMENT" else 0,
-            human_simulation=self.chk_human_sim.isChecked()
+            human_simulation=self.chk_human_sim.isChecked(),
+            browser_channel=self.combo_browser_engine.currentData() or "msedge"
         )
         self.worker.log_signal.connect(self.add_log_row)
         self.worker.progress_signal.connect(self.update_progress)

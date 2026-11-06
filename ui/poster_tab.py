@@ -41,7 +41,8 @@ class PosterWorker(QThread):
         action_mode: str = "POST_GROUPS",
         min_likes: int = 0,
         human_simulation: bool = True,
-        target_urls: list = None
+        target_urls: list = None,
+        browser_channel: str = "chrome"
     ):
         super().__init__()
         self.db = db
@@ -56,6 +57,7 @@ class PosterWorker(QThread):
         self.min_likes = min_likes
         self.human_simulation = human_simulation
         self.target_urls = target_urls or []
+        self.browser_channel = browser_channel or "chrome"
         self.is_paused = False
         self.is_stopped = False
 
@@ -103,7 +105,7 @@ class PosterWorker(QThread):
         # --- CHẾ ĐỘ ĐI BÌNH LUẬN BẢNG TIN FACEBOOK / LINK BÀI VIẾT (LỌC THEO SỐ LIKE TỐI THIỂU) ---
         if self.action_mode == "COMMENT_FEED":
             excel_list = [target_camp] if target_camp else list(campaigns)
-            engine = FBAutomationEngine()
+            engine = FBAutomationEngine(browser_channel=self.browser_channel)
             self.status_text_signal.emit(f"[{profile_label}] Đang bình luận Facebook (Lọc >= {self.min_likes} Likes)...")
             await engine.run_fb_commenting_session(
                 cookie_str=target_acc["cookie"],
@@ -138,7 +140,7 @@ class PosterWorker(QThread):
             return
 
         anti_spam = AntiSpamManager(self.anti_config)
-        engine = FBAutomationEngine()
+        engine = FBAutomationEngine(browser_channel=self.browser_channel)
         cookies = engine.parse_cookie_string(target_acc["cookie"])
 
         total_groups = len(selected_groups)
@@ -1075,6 +1077,17 @@ class PosterTab(QWidget):
         self.combo_browser_mode.currentIndexChanged.connect(self.save_all_config)
         c3_layout.addWidget(self.combo_browser_mode)
 
+        lbl_engine = QLabel("🌐 Trình Duyệt Chạy:")
+        lbl_engine.setStyleSheet("color: #94a3b8; font-size: 11px; font-weight: 600; border: none; background: transparent;")
+        c3_layout.addWidget(lbl_engine)
+
+        self.combo_browser_engine = QComboBox()
+        self.combo_browser_engine.setFixedHeight(36)
+        self.combo_browser_engine.addItem("🌐 Google Chrome (Mặc định FB - Chạy song song độc lập)", "chrome")
+        self.combo_browser_engine.addItem("🌐 Microsoft Edge", "msedge")
+        self.combo_browser_engine.addItem("🌐 Playwright Chromium", "chromium")
+        c3_layout.addWidget(self.combo_browser_engine)
+
         # Các Checkbox tuỳ chọn tiến trình (Giống Ảnh 2)
         self.chk_loop_forever = QCheckBox("Đăng vòng lặp liên tục (1 ➔ N ➔ 1)")
         self.chk_loop_forever.setChecked(True)
@@ -1714,6 +1727,7 @@ class PosterTab(QWidget):
 
         headless_mode = bool(self.combo_browser_mode.currentData())
         loop_forever = self.chk_loop_forever.isChecked()
+        browser_channel = self.combo_browser_engine.currentData() or "chrome"
 
         for cfg in target_configs:
             w = PosterWorker(
@@ -1728,7 +1742,8 @@ class PosterTab(QWidget):
                 action_mode=action_mode,
                 min_likes=min_likes,
                 human_simulation=human_sim,
-                target_urls=raw_urls
+                target_urls=raw_urls,
+                browser_channel=browser_channel
             )
             w.log_signal.connect(self.add_log_row)
             w.progress_signal.connect(self.update_progress)

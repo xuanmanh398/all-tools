@@ -42,7 +42,8 @@ class FBCommentWorker(QThread):
         max_per_acc: int,
         headless: bool,
         keyword_posts_count: int = 10,
-        group_posts_count: int = 3
+        group_posts_count: int = 3,
+        browser_channel: str = "chrome"
     ):
         super().__init__()
         self.db = db
@@ -58,6 +59,7 @@ class FBCommentWorker(QThread):
         self.headless = headless
         self.keyword_posts_count = keyword_posts_count
         self.group_posts_count = group_posts_count
+        self.browser_channel = browser_channel or "chrome"
 
         self.is_paused = False
         self.is_stopped = False
@@ -87,7 +89,7 @@ class FBCommentWorker(QThread):
             self.log_signal.emit(time.strftime("%H:%M:%S"), "-", "-", "FAILED", "Chưa chọn tài khoản Facebook nào!")
             return
 
-        engine = FBAutomationEngine()
+        engine = FBAutomationEngine(browser_channel=self.browser_channel)
         resolved_targets: List[str] = []
 
         # 1. Thu thập danh sách mục tiêu dựa theo chế độ chạy
@@ -513,6 +515,15 @@ class FBCommentTab(QWidget):
         row_limits.addStretch()
         sg_layout.addLayout(row_limits)
 
+        row_browser = QHBoxLayout()
+        row_browser.addWidget(QLabel("🌐 Trình duyệt chạy:"))
+        self.combo_browser = QComboBox()
+        self.combo_browser.addItem("🌐 Google Chrome (Mặc định FB - Chạy song song độc lập)", "chrome")
+        self.combo_browser.addItem("🌐 Playwright Chromium", "chromium")
+        self.combo_browser.addItem("🌐 Microsoft Edge", "msedge")
+        row_browser.addWidget(self.combo_browser, 1)
+        sg_layout.addLayout(row_browser)
+
         left_layout.addWidget(safety_group)
         splitter.addWidget(left_widget)
 
@@ -901,7 +912,8 @@ class FBCommentTab(QWidget):
             max_per_acc=self.spin_max_per_acc.value(),
             headless=not self.chk_headless.isChecked(),
             keyword_posts_count=self.spin_keyword_posts.value(),
-            group_posts_count=self.spin_group_posts.value()
+            group_posts_count=self.spin_group_posts.value(),
+            browser_channel=self.combo_browser.currentData() or "chrome"
         )
 
         self.worker.log_signal.connect(self.on_worker_log)
