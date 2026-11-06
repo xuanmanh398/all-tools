@@ -2585,3 +2585,347 @@ class FBAutomationEngine:
             except Exception:
                 pass
 
+    async def comment_on_post(
+        self,
+        page: Page,
+        target_url: str,
+        content_template: str,
+        media_paths: Optional[List[str]] = None,
+        auto_like: bool = True,
+        anti_spam: Optional[AntiSpamManager] = None,
+        logger_callback: Optional[Callable[[str, str], None]] = None,
+        cookie_str: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Tự động thả like (tùy chọn) và bình luận vào bài viết Facebook (theo URL hoặc Post ID).
+        Hỗ trợ Spintax, chống spam, đính kèm ảnh và tự động xử lý các rào cản giao diện.
+        """
+        try:
+            # 1. Chuẩn hóa đường dẫn bài viết
+            target_url = target_url.strip()
+            if not target_url:
+                return {"success": False, "message": "Đường dẫn bài viết trống!"}
+
+            if not target_url.startswith("http://") and not target_url.startswith("https://"):
+                # Nếu chỉ là số ID bài viết
+                if target_url.isdigit() or ("_" in target_url and target_url.replace("_", "").isdigit()):
+                    target_url = f"https://www.facebook.com/{target_url}"
+                else:
+                    target_url = f"https://www.facebook.com/{target_url}"
+
+            # Đổi m.facebook hoặc mbasic sang www.facebook
+            target_url = re.sub(r"https?://(m|mbasic)\.facebook\.com", "https://www.facebook.com", target_url)
+
+            if logger_callback:
+                logger_callback("INFO", f"Đang điều hướng đến bài viết: {target_url}")
+
+            await page.goto(target_url, wait_until="domcontentloaded", timeout=45000)
+            await asyncio.sleep(3.5)
+
+            # Tự đóng các popup hoặc dialog che khuất (như 'Xem thêm trên Facebook' hoặc cookie banner)
+            try:
+                await page.keyboard.press("Escape")
+                close_btn = await page.query_selector("div[aria-label='Đóng'], div[aria-label='Close'], div[role='button']:has-text('Không phải bây giờ')")
+                if close_btn and await close_btn.is_visible():
+                    await close_btn.click()
+            except Exception:
+                pass
+
+            # 2. Tự động thả cảm xúc Like nếu được bật
+            if auto_like:
+                try:
+                    if logger_callback:
+                        logger_callback("INFO", "Đang kiểm tra và thả Like cho bài viết...")
+
+                    like_selectors = [
+                        "div[aria-label='Thích'][role='button']",
+                        "div[aria-label='Like'][role='button']",
+                        "div[aria-label*='Bày tỏ cảm xúc'][role='button']",
+                        "div[role='button']:has-text('Thích')",
+                        "span:has-text('Thích')"
+                    ]
+                    for l_sel in like_selectors:
+                        like_btn = await page.query_selector(l_sel)
+                        if like_btn and await like_btn.is_visible():
+                            # Kiểm tra xem bài viết đã like chưa (aria-pressed='true' hoặc label 'Gỡ thích')
+                            aria_pressed = await like_btn.get_attribute("aria-pressed")
+                            aria_label = await like_btn.get_attribute("aria-label") or ""
+                            if aria_pressed != "true" and "Gỡ" not in aria_label and "Remove" not in aria_label:
+                                await like_btn.click()
+                                if logger_callback:
+                                    logger_callback("INFO", "Đã thả Like thành công!")
+                                await asyncio.sleep(1.5)
+                                break
+                except Exception as le:
+                    if logger_callback:
+                        logger_callback("WARNING", f"Bỏ qua bước Like: {str(le)}")
+
+            # 3. Chuẩn bị nội dung bình luận (Spintax & Anti-spam)
+            final_text = SpintaxParser.parse(content_template)
+            if anti_spam:
+                final_text = anti_spam.prepare_text(final_text)
+
+            # Cuộn trang nhẹ xuống để khu vực bình luận lọt vào viewport
+            try:
+                await page.evaluate("window.scrollBy(0, 350)")
+            except Exception:
+                pass
+            await asyncio.sleep(1.5)
+
+            # 4. Tìm ô nhập bình luận
+            comment_selectors = [
+                "div[role='textbox'][aria-label*='Viết bình luận']",
+                "div[role='textbox'][aria-label*='Write a comment']",
+                "div[role='textbox'][aria-label*='bình luận']",
+                "div[role='textbox'][aria-label*='comment']",
+                "div[contenteditable='true'][role='textbox']",
+                "div[contenteditable='true'][data-lexical-editor='true']",
+                "form div[contenteditable='true']",
+                "div[role='dialog'] div[contenteditable='true']",
+                "div[contenteditable='true']"
+            ]
+
+            comment_box = None
+            for sel in comment_selectors:
+                try:
+                    candidates = await page.query_selector_all(sel)
+                    for c in candidates:
+                        if await c.is_visible():
+                            comment_box = c
+                            break
+                    if comment_box:
+                        break
+                except Exception:
+                    continue
+
+            # Nếu chưa thấy ô nhập bình luận, thử tìm nút bấm "Bình luận" để kích hoạt ô nhập
+            if not comment_box:
+                try:
+                    open_cmt_btns = [
+                        "div[aria-label*='Bình luận'][role='button']",
+                        "div[aria-label*='Comment'][role='button']",
+                        "div[role='button']:has-text('Bình luận')",
+                        "span:has-text('Bình luận')"
+                    ]
+                    for ob_sel in open_cmt_btns:
+                        ob = await page.query_selector(ob_sel)
+                        if ob and await ob.is_visible():
+                            await ob.click()
+                            await asyncio.sleep(2)
+                            break
+                    
+                    # Thử tìm lại ô nhập sau khi bấm nút
+                    for sel in comment_selectors:
+                        candidates = await page.query_selector_all(sel)
+                        for c in candidates:
+                            if await c.is_visible():
+                                comment_box = c
+                                break
+                        if comment_box:
+                            break
+                except Exception:
+                    pass
+
+            if not comment_box:
+                if logger_callback:
+                    logger_callback("ERROR", "Không tìm thấy khung nhập bình luận (Bài viết có thể đã tắt tính năng bình luận hoặc bạn chưa có quyền).")
+                return {"success": False, "message": "Không tìm thấy khung nhập bình luận!"}
+
+            # Focus vào khung bình luận
+            try:
+                await comment_box.scroll_into_view_if_needed()
+                await comment_box.click(force=True)
+                await comment_box.focus()
+            except Exception:
+                pass
+            await asyncio.sleep(1)
+
+            # Nhập nội dung bình luận
+            if logger_callback:
+                logger_callback("INFO", f"Đang nhập nội dung bình luận: '{final_text[:50]}...'")
+
+            try:
+                await page.keyboard.insert_text(final_text)
+            except Exception:
+                if anti_spam:
+                    for char in final_text:
+                        await page.keyboard.write(char)
+                        await asyncio.sleep(anti_spam.get_typing_delay())
+                else:
+                    await page.keyboard.type(final_text, delay=35)
+
+            await asyncio.sleep(2)
+
+            # 5. Đính kèm ảnh nếu có
+            if media_paths:
+                valid_media = [m for m in media_paths if os.path.exists(m)]
+                if valid_media:
+                    if logger_callback:
+                        logger_callback("INFO", f"Đang đính kèm ảnh bình luận: {os.path.basename(valid_media[0])}...")
+                    
+                    attached = False
+                    # Cách 1: Nạp file vào input type='file' của khung comment
+                    try:
+                        file_input = await page.query_selector("form input[type='file'][accept*='image'], input[type='file'][accept*='image']")
+                        if file_input:
+                            await file_input.set_input_files(valid_media[0])
+                            attached = True
+                            await asyncio.sleep(3)
+                    except Exception:
+                        attached = False
+
+                    # Cách 2: Dán ảnh Clipboard trực tiếp vào comment box
+                    if not attached:
+                        try:
+                            ext = os.path.splitext(valid_media[0])[1].lower()
+                            mime, _ = mimetypes.guess_type(valid_media[0])
+                            mime = mime or "image/png"
+                            with open(valid_media[0], "rb") as mf:
+                                b64 = base64.b64encode(mf.read()).decode('utf-8')
+                            
+                            await page.evaluate("""({b64, mime, filename}) => {
+                                const bytes = atob(b64);
+                                const arr = new Uint8Array(bytes.length);
+                                for (let i = 0; i < bytes.length; i++) arr[i] = bytes.charCodeAt(i);
+                                const file = new File([arr], filename, { type: mime });
+                                const dt = new DataTransfer();
+                                dt.items.add(file);
+                                const target = document.activeElement || document.querySelector("div[role='textbox']");
+                                if (target) {
+                                    target.dispatchEvent(new ClipboardEvent('paste', { bubbles: true, cancelable: true, clipboardData: dt }));
+                                }
+                            }""", {"b64": b64, "mime": mime, "filename": os.path.basename(valid_media[0])})
+                            await asyncio.sleep(3)
+                            attached = True
+                        except Exception:
+                            pass
+
+            # 6. Nhấn Enter hoặc nút gửi để gửi bình luận
+            if logger_callback:
+                logger_callback("INFO", "Đang gửi bình luận...")
+
+            await page.keyboard.press("Enter")
+            await asyncio.sleep(2)
+
+            # Nếu Enter chưa gửi (ví dụ Facebook đòi bấm nút gửi), thử tìm icon/nút Gửi
+            try:
+                send_btns = [
+                    "div[aria-label='Bình luận'][role='button']",
+                    "div[aria-label='Comment'][role='button']",
+                    "div[aria-label*='Nhấn Enter để gửi']"
+                ]
+                for s_sel in send_btns:
+                    s_btn = await page.query_selector(s_sel)
+                    if s_btn and await s_btn.is_visible():
+                        await s_btn.click()
+                        await asyncio.sleep(1.5)
+                        break
+            except Exception:
+                pass
+
+            await asyncio.sleep(4)
+
+            if anti_spam:
+                anti_spam.record_post()
+
+            if logger_callback:
+                logger_callback("INFO", f"✅ Đã bình luận thành công vào bài viết!")
+
+            return {"success": True, "message": "Bình luận thành công!", "content": final_text}
+
+        except Exception as e:
+            if logger_callback:
+                logger_callback("ERROR", f"Lỗi ngoại lệ khi bình luận: {str(e)}")
+            return {"success": False, "message": f"Lỗi: {str(e)}"}
+
+    async def scan_group_posts(
+        self,
+        page: Page,
+        group_url: str,
+        limit: int = 10,
+        logger_callback: Optional[Callable[[str, str], None]] = None
+    ) -> List[str]:
+        """Quét và trích xuất danh sách link bài viết mới nhất từ một nhóm Facebook."""
+        post_urls = []
+        try:
+            if logger_callback:
+                logger_callback("INFO", f"Đang quét bài viết từ nhóm: {group_url}")
+
+            await page.goto(group_url, wait_until="domcontentloaded", timeout=40000)
+            await asyncio.sleep(3)
+
+            # Cuộn trang 3-5 lần để tải bài viết
+            for i in range(4):
+                await page.evaluate("window.scrollBy(0, 1000)")
+                await asyncio.sleep(1.5)
+
+            # Tìm tất cả thẻ <a> chứa đường dẫn bài viết trong nhóm
+            links = await page.query_selector_all("a[href*='/posts/'], a[href*='permalink.php'], a[href*='multi_permalinks']")
+            for a in links:
+                href = await a.get_attribute("href")
+                if href:
+                    # Làm sạch URL Facebook
+                    if href.startswith("/"):
+                        href = f"https://www.facebook.com{href}"
+                    # Cắt bỏ các tham số tracking ?__cft__...
+                    clean_url = href.split("?")[0]
+                    if "/posts/" in clean_url or "permalink.php" in clean_url:
+                        if clean_url not in post_urls:
+                            post_urls.append(clean_url)
+                            if len(post_urls) >= limit:
+                                break
+
+            if logger_callback:
+                logger_callback("INFO", f"Đã tìm thấy {len(post_urls)} bài viết trong nhóm.")
+
+        except Exception as e:
+            if logger_callback:
+                logger_callback("WARNING", f"Lỗi khi quét bài viết nhóm: {str(e)}")
+
+        return post_urls
+
+    async def search_posts_by_keyword(
+        self,
+        page: Page,
+        keyword: str,
+        limit: int = 10,
+        logger_callback: Optional[Callable[[str, str], None]] = None
+    ) -> List[str]:
+        """Tìm kiếm bài viết trên Facebook theo từ khóa và trích xuất link."""
+        import urllib.parse
+        post_urls = []
+        try:
+            encoded_kw = urllib.parse.quote(keyword)
+            search_url = f"https://www.facebook.com/search/posts/?q={encoded_kw}"
+
+            if logger_callback:
+                logger_callback("INFO", f"Đang tìm kiếm bài viết theo từ khóa '{keyword}'...")
+
+            await page.goto(search_url, wait_until="domcontentloaded", timeout=40000)
+            await asyncio.sleep(3.5)
+
+            # Cuộn trang để tải thêm bài viết
+            for _ in range(4):
+                await page.evaluate("window.scrollBy(0, 1200)")
+                await asyncio.sleep(1.8)
+
+            links = await page.query_selector_all("a[href*='/posts/'], a[href*='permalink.php'], a[href*='/videos/'], a[href*='/reel/']")
+            for a in links:
+                href = await a.get_attribute("href")
+                if href:
+                    if href.startswith("/"):
+                        href = f"https://www.facebook.com{href}"
+                    clean_url = href.split("?")[0]
+                    if clean_url not in post_urls:
+                        post_urls.append(clean_url)
+                        if len(post_urls) >= limit:
+                            break
+
+            if logger_callback:
+                logger_callback("INFO", f"Đã tìm thấy {len(post_urls)} bài viết cho từ khóa '{keyword}'.")
+
+        except Exception as e:
+            if logger_callback:
+                logger_callback("WARNING", f"Lỗi khi tìm bài viết theo từ khóa: {str(e)}")
+
+        return post_urls
