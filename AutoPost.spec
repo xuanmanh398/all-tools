@@ -36,6 +36,7 @@ hiddenimports = [
     'core',
     'core.anti_spam',
     'core.database',
+    'core.excel_loader',
     'core.fb_automation',
     'core.threads_automation',
     'core.threads_worker',

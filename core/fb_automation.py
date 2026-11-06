@@ -3,6 +3,7 @@ import json
 import re
 import os
 import time
+import random
 import base64
 import mimetypes
 import subprocess
@@ -293,6 +294,30 @@ class FBAutomationEngine:
 
         if not session_file and uid:
             u_file = get_session_file_path(uid, "")
+            # Nếu chạy Nick cá nhân (page_id == ""), ưu tiên đồng bộ cookie xác thực mới nhất (c_user, xs, fr, datr, sb)
+            # từ các file session Fanpage cùng UID (nếu mới hơn) nhưng bỏ i_user để không bị văng ra màn hình 'Tiếp tục'
+            try:
+                from core.database import get_app_data_dir
+                session_dir = os.path.join(get_app_data_dir(), "sessions")
+                if os.path.exists(session_dir):
+                    prefix = f"{uid}_"
+                    cand_files = [
+                        os.path.join(session_dir, fn)
+                        for fn in os.listdir(session_dir)
+                        if fn.startswith(prefix) and fn.endswith("_state.json")
+                    ]
+                    if cand_files:
+                        newest_f = max(cand_files, key=lambda x: os.path.getmtime(x))
+                        u_mtime = os.path.getmtime(u_file) if os.path.exists(u_file) else 0
+                        if not page_id and os.path.abspath(newest_f) != os.path.abspath(u_file) and os.path.getmtime(newest_f) > u_mtime:
+                            with open(newest_f, "r", encoding="utf-8") as nf:
+                                ndata = json.load(nf)
+                            n_cookies = [c for c in ndata.get("cookies", []) if c.get("name") != "i_user"]
+                            if any(c.get("name") == "c_user" for c in n_cookies):
+                                with open(u_file, "w", encoding="utf-8") as uf:
+                                    json.dump({"cookies": n_cookies, "origins": ndata.get("origins", [])}, uf)
+            except Exception:
+                pass
             if os.path.exists(u_file):
                 session_file = u_file
 
@@ -313,11 +338,17 @@ class FBAutomationEngine:
 
         context = await browser.new_context(
             storage_state=storage_state,
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            viewport={"width": 1280, "height": 800},
+            viewport={"width": 1280, "height": 820},
             locale="vi-VN",
             timezone_id="Asia/Ho_Chi_Minh"
         )
+
+        # Stealth chống phát hiện tự động hóa (Anti-Checkpoint / Anti-Human Verification)
+        await context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            if (!window.chrome) { window.chrome = { runtime: {} }; }
+            Object.defineProperty(navigator, 'languages', { get: () => ['vi-VN', 'vi', 'en-US', 'en'] });
+        """)
 
         # Trích xuất cookies hiện tại của context
         current_cookies = await context.cookies()
@@ -776,7 +807,11 @@ class FBAutomationEngine:
 
             # Trường hợp 1: Yêu cầu đăng bài với tư cách Fanpage
             if target_page_name or target_page_id:
-                if target_page_id and curr_i_user == target_page_id:
+                session_page_file = get_session_file_path(curr_uid, target_page_id) if (curr_uid and target_page_id) else None
+                has_saved_page_session = bool(
+                    session_page_file and os.path.exists(session_page_file) and curr_i_user and curr_i_user != curr_uid
+                )
+                if (target_page_id and curr_i_user == target_page_id) or has_saved_page_session:
                     if logger_callback:
                         logger_callback("INFO", f"Trình duyệt đã ở sẵn danh tính Fanpage '{target_page_name}'.")
                     return True
@@ -1612,3 +1647,941 @@ class FBAutomationEngine:
             if logger_callback:
                 logger_callback("ERROR", f"Lỗi ngoại lệ khi đăng bài: {str(e)}")
             return False
+
+    @staticmethod
+    def parse_like_count(text: str) -> int:
+        """
+        Chuyển đổi chuỗi hiển thị số lượt thích trên Facebook (VD: '315', '1,2K', '1.2K', '2,5N', '15 N', '1,2 Tr', '1.234')
+        thành số nguyên chính xác để so sánh với mức Like tối thiểu.
+        """
+        if not text:
+            return 0
+        s = str(text).strip().upper()
+        for w in ["LƯỢT THÍCH", "LIKES", "LIKE", "THÍCH", "BỎ THÍCH", "UNLIKE", "TẤT CẢ CẢM XÚC", "CẢM XÚC"]:
+            s = s.replace(w, "")
+        s = s.strip()
+        if not s:
+            return 0
+
+        m = re.search(r"(\d+(?:[.,]\d+)?)\s*(K|N|M|TR|TRIỆU|B)?", s, re.IGNORECASE)
+        if not m:
+            return 0
+        num_str = m.group(1)
+        unit = (m.group(2) or "").upper()
+
+        if unit in ("K", "N"):
+            val = float(num_str.replace(",", "."))
+            return int(val * 1000)
+        if unit in ("M", "TR", "TRIỆU"):
+            val = float(num_str.replace(",", "."))
+            return int(val * 1000000)
+        if unit == "B":
+            val = float(num_str.replace(",", "."))
+            return int(val * 1000000000)
+
+        # Trường hợp không có hậu tố K/N/M: nếu sau dấu chấm/phẩy có đúng 3 chữ số (VD: 1.250 hoặc 1,250) -> hàng nghìn
+        if re.match(r"^\d{1,3}([.,]\d{3})+$", num_str):
+            return int(re.sub(r"[.,]", "", num_str))
+
+        try:
+            return int(float(num_str.replace(",", ".")))
+        except Exception:
+            return 0
+
+    async def check_human_verification_challenge(self, page: Page) -> Optional[str]:
+        """
+        Kiểm tra xem Facebook có đang hiển thị màn hình bắt xác minh con người (Checkpoint / CAPTCHA / Khóa tạm thời) hay không.
+        Nếu phát hiện, dừng ngay lập tức để bảo vệ tài khoản.
+        """
+        try:
+            cur_url = (page.url or "").lower()
+            if any(k in cur_url for k in ["/checkpoint/", "checkpoint", "/login/", "recover/initiate"]):
+                return "Phát hiện Facebook chuyển hướng sang trang Xác minh bảo mật (Checkpoint). Đã tự động dừng phiên để bảo vệ tài khoản!"
+
+            body_text = await page.evaluate("""() => {
+                return (document.body && document.body.innerText) ? document.body.innerText.slice(0, 2500) : '';
+            }""")
+            lower_txt = (body_text or "").lower()
+            challenge_keywords = [
+                "confirm you're human",
+                "confirm you are human",
+                "xác nhận bạn là con người",
+                "xác minh bạn là người thật",
+                "tài khoản của bạn đã bị khóa",
+                "we suspended your account",
+                "chúng tôi đã đình chỉ tài khoản của bạn",
+                "enter the characters you see",
+                "nhập các ký tự bạn thấy"
+            ]
+            for kw in challenge_keywords:
+                if kw in lower_txt:
+                    return f"Phát hiện yêu cầu xác minh con người từ Facebook ('{kw}'). Đã tự động dừng ngay để tránh khóa tài khoản!"
+        except Exception:
+            pass
+        return None
+
+    async def human_type_text(self, page: Page, editor: Any, text: str, human_simulation: bool = True):
+        """
+        Nhập nội dung bình luận theo nhịp gõ phím tự nhiên của con người (Human-like Keystroke Simulation)
+        kết hợp chèn nhanh các cụm URL/Emoji và tự động kết thúc token Link bằng phím Space để Lexical
+        nhận diện Link có thể click trực tiếp.
+        """
+        if not text:
+            return
+        try:
+            await editor.click(force=True)
+            await page.wait_for_timeout(random.randint(250, 500))
+        except Exception:
+            pass
+
+        if not human_simulation:
+            await page.keyboard.insert_text(text)
+            if re.search(r"https?://\S+$", text.strip()):
+                await page.keyboard.press("Space")
+            await page.wait_for_timeout(500)
+            return
+
+        tokens = [t for t in re.split(r"(\s+)", text) if t]
+        for idx, token in enumerate(tokens):
+            is_url = token.startswith("http://") or token.startswith("https://") or token.startswith("www.")
+            if is_url:
+                # Đảm bảo trước URL có khoảng trắng hoặc xuống dòng rõ ràng
+                await page.keyboard.insert_text(token)
+                await page.wait_for_timeout(random.randint(120, 240))
+                # Nếu URL nằm ở cuối câu, gõ thêm phím Space thật để trình soạn thảo Lexical kích hoạt AutoLinkNode
+                if idx == len(tokens) - 1:
+                    await page.keyboard.press("Space")
+                    await page.wait_for_timeout(random.randint(150, 280))
+            elif len(token) > 18 or any(ord(c) > 0xFFFF for c in token):
+                await page.keyboard.insert_text(token)
+                await page.wait_for_timeout(random.randint(70, 170))
+            else:
+                for ch in token:
+                    if ch == "\n":
+                        await page.keyboard.press("Shift+Enter")
+                        await page.wait_for_timeout(random.randint(120, 260))
+                    elif ch == " ":
+                        await page.keyboard.press("Space")
+                        await page.wait_for_timeout(random.randint(25, 65))
+                    else:
+                        await page.keyboard.insert_text(ch)
+                        await page.wait_for_timeout(random.randint(18, 55))
+                if any(p in token for p in [".", ",", "!", "?", ":"]):
+                    await page.wait_for_timeout(random.randint(140, 320))
+        await page.wait_for_timeout(random.randint(500, 950))
+
+    async def _scan_fb_feed_posts_with_likes(self, page: Page) -> List[Dict[str, Any]]:
+        """
+        Quét các bài viết đang hiển thị trên Bảng tin Facebook kèm theo số lượt thích (Likes) thực tế.
+        Hỗ trợ chính xác cả 2 giao diện Facebook:
+        1. Giao diện nút Pill mới (như trong ảnh chụp Inspect):
+           - Nút Bình luận là `div.x9f619.x1ja2u2z.x2lah0s.x1n2onr6.xl56j7k.xozqiw3.x1q0g3np.xpdmqnj.x1g0dm76` (74.52 x 44, Role: generic)
+           - Nút Thích nằm ngay bên trái cùng hàng, chứa thẻ số tim `span.x193iq5w.xeuugli.x13faqbe.x1vvkbs.x1xmvt09` (VD: '315', '1,2K')
+        2. Giao diện thanh Thích / Bình luận / Chia sẻ truyền thống.
+        """
+        try:
+            raw_items = await page.evaluate("""() => {
+                const results = [];
+                const seenCodes = new Set();
+                const origin = (window.location.origin && window.location.origin.startsWith('http'))
+                    ? window.location.origin
+                    : 'https://www.facebook.com';
+
+                // Tìm tất cả các pill nút hành động theo đúng cấu trúc DOM Facebook mới:
+                // div.x9f619.x1ja2u2z.x2lah0s.x1n2onr6.xl56j7k.xozqiw3.x1q0g3np.xpdmqnj.x1g0dm76
+                const pillSelector = 'div.x9f619.x1ja2u2z.x2lah0s.x1n2onr6.xl56j7k.xozqiw3.x1q0g3np.xpdmqnj.x1g0dm76';
+                const allPills = Array.from(document.querySelectorAll(pillSelector)).filter(el => {
+                    const r = el.getBoundingClientRect();
+                    return r.width >= 32 && r.width <= 260 && r.height >= 28 && r.height <= 56 && r.bottom > 0;
+                });
+
+                // Gom nhóm các pill nằm trên cùng 1 hàng ngang của cùng 1 bài viết
+                const rows = [];
+                const usedPills = new Set();
+
+                for (const p of allPills) {
+                    if (usedPills.has(p)) continue;
+                    // Loại trừ các nút nằm bên trong phần bình luận con bên dưới bài viết
+                    if (p.closest('[aria-label*="Bình luận dưới tên"], [aria-label*="Bình luận của "], [aria-label*="Phản hồi "], [aria-label*="Comment by "]')) {
+                        continue;
+                    }
+                    const r1 = p.getBoundingClientRect();
+                    // Tìm phần tử cha cấp 2..5 chứa cả hàng nút (Like, Comment, Share)
+                    let rowContainer = p.parentElement;
+                    for (let d = 0; d < 4 && rowContainer; d++) {
+                        const rowCandidates = Array.from(rowContainer.querySelectorAll(pillSelector)).filter(other => {
+                            const r2 = other.getBoundingClientRect();
+                            return Math.abs(r1.top - r2.top) < 8 && Math.abs(r1.height - r2.height) < 8 && r2.width >= 32;
+                        });
+                        if (rowCandidates.length >= 2 && rowCandidates.length <= 5) {
+                            rowCandidates.forEach(c => usedPills.add(c));
+                            // Sắp xếp từ trái sang phải (Nút 0 = Like 👍, Nút 1 = Bình luận 💬, Nút 2 = Chia sẻ ↗️)
+                            rowCandidates.sort((a, b) => a.getBoundingClientRect().left - b.getBoundingClientRect().left);
+                            rows.push({
+                                likePill: rowCandidates[0],
+                                cmtPill: rowCandidates[1],
+                                rowEl: rowContainer
+                            });
+                            break;
+                        }
+                        rowContainer = rowContainer.parentElement;
+                    }
+                }
+
+                // Dự phòng cho giao diện Facebook cổ điển (nếu không dùng pillSelector)
+                if (rows.length === 0) {
+                    const cmtBtns = Array.from(document.querySelectorAll(
+                        'div[aria-label="Viết bình luận"], div[aria-label="Bình luận"], div[aria-label="Comment"], div[aria-label="Leave a comment"]'
+                    ));
+                    for (const cBtn of cmtBtns) {
+                        const rC = cBtn.getBoundingClientRect();
+                        if (rC.width < 30 || rC.height < 24) continue;
+                        let bar = cBtn.parentElement;
+                        for (let d = 0; d < 5 && bar; d++) {
+                            const likeBtn = bar.querySelector('div[aria-label="Thích"], div[aria-label="Like"], div[aria-label="Bỏ thích"], div[aria-label="Unlike"]');
+                            if (likeBtn) {
+                                rows.push({ likePill: likeBtn, cmtPill: cBtn, rowEl: bar });
+                                break;
+                            }
+                            bar = bar.parentElement;
+                        }
+                    }
+                }
+
+                let idxCounter = 0;
+                for (const item of rows) {
+                    const { likePill, cmtPill, rowEl } = item;
+                    if (!likePill || !cmtPill) continue;
+
+                    // Đi ngược lên tìm thẻ khung bài viết (card)
+                    let card = rowEl;
+                    let postLink = null;
+                    for (let depth = 0; depth < 16 && card && card !== document.body; depth++) {
+                        postLink = card.querySelector(
+                            'a[href*="/posts/"], a[href*="fbid="], a[href*="/photo"], a[href*="/permalink/"], ' +
+                            'a[href*="/videos/"], a[href*="/reel/"], a[href*="story_fbid="]'
+                        );
+                        if (postLink) break;
+                        card = card.parentElement;
+                    }
+                    if (!card || card === document.body) {
+                        card = rowEl.parentElement ? (rowEl.parentElement.parentElement || rowEl) : rowEl;
+                    }
+
+                    // Nếu thẻ bài viết này đã được xử lý/bỏ qua trước đó thì bỏ qua
+                    if (card.getAttribute('data-agy-fb-done') === '1') continue;
+
+                    // 1. Trích xuất số lượt thích từ thẻ chính xác `span.x193iq5w.xeuugli.x13faqbe.x1vvkbs.x1xmvt09` bên trong nút Like
+                    let likeText = '';
+                    const exactLikeSpans = Array.from(likePill.querySelectorAll(
+                        'span.x193iq5w.xeuugli.x13faqbe.x1vvkbs.x1xmvt09, span.x193iq5w, span'
+                    ));
+                    for (const sp of exactLikeSpans) {
+                        const t = (sp.textContent || sp.innerText || '').replace(/\\s+/g, ' ').trim();
+                        if (t && /\\d/.test(t) && !['thích', 'like', 'bỏ thích', 'unlike'].includes(t.toLowerCase())) {
+                            likeText = t;
+                            break;
+                        }
+                    }
+                    if (!likeText) {
+                        const rawLike = (likePill.innerText || likePill.textContent || '').replace(/\\s+/g, ' ').trim();
+                        if (/\\d/.test(rawLike)) {
+                            likeText = rawLike;
+                        }
+                    }
+
+                    // Dự phòng giao diện cổ điển: số cảm xúc nằm ở thanh trạng thái ngay phía trên hàng nút Like/Comment
+                    if (!likeText && card) {
+                        const likeRect = likePill.getBoundingClientRect();
+                        const cardSpans = Array.from(card.querySelectorAll(
+                            'span.xt0b8zv, span.x193iq5w.xeuugli.x13faqbe.x1vvkbs.x1xmvt09, span.x193iq5w'
+                        ));
+                        for (const sp of cardSpans) {
+                            const sr = sp.getBoundingClientRect();
+                            if (sr.width > 5 && sr.bottom <= likeRect.top + 8 && sr.top >= likeRect.top - 65 && sr.left < likeRect.right + 120) {
+                                const t = (sp.textContent || '').replace(/\\s+/g, ' ').trim();
+                                const tl = t.toLowerCase();
+                                if (/^\\d/.test(t) && !tl.includes('bình luận') && !tl.includes('comment') && !tl.includes('chia sẻ') && !tl.includes('share')) {
+                                    likeText = t;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    // 2. Xác định URL hoặc mã định danh duy nhất của bài viết
+                    let cleanUrl = '';
+                    if (postLink) {
+                        const href = postLink.getAttribute('href') || '';
+                        if (href) {
+                            const fullUrl = href.startsWith('http') ? href : (origin + (href.startsWith('/') ? href : '/' + href));
+                            // Giữ lại fbid / story_fbid nếu là link photo.php hoặc permalink.php
+                            if (fullUrl.includes('fbid=') || fullUrl.includes('story_fbid=')) {
+                                const m = fullUrl.match(/[?&](?:story_)?fbid=([^&]+)/);
+                                cleanUrl = m ? (origin + '/?fbid=' + m[1]) : fullUrl.split('&')[0];
+                            } else {
+                                cleanUrl = fullUrl.split('?')[0].replace(/\\/+$/, '');
+                            }
+                        }
+                    }
+
+                    let postCode = card.getAttribute('data-agy-fb-card') || '';
+                    if (!postCode) {
+                        if (cleanUrl) {
+                            postCode = 'fb_' + cleanUrl.replace(/[^a-zA-Z0-9]/g, '').slice(-28);
+                        } else {
+                            const snippet = (card.innerText || '').replace(/\\s+/g, '').slice(0, 32);
+                            idxCounter += 1;
+                            postCode = 'fb_card_' + idxCounter + '_' + snippet.replace(/[^a-zA-Z0-9]/g, '').slice(0, 16);
+                        }
+                    }
+                    if (!cleanUrl) {
+                        cleanUrl = origin + '/#' + postCode;
+                    }
+                    if (seenCodes.has(postCode)) continue;
+                    seenCodes.add(postCode);
+
+                    card.setAttribute('data-agy-fb-card', postCode);
+                    likePill.setAttribute('data-agy-fb-like-btn', postCode);
+                    cmtPill.setAttribute('data-agy-fb-cmt-btn', postCode);
+
+                    results.push({
+                        url: cleanUrl,
+                        postCode: postCode,
+                        likeText: likeText || '0'
+                    });
+                }
+                return results;
+            }""")
+        except Exception:
+            return []
+
+        parsed_list = []
+        for item in (raw_items or []):
+            l_txt = item.get("likeText", "0")
+            likes = self.parse_like_count(l_txt)
+            parsed_list.append({
+                "url": item.get("url", ""),
+                "post_code": item.get("postCode", ""),
+                "like_text": l_txt or "0",
+                "likes": likes
+            })
+        return parsed_list
+
+    async def _get_single_fb_post_likes(self, page: Page) -> tuple[int, str]:
+        """Lấy số lượt thích khi đang mở trang chi tiết một bài viết Facebook cụ thể."""
+        posts = await self._scan_fb_feed_posts_with_likes(page)
+        if posts:
+            return posts[0]["likes"], posts[0]["like_text"]
+        return 0, "0"
+
+    async def _interact_and_open_comment_on_fb_feed(self, page: Page, post_code: str, auto_like: bool = True) -> Any:
+        """
+        Cuộn mượt tới bài viết trên Bảng tin Facebook, nghỉ đọc bài tự nhiên,
+        tự động thả Like (tùy chọn) và nhấn vào nút Bình luận (`div.x9f619.x1ja2u2z...` 💬)
+        để mở ô nhập bình luận trực tiếp mà không cần tải lại trang.
+        Trả về phần tử `editor` (`div[role="textbox"][contenteditable="true"]`) nếu mở thành công.
+        """
+        if not post_code:
+            return None
+        try:
+            # 1. Cuộn bài viết vào giữa màn hình mượt mà như người thật
+            found = await page.evaluate("""(code) => {
+                const cmtBtn = document.querySelector(`[data-agy-fb-cmt-btn="${code}"]`);
+                const card = document.querySelector(`[data-agy-fb-card="${code}"]`);
+                const target = cmtBtn || card;
+                if (!target) return false;
+                target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                return true;
+            }""", post_code)
+            if not found:
+                return None
+
+            await page.wait_for_timeout(random.randint(1800, 3200))
+
+            # 2. Tự động thả Like bài viết trước khi bình luận (xác suất 70% khi bật mô phỏng người thật)
+            if auto_like and random.random() < 0.70:
+                try:
+                    like_loc = page.locator(f'[data-agy-fb-like-btn="{post_code}"]').first
+                    if await like_loc.count() > 0:
+                        await like_loc.click(timeout=3000)
+                        await page.wait_for_timeout(random.randint(900, 1600))
+                except Exception:
+                    pass
+
+            # 3. Nhấn vào nút Bình luận (`div.x9f619.x1ja2u2z...` 💬 69) bằng chuột thật của Playwright
+            clicked_cmt = False
+            try:
+                cmt_loc = page.locator(f'[data-agy-fb-cmt-btn="{post_code}"]').first
+                if await cmt_loc.count() > 0:
+                    await cmt_loc.click(timeout=4000)
+                    clicked_cmt = True
+            except Exception:
+                clicked_cmt = False
+
+            if not clicked_cmt:
+                coords = await page.evaluate("""(code) => {
+                    const btn = document.querySelector(`[data-agy-fb-cmt-btn="${code}"]`);
+                    if (!btn) return null;
+                    const r = btn.getBoundingClientRect();
+                    return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+                }""", post_code)
+                if coords:
+                    await page.mouse.click(coords["x"], coords["y"])
+                    clicked_cmt = True
+
+            await page.wait_for_timeout(random.randint(1600, 2600))
+
+            # 4. Tìm ô nhập bình luận vừa được focus hoặc hiển thị trong Modal / dưới bài viết
+            # Ưu tiên 1: Phần tử đang được focus tự động sau khi bấm nút Bình luận
+            active_is_editor = await page.evaluate("""() => {
+                const el = document.activeElement;
+                if (el && el.getAttribute('contenteditable') === 'true' && el.getAttribute('role') === 'textbox') {
+                    document.querySelectorAll('[data-agy-fb-active-editor]').forEach(n => n.removeAttribute('data-agy-fb-active-editor'));
+                    el.setAttribute('data-agy-fb-active-editor', '1');
+                    return true;
+                }
+                return false;
+            }""")
+            if active_is_editor:
+                ed = await page.query_selector('[data-agy-fb-active-editor="1"]')
+                if ed:
+                    return ed
+
+            # Ưu tiên 2: Tìm ô nhập bình luận chính (loại trừ các ô 'Trả lời...' bình luận con và loại trừ ô 'Bạn đang nghĩ gì')
+            tagged_editor = await page.evaluate("""(code) => {
+                document.querySelectorAll('[data-agy-fb-active-editor]').forEach(n => n.removeAttribute('data-agy-fb-active-editor'));
+
+                const isCommentBox = (el) => {
+                    const r = el.getBoundingClientRect();
+                    if (r.width < 80 || r.height < 14 || r.bottom <= 0) return false;
+                    const aria = (el.getAttribute('aria-label') || '').toLowerCase();
+                    const placeholder = (el.getAttribute('aria-placeholder') || '').toLowerCase();
+                    const combined = aria + ' ' + placeholder;
+                    // Không lấy ô đăng bài đầu trang ('bạn đang nghĩ gì') hoặc ô phản hồi bình luận con ('trả lời ')
+                    if (combined.includes('nghĩ gì') || combined.includes('on your mind')) return false;
+                    if (combined.startsWith('trả lời ') || combined.startsWith('reply to ')) return false;
+                    return combined.includes('bình luận') || combined.includes('comment') || Boolean(el.closest('div[role="dialog"]'));
+                };
+
+                // Nếu nút Bình luận mở ra Modal (div[role="dialog"]), ưu tiên ô textbox trong Modal
+                const dialogs = Array.from(document.querySelectorAll('div[role="dialog"]'));
+                for (let i = dialogs.length - 1; i >= 0; i--) {
+                    const dlg = dialogs[i];
+                    const boxes = Array.from(dlg.querySelectorAll('div[role="textbox"][contenteditable="true"], div[contenteditable="true"]'));
+                    for (let j = boxes.length - 1; j >= 0; j--) {
+                        if (isCommentBox(boxes[j])) {
+                            boxes[j].setAttribute('data-agy-fb-active-editor', '1');
+                            return true;
+                        }
+                    }
+                }
+
+                // Nếu mở khung bình luận ngay bên dưới bài viết trên Bảng tin
+                const cmtBtn = document.querySelector(`[data-agy-fb-cmt-btn="${code}"]`);
+                const btnTop = cmtBtn ? cmtBtn.getBoundingClientRect().top : 0;
+                const allBoxes = Array.from(document.querySelectorAll('div[role="textbox"][contenteditable="true"]')).filter(isCommentBox);
+                // Chọn ô bình luận nằm gần bên dưới nút Bình luận vừa bấm nhất
+                let bestBox = null;
+                let bestDist = 999999;
+                for (const b of allBoxes) {
+                    const br = b.getBoundingClientRect();
+                    const dist = Math.abs(br.top - btnTop);
+                    if (br.top >= btnTop - 40 && dist < bestDist) {
+                        bestDist = dist;
+                        bestBox = b;
+                    }
+                }
+                if (!bestBox && allBoxes.length > 0) {
+                    bestBox = allBoxes[allBoxes.length - 1];
+                }
+                if (bestBox) {
+                    bestBox.setAttribute('data-agy-fb-active-editor', '1');
+                    return true;
+                }
+                return false;
+            }""", post_code)
+
+            if tagged_editor:
+                return await page.query_selector('[data-agy-fb-active-editor="1"]')
+        except Exception:
+            pass
+        return None
+
+    async def _attach_media_to_fb_comment(self, page: Page, editor: Any, media_files: List[str]) -> bool:
+        """
+        Đính kèm toàn bộ hình ảnh trong Folder Excel vào ô bình luận Facebook.
+        Do khung bình luận Facebook chỉ cho phép 1 file ảnh/bình luận, khi Folder có từ 2 ảnh trở lên,
+        hệ thống tự động ghép toàn bộ ảnh trong Folder thành 1 ảnh tổng hợp sắc nét rồi đính kèm vào bình luận.
+        """
+        valid_files = [f for f in (media_files or []) if os.path.exists(f)]
+        if not valid_files:
+            return False
+
+        from core.excel_loader import combine_folder_images_for_comment
+        target_file = combine_folder_images_for_comment(valid_files) or valid_files[0]
+
+        try:
+            mime, _ = mimetypes.guess_type(target_file)
+            mime = mime or "image/jpeg"
+            with open(target_file, "rb") as mf:
+                b64_data = base64.b64encode(mf.read()).decode("utf-8")
+
+            await editor.click(force=True)
+            await page.wait_for_timeout(300)
+
+            pasted = await page.evaluate("""({b64, mime, filename}) => {
+                const target = document.querySelector('[data-agy-fb-active-editor="1"]') || document.activeElement;
+                if (!target) return false;
+                const byteCharacters = atob(b64);
+                const byteNumbers = new Array(byteCharacters.length);
+                for (let i = 0; i < byteCharacters.length; i++) {
+                    byteNumbers[i] = byteCharacters.charCodeAt(i);
+                }
+                const byteArray = new Uint8Array(byteNumbers);
+                const file = new File([byteArray], filename, { type: mime });
+                const dt = new DataTransfer();
+                dt.items.add(file);
+                target.focus();
+                const pasteEvent = new ClipboardEvent('paste', {
+                    bubbles: true,
+                    cancelable: true,
+                    clipboardData: dt
+                });
+                target.dispatchEvent(pasteEvent);
+                return true;
+            }""", {"b64": b64_data, "mime": mime, "filename": os.path.basename(target_file)})
+
+            if pasted:
+                await page.wait_for_timeout(random.randint(3800, 5200))
+                return True
+        except Exception:
+            pass
+
+        # Fallback: Tìm input[type="file"] gần khung bình luận
+        try:
+            fi_list = await page.query_selector_all('input[type="file"][accept*="image"], input[type="file"]')
+            if fi_list:
+                await fi_list[-1].set_input_files([target_file])
+                await page.wait_for_timeout(random.randint(3800, 5200))
+                return True
+        except Exception:
+            pass
+        return False
+
+    async def _submit_fb_comment(self, page: Page, editor: Any) -> bool:
+        """
+        Gửi bình luận trên Facebook bằng click nút gửi (#focused-state-composer-submit / aria-label='Đăng bình luận')
+        kết hợp phím Enter.
+        Chờ ảnh tải lên hoàn tất (nút gửi hết trạng thái aria-disabled='true') trước khi bấm,
+        và chờ trạng thái 'Đang viết...' / 'Posting...' hoàn tất trước khi kết thúc.
+        """
+        try:
+            # Chờ tối đa 15 giây nếu nút gửi đang bị aria-disabled="true" (do đang tải ảnh đính kèm)
+            for _ in range(15):
+                is_uploading = await page.evaluate("""() => {
+                    const submitWrap = document.querySelector(
+                        '#focused-state-composer-submit [aria-disabled="true"], ' +
+                        'div[aria-label="Đăng bình luận"][aria-disabled="true"], ' +
+                        'div[aria-label="Bình luận"][aria-disabled="true"]'
+                    );
+                    return Boolean(submitWrap);
+                }""")
+                if not is_uploading:
+                    break
+                await page.wait_for_timeout(1000)
+
+            send_selector = (
+                '#focused-state-composer-submit div[role="button"]:not([aria-disabled="true"]), '
+                'div[aria-label="Đăng bình luận"][role="button"]:not([aria-disabled="true"]), '
+                'div[aria-label="Bình luận"][role="button"]:not([aria-disabled="true"]), '
+                'div[aria-label="Gửi"][role="button"]:not([aria-disabled="true"]), '
+                'div[aria-label="Comment"][role="button"]:not([aria-disabled="true"])'
+            )
+
+            clicked_send = False
+            try:
+                loc = page.locator(send_selector).last
+                if await loc.count() > 0:
+                    await loc.click(timeout=3500)
+                    clicked_send = True
+            except Exception:
+                clicked_send = False
+
+            if not clicked_send:
+                clicked_send = await page.evaluate("""(sel) => {
+                    const btns = Array.from(document.querySelectorAll(sel));
+                    for (let i = btns.length - 1; i >= 0; i--) {
+                        const r = btns[i].getBoundingClientRect();
+                        if (r.width >= 10 && r.height >= 10) {
+                            btns[i].click();
+                            return true;
+                        }
+                    }
+                    return false;
+                }""", send_selector)
+
+            if not clicked_send:
+                # Cách dự phòng: Focus vào ô bình luận và nhấn phím Enter
+                try:
+                    await editor.click(force=True)
+                    await page.wait_for_timeout(200)
+                except Exception:
+                    pass
+                await page.keyboard.press("Enter")
+
+            # Chờ bình luận gửi hoàn tất (hết trạng thái "Đang viết..." / "Posting...") trước khi đóng hộp thoại
+            await page.wait_for_timeout(2200)
+            for _ in range(12):
+                still_posting = await page.evaluate("""() => {
+                    const spans = Array.from(document.querySelectorAll('span, div'));
+                    for (const el of spans) {
+                        const t = (el.innerText || '').trim();
+                        if (t === 'Đang viết...' || t === 'Posting...' || t === 'Đang đăng...') {
+                            return true;
+                        }
+                    }
+                    return false;
+                }""")
+                if not still_posting:
+                    break
+                await page.wait_for_timeout(1000)
+
+            await page.wait_for_timeout(random.randint(1500, 2500))
+            return True
+        except Exception:
+            return False
+
+    async def run_fb_commenting_session(
+        self,
+        cookie_str: str,
+        target_urls: List[str],
+        excel_posts: List[Dict[str, Any]],
+        anti_config: Any = None,
+        proxy: str = "",
+        headless: bool = False,
+        uid: str = "",
+        post_as_page_name: str = "",
+        page_id: str = "",
+        page_url: str = "",
+        min_likes: int = 0,
+        human_simulation: bool = True,
+        is_paused_fn: Optional[Callable[[], bool]] = None,
+        is_stopped_fn: Optional[Callable[[], bool]] = None,
+        log_callback: Optional[Callable[[str, str, str, str, str], None]] = None,
+        progress_callback: Optional[Callable[[int, int], None]] = None
+    ):
+        """
+        Phiên tự động đi bình luận trên Facebook (Bảng tin Trang chủ hoặc danh sách Link bài viết):
+        - Lọc chỉ bình luận vào bài viết có số lượt thích (Likes) >= min_likes (đọc từ `span.x193iq5w.xeuugli...`).
+        - Nhấn trực tiếp nút Bình luận (`div.x9f619.x1ja2u2z...`) ngay trên Bảng tin.
+        - Lấy nội dung (Cột A) và ảnh trong Folder (Cột B) từ file Excel theo vòng lặp tuần tự (Mẫu #1 -> #2 -> ... -> #N -> #1).
+        - Kết hợp tự động thả Like, gõ phím theo nhịp người thật và giữ nguyên 1 phiên trình duyệt để chống Checkpoint / Xác minh con người.
+        """
+        cookies = self.parse_cookie_string(cookie_str)
+        if not uid:
+            uid = self.extract_uid_from_cookie(cookies)
+
+        from core.excel_loader import get_fresh_media_for_post
+        if not anti_config:
+            anti_config = AntiSpamConfig()
+        anti_mgr = AntiSpamManager(anti_config)
+
+        profile_label = f"Fanpage: {post_as_page_name}" if post_as_page_name else "Nick cá nhân"
+
+        def emit_log(target: str, status: str, msg: str):
+            if log_callback:
+                log_callback(time.strftime("%H:%M:%S"), profile_label, target, status, msg)
+
+        def get_next_template(seq_idx: int) -> tuple[str, List[str], str]:
+            if excel_posts and len(excel_posts) > 0:
+                item = excel_posts[seq_idx % len(excel_posts)]
+                raw_txt = item.get("content", "")
+                files = get_fresh_media_for_post(item)
+                if anti_config and getattr(anti_config, "randomize_media", False) and len(files) > 1:
+                    random.shuffle(files)
+                title = item.get("title") or f"Mẫu #{(seq_idx % len(excel_posts)) + 1}"
+                parsed_txt = anti_mgr.process_content(raw_txt or "")
+                return parsed_txt.strip(), files, title
+            return "", [], "Mẫu trống"
+
+        browser = None
+        context = None
+        try:
+            async with async_playwright() as p:
+                browser, context = await self.create_context(
+                    p, cookies, proxy=proxy, headless=headless, uid=uid, page_id=page_id
+                )
+                page = await context.new_page()
+
+                # Chuyển sang đúng tư cách Nick cá nhân hoặc Fanpage
+                await self.ensure_active_profile(
+                    page=page,
+                    uid=uid,
+                    target_page_name=post_as_page_name,
+                    target_page_id=page_id,
+                    target_page_url=page_url,
+                    logger_callback=lambda level, msg: emit_log("-", level, msg)
+                )
+
+                # --- TRƯỜNG HỢP 1: CÓ DANH SÁCH LINK BÀI VIẾT CỤ THỂ ---
+                if target_urls and len(target_urls) > 0:
+                    total = len(target_urls)
+                    if progress_callback:
+                        progress_callback(0, total)
+
+                    for idx, target_url in enumerate(target_urls, 1):
+                        if is_stopped_fn and is_stopped_fn():
+                            emit_log("-", "STOPPED", "Đã dừng tiến trình bình luận theo yêu cầu.")
+                            break
+
+                        while is_paused_fn and is_paused_fn():
+                            if is_stopped_fn and is_stopped_fn():
+                                break
+                            await asyncio.sleep(1)
+
+                        parsed_cmt, valid_files, tpl_title = get_next_template(idx - 1)
+                        emit_log(target_url, "POSTING", f"Đang mở bài viết {idx}/{total} [{tpl_title}]: {target_url}...")
+
+                        try:
+                            await page.goto(target_url, wait_until="domcontentloaded", timeout=35000)
+                            await page.wait_for_timeout(random.randint(3000, 4500))
+
+                            challenge_msg = await self.check_human_verification_challenge(page)
+                            if challenge_msg:
+                                emit_log(target_url, "FAILED", f"🛡️ {challenge_msg}")
+                                break
+
+                            posts = await self._scan_fb_feed_posts_with_likes(page)
+                            first_post = posts[0] if posts else None
+                            if min_likes > 0 and first_post and first_post["likes"] < min_likes:
+                                emit_log(
+                                    target_url,
+                                    "SKIPPED",
+                                    f"⏭️ Bỏ qua bài viết vì có {first_post['like_text']} lượt thích (< mức tối thiểu {min_likes} like)."
+                                )
+                                continue
+
+                            post_code = first_post["post_code"] if first_post else ""
+                            editor = await self._interact_and_open_comment_on_fb_feed(page, post_code, auto_like=human_simulation) if post_code else None
+                            if not editor:
+                                editor = await page.query_selector('div[role="textbox"][contenteditable="true"][aria-label*="bình luận" i], div[role="textbox"][contenteditable="true"][aria-label*="comment" i]')
+
+                            if not editor:
+                                emit_log(target_url, "FAILED", "Không tìm thấy ô bình luận trên bài viết này.")
+                                continue
+
+                            if parsed_cmt:
+                                await self.human_type_text(page, editor, parsed_cmt, human_simulation=human_simulation)
+
+                            if valid_files:
+                                await self._attach_media_to_fb_comment(page, editor, valid_files)
+
+                            if await self._submit_fb_comment(page, editor):
+                                anti_mgr.record_post()
+                                emit_log(target_url, "SUCCESS", f"✅ Đã bình luận thành công bài #{idx} [{tpl_title}]: {target_url}")
+                            else:
+                                emit_log(target_url, "FAILED", "Không thể gửi bình luận.")
+
+                        except Exception as e:
+                            emit_log(target_url, "FAILED", f"Lỗi thao tác: {str(e)}")
+
+                        if progress_callback:
+                            progress_callback(idx, total)
+
+                        if idx < total and not (is_stopped_fn and is_stopped_fn()):
+                            delay_sec = anti_mgr.get_random_delay()
+                            emit_log("-", "WAITING", f"Nghỉ giãn cách {delay_sec}s trước bài tiếp theo...")
+                            for _ in range(delay_sec):
+                                if is_stopped_fn and is_stopped_fn():
+                                    break
+                                await asyncio.sleep(1)
+
+                # --- TRƯỜNG HỢP 2: TỰ ĐỘNG LƯỚT BẢNG TIN FACEBOOK & LỌC BÀI CÓ SỐ LIKE >= MIN_LIKES ---
+                else:
+                    like_desc = f"Lọc bài >= {min_likes} Likes" if min_likes > 0 else "Mọi bài viết"
+                    emit_log(
+                        "Bảng tin Facebook",
+                        "POSTING",
+                        f"Đang mở Bảng tin Facebook ({like_desc} | Mô phỏng người thật chống Checkpoint)..."
+                    )
+                    await page.goto("https://www.facebook.com/", wait_until="domcontentloaded", timeout=35000)
+                    await page.wait_for_timeout(random.randint(3500, 5000))
+
+                    if human_simulation:
+                        await page.mouse.wheel(0, random.randint(300, 600))
+                        await page.wait_for_timeout(random.randint(1500, 2600))
+
+                    seen_codes = set()
+                    skipped_low_likes = 0
+                    success_count = 0
+
+                    while True:
+                        if is_stopped_fn and is_stopped_fn():
+                            emit_log("-", "SKIPPED", f"Đã dừng tiến trình. Tổng cộng đã bình luận {success_count} bài viết Facebook.")
+                            break
+
+                        while is_paused_fn and is_paused_fn():
+                            if is_stopped_fn and is_stopped_fn():
+                                break
+                            await asyncio.sleep(1)
+
+                        challenge_msg = await self.check_human_verification_challenge(page)
+                        if challenge_msg:
+                            emit_log("-", "FAILED", f"🛡️ {challenge_msg}")
+                            break
+
+                        candidate = None
+                        recent_skipped = []
+                        for _ in range(10):
+                            if is_stopped_fn and is_stopped_fn():
+                                break
+                            feed_posts = await self._scan_fb_feed_posts_with_likes(page)
+                            for fp in feed_posts:
+                                code = fp["post_code"]
+                                if not code or code in seen_codes:
+                                    continue
+                                if min_likes > 0 and fp["likes"] < min_likes:
+                                    seen_codes.add(code)
+                                    skipped_low_likes += 1
+                                    recent_skipped.append(f"{fp['like_text']} ({fp['likes']})")
+                                    await page.evaluate("""(c) => {
+                                        const card = document.querySelector(`[data-agy-fb-card="${c}"]`);
+                                        if (card) card.setAttribute('data-agy-fb-done', '1');
+                                    }""", code)
+                                    continue
+                                candidate = fp
+                                break
+
+                            if candidate:
+                                break
+
+                            await page.mouse.wheel(0, random.randint(600, 1000))
+                            await page.wait_for_timeout(random.randint(1800, 2800))
+
+                        if not candidate:
+                            sample_str = ", ".join(recent_skipped[-5:]) if recent_skipped else "0"
+                            emit_log(
+                                "Bảng tin Facebook",
+                                "WAITING",
+                                f"Đang cuộn tìm bài >= {min_likes} Likes (Đã bỏ qua {skipped_low_likes} bài | Số like đọc được: {sample_str})..."
+                            )
+                            await page.mouse.wheel(0, random.randint(850, 1350))
+                            await page.wait_for_timeout(random.randint(2000, 3200))
+                            continue
+
+                        post_code = candidate["post_code"]
+                        post_url = candidate["url"]
+                        post_like_text = candidate["like_text"]
+                        seen_codes.add(post_code)
+
+                        # Đánh dấu bài viết này đã xử lý để lần quét sau không lặp lại
+                        await page.evaluate("""(c) => {
+                            const card = document.querySelector(`[data-agy-fb-card="${c}"]`);
+                            if (card) card.setAttribute('data-agy-fb-done', '1');
+                        }""", post_code)
+
+                        parsed_cmt, valid_files, tpl_title = get_next_template(success_count)
+                        emit_log(
+                            post_url,
+                            "POSTING",
+                            f"🎯 Đã chọn bài #{success_count + 1} (👍 {post_like_text} lượt thích >= {min_likes}) | Đang bình luận [{tpl_title}]..."
+                        )
+
+                        try:
+                            editor = await self._interact_and_open_comment_on_fb_feed(
+                                page=page,
+                                post_code=post_code,
+                                auto_like=human_simulation
+                            )
+                            if not editor:
+                                emit_log(post_url, "FAILED", "Không mở được khung bình luận cho bài viết này, chuyển sang bài tiếp theo...")
+                                continue
+
+                            if parsed_cmt:
+                                await self.human_type_text(page, editor, parsed_cmt, human_simulation=human_simulation)
+
+                            if valid_files:
+                                await self._attach_media_to_fb_comment(page, editor, valid_files)
+
+                            if await self._submit_fb_comment(page, editor):
+                                success_count += 1
+                                anti_mgr.record_post()
+                                emit_log(
+                                    post_url,
+                                    "SUCCESS",
+                                    f"✅ Đã bình luận bài #{success_count} (👍 {post_like_text} likes) [{tpl_title}]: {post_url}"
+                                )
+                                if progress_callback:
+                                    progress_callback(success_count, 0)
+                            else:
+                                emit_log(post_url, "FAILED", "Không thể gửi bình luận.")
+
+                            # Nếu việc bấm nút Bình luận làm mở hộp thoại bài viết (div[role="dialog"]), đóng hộp thoại để quay về Bảng tin
+                            has_dialog = await page.evaluate("""() => {
+                                const dlg = document.querySelector('div[role="dialog"]');
+                                if (!dlg) return false;
+                                const closeBtn = dlg.querySelector('div[aria-label="Đóng"], div[aria-label="Close"]');
+                                if (closeBtn) {
+                                    closeBtn.click();
+                                    return true;
+                                }
+                                return true;
+                            }""")
+                            if has_dialog:
+                                await page.keyboard.press("Escape")
+                                await page.wait_for_timeout(1200)
+
+                        except Exception as e:
+                            emit_log(post_url, "FAILED", f"Lỗi khi bình luận: {str(e)}")
+                            try:
+                                await page.keyboard.press("Escape")
+                            except Exception:
+                                pass
+
+                        # Giãn cách Anti-Spam kèm cuộn nhẹ tự nhiên
+                        if not (is_stopped_fn and is_stopped_fn()):
+                            delay_sec = anti_mgr.get_random_delay()
+                            emit_log("-", "WAITING", f"Nghỉ giãn cách {delay_sec}s trước bài tiếp theo (Mô phỏng đọc bảng tin)...")
+                            for sec_i in range(delay_sec):
+                                if is_stopped_fn and is_stopped_fn():
+                                    break
+                                while is_paused_fn and is_paused_fn():
+                                    if is_stopped_fn and is_stopped_fn():
+                                        break
+                                    await asyncio.sleep(1)
+                                if human_simulation and sec_i > 0 and sec_i % 18 == 0:
+                                    try:
+                                        await page.mouse.wheel(0, random.randint(180, 420))
+                                    except Exception:
+                                        pass
+                                await asyncio.sleep(1)
+
+                            if anti_mgr.should_rest() and not (is_stopped_fn and is_stopped_fn()):
+                                r_sec = anti_mgr.get_rest_duration_sec()
+                                emit_log("-", "RESTING", f"Tạm nghỉ dài {r_sec // 60} phút chống Checkpoint...")
+                                for _ in range(r_sec):
+                                    if is_stopped_fn and is_stopped_fn():
+                                        break
+                                    while is_paused_fn and is_paused_fn():
+                                        if is_stopped_fn and is_stopped_fn():
+                                            break
+                                        await asyncio.sleep(1)
+                                    await asyncio.sleep(1)
+
+                try:
+                    await self.safe_save_storage_state(context, uid, page_id=page_id)
+                except Exception:
+                    pass
+                await context.close()
+                await browser.close()
+        except Exception as e:
+            emit_log("-", "ERROR", f"Lỗi phiên bình luận Facebook: {str(e)}")
+            try:
+                if context:
+                    await context.close()
+                if browser:
+                    await browser.close()
+            except Exception:
+                pass
+

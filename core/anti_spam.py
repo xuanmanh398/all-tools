@@ -49,10 +49,14 @@ class AntiSpamManager:
 
     def prepare_text(self, text: str) -> str:
         """Thêm mã hash / ký tự ngẫu nhiên vào cuối bài viết nếu được bật."""
+        from core.spintax_parser import SpintaxParser
+        parsed = SpintaxParser.parse(text or "")
         if self.config.add_unique_hash:
             random_hash = ''.join(random.choices(string.ascii_letters + string.digits, k=6))
-            text += f"\n\nRef: #{random_hash}"
-        return text
+            parsed += f"\n\nRef: #{random_hash}"
+        return parsed
+
+    process_content = prepare_text
 
     def prepare_media(self, media_paths: list[str]) -> list[str]:
         """Xáo trộn thứ tự hình ảnh/video nếu được cấu hình."""
