@@ -1,17 +1,26 @@
 import asyncio
+import os
 import time
+import webbrowser
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QComboBox,
     QSpinBox, QCheckBox, QGroupBox, QMessageBox, QProgressBar, QTextEdit,
-    QTableWidget, QTableWidgetItem, QHeaderView, QTimeEdit, QLineEdit, QFrame,
-    QDialog
+    QTableWidget, QTableWidgetItem, QHeaderView, QLineEdit, QFrame,
+    QDialog, QFileDialog, QRadioButton, QButtonGroup
 )
-from PySide6.QtCore import Qt, QThread, Signal, QTimer, QTime, QDateTime
+from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtGui import QFont, QColor
 from core.database import Database
 from core.anti_spam import AntiSpamManager, AntiSpamConfig
 from core.fb_automation import FBAutomationEngine
+from core.excel_loader import (
+    get_configured_excel_path,
+    set_configured_excel_path,
+    get_fresh_media_for_post,
+    DEFAULT_EXCEL_PATH
+)
 from playwright.async_api import async_playwright
+
 
 class PosterWorker(QThread):
     log_signal = Signal(str, str, str, str, str)  # (timestamp, profile_label, group_name, status, message)
@@ -19,7 +28,21 @@ class PosterWorker(QThread):
     status_text_signal = Signal(str)  # Short status for floating widget / tray
     finished_signal = Signal()
 
-    def __init__(self, db: Database, account_uid: str, campaign_id: int, anti_config: AntiSpamConfig, headless: bool = True, post_as_page_name: str = "", category: str = "Tất cả lĩnh vực"):
+    def __init__(
+        self,
+        db: Database,
+        account_uid: str,
+        campaign_id: int,
+        anti_config: AntiSpamConfig,
+        headless: bool = True,
+        post_as_page_name: str = "",
+        category: str = "Tất cả lĩnh vực",
+        loop_forever: bool = True,
+        action_mode: str = "POST_GROUPS",
+        min_likes: int = 0,
+        human_simulation: bool = True,
+        target_urls: list = None
+    ):
         super().__init__()
         self.db = db
         self.account_uid = account_uid
@@ -28,6 +51,11 @@ class PosterWorker(QThread):
         self.headless = headless
         self.post_as_page_name = post_as_page_name
         self.category = category
+        self.loop_forever = loop_forever
+        self.action_mode = action_mode
+        self.min_likes = min_likes
+        self.human_simulation = human_simulation
+        self.target_urls = target_urls or []
         self.is_paused = False
         self.is_stopped = False
 
@@ -54,30 +82,59 @@ class PosterWorker(QThread):
     async def _process_posting(self):
         profile_label = f"Fanpage: {self.post_as_page_name}" if self.post_as_page_name else "Nick cá nhân"
 
-        # Lấy thông tin tài khoản
         accounts = self.db.get_accounts()
         target_acc = next((a for a in accounts if a["uid"] == self.account_uid), None)
         if not target_acc:
             self.log_signal.emit(time.strftime("%H:%M:%S"), profile_label, "-", "FAILED", "Không tìm thấy tài khoản trong CSDL!")
             return
 
-        # Lấy danh sách nhóm được chọn cho Profile/Fanpage này theo Lĩnh Vực
         pages = self.db.get_pages(self.account_uid)
         page_obj = next((p for p in pages if p["page_name"] == self.post_as_page_name), None)
         target_page_id = page_obj["page_id"] if page_obj else ""
+        page_url = page_obj.get("page_url", "") if page_obj else ""
 
-        selected_groups = self.db.get_groups(account_uid=self.account_uid, page_id=target_page_id, category=self.category, only_selected=True)
+        campaigns = self.db.get_campaigns()
+        campaign_map = {c["id"]: c for c in campaigns}
+        target_camp = campaign_map.get(self.campaign_id) if self.campaign_id and self.campaign_id > 0 else None
+        if not target_camp and not campaigns:
+            self.log_signal.emit(time.strftime("%H:%M:%S"), profile_label, "-", "FAILED", "Không tìm thấy mẫu nội dung trong file Excel!")
+            return
+
+        # --- CHẾ ĐỘ ĐI BÌNH LUẬN BẢNG TIN FACEBOOK / LINK BÀI VIẾT (LỌC THEO SỐ LIKE TỐI THIỂU) ---
+        if self.action_mode == "COMMENT_FEED":
+            excel_list = [target_camp] if target_camp else list(campaigns)
+            engine = FBAutomationEngine()
+            self.status_text_signal.emit(f"[{profile_label}] Đang bình luận Facebook (Lọc >= {self.min_likes} Likes)...")
+            await engine.run_fb_commenting_session(
+                cookie_str=target_acc["cookie"],
+                target_urls=self.target_urls,
+                excel_posts=excel_list,
+                anti_config=self.anti_config,
+                proxy=target_acc.get("proxy", ""),
+                headless=self.headless,
+                uid=self.account_uid,
+                post_as_page_name=self.post_as_page_name,
+                page_id=target_page_id,
+                page_url=page_url,
+                min_likes=self.min_likes,
+                human_simulation=self.human_simulation,
+                is_paused_fn=lambda: self.is_paused,
+                is_stopped_fn=lambda: self.is_stopped,
+                log_callback=lambda ts, prof, tgt, st, msg: self.log_signal.emit(ts, prof, tgt, st, msg),
+                progress_callback=lambda cur, tot: self.progress_signal.emit(cur, tot if tot > 0 else cur)
+            )
+            self.status_text_signal.emit(f"Hoàn thành tiến trình bình luận Facebook cho [{profile_label}]!")
+            return
+
+        selected_groups = self.db.get_groups(
+            account_uid=self.account_uid,
+            page_id=target_page_id,
+            category=self.category,
+            only_selected=True
+        )
         if not selected_groups:
             cat_desc = f" thuộc lĩnh vực '{self.category}'" if self.category not in ["Tất cả", "Tất cả lĩnh vực", ""] else ""
             self.log_signal.emit(time.strftime("%H:%M:%S"), profile_label, "-", "FAILED", f"Không có nhóm nào được chọn{cat_desc}!")
-            return
-
-        # Lấy danh sách mẫu nội dung chiến dịch
-        campaigns = self.db.get_campaigns()
-        campaign_map = {c["id"]: c for c in campaigns}
-        target_camp = campaign_map.get(self.campaign_id)
-        if not target_camp and not campaigns:
-            self.log_signal.emit(time.strftime("%H:%M:%S"), profile_label, "-", "FAILED", "Không tìm thấy mẫu nội dung chiến dịch!")
             return
 
         anti_spam = AntiSpamManager(self.anti_config)
@@ -88,13 +145,19 @@ class PosterWorker(QThread):
         self.progress_signal.emit(0, total_groups)
         self.status_text_signal.emit(f"Bắt đầu chiến dịch [{profile_label}]: 0/{total_groups} nhóm")
 
+        try:
+            excel_cursor = int(self.db.get_setting("fb_excel_cursor", 0) or 0)
+        except Exception:
+            excel_cursor = 0
+
         async with async_playwright() as p:
             try:
-                browser, context = await engine.create_context(p, cookies, target_acc.get("proxy", ""), headless=self.headless, uid=self.account_uid, page_id=target_page_id)
+                browser, context = await engine.create_context(
+                    p, cookies, target_acc.get("proxy", ""),
+                    headless=self.headless, uid=self.account_uid, page_id=target_page_id
+                )
                 page = await context.new_page()
 
-                # Tự động chuyển danh tính sang Fanpage hoặc Nick cá nhân (chạy ngầm 100% không cần người dùng thao tác)
-                page_url = page_obj.get("page_url", "") if page_obj else ""
                 await engine.ensure_active_profile(
                     page=page,
                     uid=self.account_uid,
@@ -104,70 +167,72 @@ class PosterWorker(QThread):
                     logger_callback=lambda level, msg: self.log_signal.emit(time.strftime("%H:%M:%S"), profile_label, "-", level, msg)
                 )
 
-                for index, group in enumerate(selected_groups, 1):
-                    if self.is_stopped:
-                        self.log_signal.emit(time.strftime("%H:%M:%S"), profile_label, "-", "SKIPPED", "Tiến trình bị hủy bởi người dùng.")
-                        break
+                cycle_num = 0
+                while True:
+                    cycle_num += 1
+                    for index, group in enumerate(selected_groups, 1):
+                        if self.is_stopped:
+                            self.log_signal.emit(time.strftime("%H:%M:%S"), profile_label, "-", "SKIPPED", "Tiến trình bị hủy bởi người dùng.")
+                            break
 
-                    while self.is_paused:
-                        self.status_text_signal.emit(f"[{profile_label}] Đang tạm dừng...")
-                        await asyncio.sleep(1)
+                        while self.is_paused:
+                            self.status_text_signal.emit(f"[{profile_label}] Đang tạm dừng...")
+                            await asyncio.sleep(1)
+                            if self.is_stopped:
+                                break
+
                         if self.is_stopped:
                             break
 
-                    if self.is_stopped:
-                        break
+                        g_name = group["group_name"]
+                        g_url = group["group_url"]
+                        g_cat = group.get("category", "Mặc định")
 
-                    g_name = group["group_name"]
-                    g_url = group["group_url"]
-                    g_cat = group.get("category", "Mặc định")
+                        grp_camp_id = group.get("campaign_id") or 0
+                        active_camp = campaign_map.get(grp_camp_id) if grp_camp_id > 0 else target_camp
+                        if not active_camp and campaigns:
+                            active_camp = campaigns[excel_cursor % len(campaigns)]
+                            excel_cursor = (excel_cursor + 1) % len(campaigns)
+                            try:
+                                self.db.set_setting("fb_excel_cursor", excel_cursor)
+                            except Exception:
+                                pass
 
-                    # Xác định bài đăng riêng gán cho nhóm (nếu có)
-                    grp_camp_id = group.get("campaign_id") or 0
-                    active_camp = campaign_map.get(grp_camp_id) or target_camp
-                    if not active_camp and campaigns:
-                        active_camp = campaigns[0]
+                        camp_title = active_camp["title"] if active_camp else "Mẫu Excel"
+                        fresh_media = get_fresh_media_for_post(active_camp)
 
-                    camp_title = active_camp["title"] if active_camp else "Mẫu chung"
+                        self.log_signal.emit(
+                            time.strftime("%H:%M:%S"),
+                            profile_label,
+                            f"{g_name} [{g_cat}]",
+                            "POSTING",
+                            f"[Vòng {cycle_num}] Đang đăng '{camp_title}' ({len(fresh_media)} ảnh) vào nhóm ({index}/{total_groups})..."
+                        )
+                        self.status_text_signal.emit(f"[{profile_label}] Đăng '{camp_title}' ({index}/{total_groups}): {g_name}")
 
-                    self.log_signal.emit(time.strftime("%H:%M:%S"), profile_label, f"{g_name} [{g_cat}]", "POSTING", f"Đang đăng bài '{camp_title}' ({index}/{total_groups})...")
-                    self.status_text_signal.emit(f"[{profile_label}] Đăng bài '{camp_title}' ({index}/{total_groups}): {g_name}")
+                        success = await engine.post_to_group(
+                            page=page,
+                            group_url=g_url,
+                            content_template=active_camp["content"],
+                            media_paths=fresh_media,
+                            anti_spam=anti_spam,
+                            logger_callback=lambda level, msg: self.log_signal.emit(time.strftime("%H:%M:%S"), profile_label, g_name, level, msg),
+                            post_as_page_name=self.post_as_page_name,
+                            cookie_str=target_acc["cookie"]
+                        )
 
-                    success = await engine.post_to_group(
-                        page=page,
-                        group_url=g_url,
-                        content_template=active_camp["content"],
-                        media_paths=active_camp["media_paths"],
-                        anti_spam=anti_spam,
-                        logger_callback=lambda level, msg: self.log_signal.emit(time.strftime("%H:%M:%S"), profile_label, g_name, level, msg),
-                        post_as_page_name=self.post_as_page_name,
-                        cookie_str=target_acc["cookie"]
-                    )
+                        if success:
+                            self.log_signal.emit(time.strftime("%H:%M:%S"), profile_label, g_name, "SUCCESS", f"Đăng bài '{camp_title}' thành công! | {g_url}")
+                        else:
+                            self.log_signal.emit(time.strftime("%H:%M:%S"), profile_label, g_name, "FAILED", f"Đăng bài '{camp_title}' thất bại!")
 
-                    if success:
-                        self.log_signal.emit(time.strftime("%H:%M:%S"), profile_label, g_name, "SUCCESS", f"Đăng bài '{camp_title}' thành công!")
-                    else:
-                        self.log_signal.emit(time.strftime("%H:%M:%S"), profile_label, g_name, "FAILED", f"Đăng bài '{camp_title}' thất bại!")
+                        self.progress_signal.emit(index, total_groups)
 
-                    self.progress_signal.emit(index, total_groups)
-
-                    # Nghỉ chống Spam nếu chưa phải nhóm cuối cùng
-                    if index < total_groups and not self.is_stopped:
-                        delay_sec = anti_spam.get_random_delay()
-                        self.log_signal.emit(time.strftime("%H:%M:%S"), profile_label, "-", "WAITING", f"Nghỉ {delay_sec} giây trước khi đăng nhóm tiếp theo...")
-                        for elapsed in range(delay_sec):
-                            if self.is_stopped:
-                                break
-                            while self.is_paused:
-                                await asyncio.sleep(1)
-                                if self.is_stopped:
-                                    break
-                            await asyncio.sleep(1)
-
-                        if anti_spam.should_rest() and not self.is_stopped:
-                            rest_time = anti_spam.get_rest_duration_sec()
-                            self.log_signal.emit(time.strftime("%H:%M:%S"), profile_label, "-", "RESTING", f"Tạm nghỉ chống Spam trong {rest_time // 60} phút ({rest_time}s)...")
-                            for elapsed in range(rest_time):
+                        has_more = (index < total_groups) or self.loop_forever
+                        if has_more and not self.is_stopped:
+                            delay_sec = anti_spam.get_random_delay()
+                            self.log_signal.emit(time.strftime("%H:%M:%S"), profile_label, "-", "WAITING", f"Nghỉ {delay_sec} giây trước khi đăng bài tiếp theo...")
+                            for _ in range(delay_sec):
                                 if self.is_stopped:
                                     break
                                 while self.is_paused:
@@ -175,6 +240,28 @@ class PosterWorker(QThread):
                                     if self.is_stopped:
                                         break
                                 await asyncio.sleep(1)
+
+                            if anti_spam.should_rest() and not self.is_stopped:
+                                rest_time = anti_spam.get_rest_duration_sec()
+                                self.log_signal.emit(time.strftime("%H:%M:%S"), profile_label, "-", "RESTING", f"Tạm nghỉ chống Spam trong {rest_time // 60} phút ({rest_time}s)...")
+                                for _ in range(rest_time):
+                                    if self.is_stopped:
+                                        break
+                                    while self.is_paused:
+                                        await asyncio.sleep(1)
+                                        if self.is_stopped:
+                                            break
+                                    await asyncio.sleep(1)
+
+                    if self.is_stopped or not self.loop_forever:
+                        break
+                    self.log_signal.emit(
+                        time.strftime("%H:%M:%S"),
+                        profile_label,
+                        "-",
+                        "INFO",
+                        f"🔄 Đã hoàn tất vòng #{cycle_num}. Tự động lặp lại vòng #{cycle_num + 1} với mẫu Excel tiếp theo..."
+                    )
 
                 try:
                     await engine.safe_save_storage_state(context, self.account_uid, page_id=target_page_id)
@@ -210,11 +297,10 @@ class GroupSelectionDialog(QDialog):
 
         layout = QVBoxLayout(self)
 
-        # Top Bar: Info + Search
         top_bar = QHBoxLayout()
         cat_desc = f" | Lĩnh vực: {category}" if category not in ["Tất cả", "Tất cả lĩnh vực", ""] else ""
         self.lbl_title = QLabel(f"📋 Mục tiêu đăng: <b>{profile_title}</b>{cat_desc}")
-        self.lbl_title.setStyleSheet("font-size: 13px; color: #89b4fa;")
+        self.lbl_title.setStyleSheet("font-size: 13px; color: #60a5fa;")
         top_bar.addWidget(self.lbl_title)
 
         top_bar.addSpacing(15)
@@ -226,7 +312,6 @@ class GroupSelectionDialog(QDialog):
 
         layout.addLayout(top_bar)
 
-        # Table Widget
         self.table = QTableWidget()
         self.table.setColumnCount(6)
         self.table.setHorizontalHeaderLabels(["Chọn", "ID Nhóm", "Tên Nhóm", "Lĩnh Vực", "Mẫu Nội Dung Gán Riêng", "Link Nhóm"])
@@ -234,7 +319,6 @@ class GroupSelectionDialog(QDialog):
         self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
         layout.addWidget(self.table)
 
-        # Bottom Bar: Actions & Summary
         bot_bar = QHBoxLayout()
         btn_sel_all = QPushButton("✅ Chọn Tất Cả")
         btn_sel_all.clicked.connect(lambda: self.toggle_all(True))
@@ -245,23 +329,22 @@ class GroupSelectionDialog(QDialog):
         bot_bar.addWidget(btn_desel_all)
 
         btn_sync = QPushButton("🔄 Đồng Bộ Nhóm Giữa Nick & Fanpage")
-        btn_sync.setStyleSheet("background-color: #e65100; color: white; font-weight: bold;")
+        btn_sync.setStyleSheet("background-color: #d97706; color: white; font-weight: bold;")
         btn_sync.clicked.connect(self.on_sync)
         bot_bar.addWidget(btn_sync)
 
         bot_bar.addStretch()
 
         self.lbl_count = QLabel("Đã chọn: 0 / 0 nhóm")
-        self.lbl_count.setStyleSheet("font-weight: bold; color: #a6e3a1;")
+        self.lbl_count.setStyleSheet("font-weight: bold; color: #10b981;")
         bot_bar.addWidget(self.lbl_count)
 
         btn_close = QPushButton("💾 Đóng & Áp Dụng")
-        btn_close.setStyleSheet("background-color: #2e7d32; color: white; font-weight: bold; padding: 6px 14px;")
+        btn_close.setStyleSheet("background-color: #2563eb; color: white; font-weight: bold; padding: 6px 14px;")
         btn_close.clicked.connect(self.accept)
         bot_bar.addWidget(btn_close)
 
         layout.addLayout(bot_bar)
-
         self.load_table()
 
     def get_groups(self):
@@ -273,7 +356,7 @@ class GroupSelectionDialog(QDialog):
             for p in pages:
                 res.extend(self.db.get_groups(account_uid=self.account_uid, page_id=p["page_id"], category=self.category))
             return res
-        else: # ALL_PROFILES
+        else:
             res = self.db.get_groups(account_uid=self.account_uid, page_id="", category=self.category)
             pages = self.db.get_pages(self.account_uid)
             for p in pages:
@@ -291,7 +374,6 @@ class GroupSelectionDialog(QDialog):
         self.table.blockSignals(True)
         try:
             self.table.setRowCount(len(groups))
-
             sel_count = 0
             for row, g in enumerate(groups):
                 chk = QCheckBox()
@@ -365,187 +447,841 @@ class PosterTab(QWidget):
         super().__init__()
         self.db = db
         self.workers = []
-        self.fixed_times_list = []
-        self.last_triggered_key = ""
-        self.last_window_run_ts = 0
         self._is_loading_config = False
+        self.preview_tpl_idx = 0
+        self.success_post_count = 0
 
         self.init_ui()
         self.load_all_config()
-        self.init_scheduler_timer()
-        # Không lưu và xóa sạch log trên CSDL khi mở phần mềm
         self.db.clear_logs()
         self.log_table.setRowCount(0)
 
+    def _create_card_frame(self) -> QFrame:
+        card = QFrame()
+        card.setObjectName("dashCard")
+        card.setStyleSheet("""
+            QFrame#dashCard {
+                background-color: #111827;
+                border: 1px solid #1e293b;
+                border-radius: 12px;
+            }
+        """)
+        return card
+
+    def _create_inner_box(self) -> QFrame:
+        box = QFrame()
+        box.setObjectName("innerBox")
+        box.setStyleSheet("""
+            QFrame#innerBox {
+                background-color: #0b0f19;
+                border: 1px solid #1e293b;
+                border-radius: 8px;
+            }
+        """)
+        return box
+
+    def _create_check_row(self, checkbox: QCheckBox) -> QFrame:
+        row_frame = QFrame()
+        row_frame.setObjectName("chkRow")
+        row_frame.setStyleSheet("""
+            QFrame#chkRow {
+                background-color: #0b0f19;
+                border: 1px solid #1e293b;
+                border-radius: 7px;
+            }
+            QFrame#chkRow:hover {
+                border: 1px solid #334155;
+            }
+        """)
+        rl = QHBoxLayout(row_frame)
+        rl.setContentsMargins(10, 7, 10, 7)
+        checkbox.setStyleSheet("border: none; background: transparent; color: #cbd5e1; font-size: 12px;")
+        rl.addWidget(checkbox)
+        return row_frame
+
     def init_ui(self):
-        layout = QVBoxLayout(self)
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(12)
 
-        # Control Panel: Setup Campaign & Anti-Spam
-        setup_box = QGroupBox("Cấu Hình Tiến Trình & Anti-Spam Đa Luồng Fanpage")
-        s_layout = QVBoxLayout(setup_box)
+        # =========================================================================
+        # PHẦN 1: LƯỚI 3 CỘT CARD CẤU HÌNH (THEO ĐÚNG BỐ CỤC ẢNH 2, BỎ ĐẶT LỊCH)
+        # =========================================================================
+        cards_row = QHBoxLayout()
+        cards_row.setSpacing(14)
 
-        # Hàng 1: Tài khoản & Tư cách đăng
-        r1 = QHBoxLayout()
-        r1.addWidget(QLabel("Chọn Tài Khoản:"))
+        # -------------------------------------------------------------------------
+        # CARD 1: 1. NGUỒN & TÀI KHOẢN
+        # -------------------------------------------------------------------------
+        card1 = self._create_card_frame()
+        c1_layout = QVBoxLayout(card1)
+        c1_layout.setContentsMargins(16, 14, 16, 14)
+        c1_layout.setSpacing(10)
+
+        # Header Card 1
+        c1_header = QHBoxLayout()
+        lbl_num1 = QLabel("1")
+        lbl_num1.setFixedSize(22, 22)
+        lbl_num1.setAlignment(Qt.AlignCenter)
+        lbl_num1.setStyleSheet("background-color: #1e3a8a; color: #60a5fa; font-weight: bold; font-size: 11px; border-radius: 5px; border: none;")
+        c1_header.addWidget(lbl_num1)
+
+        lbl_title1 = QLabel("Nguồn & Tài Khoản")
+        lbl_title1.setStyleSheet("color: #f8fafc; font-size: 14px; font-weight: bold; border: none; background: transparent;")
+        c1_header.addWidget(lbl_title1)
+        c1_header.addStretch()
+
+        lbl_sub1 = QLabel("Cấu hình chính")
+        lbl_sub1.setStyleSheet("color: #64748b; font-size: 11px; border: none; background: transparent;")
+        c1_header.addWidget(lbl_sub1)
+        c1_layout.addLayout(c1_header)
+
+        sep1 = QFrame()
+        sep1.setFrameShape(QFrame.HLine)
+        sep1.setStyleSheet("background-color: #1e293b; border: none; max-height: 1px;")
+        c1_layout.addWidget(sep1)
+
+        # Chọn Tài Khoản FB
+        lbl_acc = QLabel("Chọn Tài Khoản FB")
+        lbl_acc.setStyleSheet("color: #94a3b8; font-size: 11px; font-weight: 600; border: none; background: transparent;")
+        c1_layout.addWidget(lbl_acc)
+
         self.combo_accounts = QComboBox()
+        self.combo_accounts.setFixedHeight(36)
         self.combo_accounts.currentIndexChanged.connect(self.on_account_combo_changed)
-        r1.addWidget(self.combo_accounts, stretch=1)
+        c1_layout.addWidget(self.combo_accounts)
 
-        r1.addWidget(QLabel("Đăng bài với tư cách:"))
+        # Đăng bài với tư cách
+        lbl_post_as = QLabel("Đăng bài với tư cách")
+        lbl_post_as.setStyleSheet("color: #94a3b8; font-size: 11px; font-weight: 600; border: none; background: transparent;")
+        c1_layout.addWidget(lbl_post_as)
+
         self.combo_post_as = QComboBox()
+        self.combo_post_as.setFixedHeight(36)
         self.combo_post_as.currentIndexChanged.connect(self.on_post_as_changed)
-        r1.addWidget(self.combo_post_as, stretch=1)
-        s_layout.addLayout(r1)
+        c1_layout.addWidget(self.combo_post_as)
 
-        # Hàng 2: Lĩnh vực nhóm & Mẫu nội dung
-        r2_sub = QHBoxLayout()
-        r2_sub.addWidget(QLabel("Lĩnh Vực Nhóm Đăng:"))
-        self.combo_category = QComboBox()
-        self.combo_category.currentIndexChanged.connect(self.on_category_changed)
-        r2_sub.addWidget(self.combo_category, stretch=1)
+        # Chế Độ Hành Động (2 Tile Chọn Giống Ảnh 2)
+        lbl_mode = QLabel("Chế Độ Hành Động")
+        lbl_mode.setStyleSheet("color: #94a3b8; font-size: 11px; font-weight: 600; border: none; background: transparent;")
+        c1_layout.addWidget(lbl_mode)
 
-        r2_sub.addWidget(QLabel("Chọn Mẫu Nội Dung:"))
-        self.combo_campaigns = QComboBox()
-        self.combo_campaigns.currentIndexChanged.connect(self.save_all_config)
-        self.combo_campaigns.currentIndexChanged.connect(self.update_campaign_preview)
-        r2_sub.addWidget(self.combo_campaigns, stretch=1)
-        s_layout.addLayout(r2_sub)
+        tiles_row = QHBoxLayout()
+        tiles_row.setSpacing(10)
 
-        # Vùng xem trước nội dung bài viết FB sẽ đăng
-        preview_group = QGroupBox("Xem Trước Bài Viết Sẽ Đăng Lên Facebook (Mẫu Chiến Dịch)")
-        prev_layout = QVBoxLayout(preview_group)
-        prev_layout.setContentsMargins(6, 6, 6, 6)
-        prev_layout.setSpacing(4)
+        # Tile 1: Đăng Bài Vào Nhóm
+        self.tile_post_groups = QFrame()
+        self.tile_post_groups.setCursor(Qt.PointingHandCursor)
+        self.tile_post_groups.mousePressEvent = lambda e: self.rad_fb_post_groups.setChecked(True)
+        t1_l = QVBoxLayout(self.tile_post_groups)
+        t1_l.setContentsMargins(12, 10, 12, 10)
+        t1_l.setSpacing(6)
+        t1_top = QHBoxLayout()
+        lbl_t1_ico = QLabel("📮")
+        lbl_t1_ico.setStyleSheet("font-size: 15px; border: none; background: transparent;")
+        t1_top.addWidget(lbl_t1_ico)
+        t1_top.addStretch()
+        self.rad_fb_post_groups = QRadioButton()
+        self.rad_fb_post_groups.setChecked(True)
+        self.rad_fb_post_groups.setStyleSheet("border: none; background: transparent;")
+        t1_top.addWidget(self.rad_fb_post_groups)
+        t1_l.addLayout(t1_top)
+        lbl_t1_txt = QLabel("Đăng Bài Vào Nhóm")
+        lbl_t1_txt.setStyleSheet("color: #f8fafc; font-weight: bold; font-size: 12px; border: none; background: transparent;")
+        t1_l.addWidget(lbl_t1_txt)
+        tiles_row.addWidget(self.tile_post_groups, 1)
 
-        prev_header = QHBoxLayout()
-        self.lbl_camp_preview_info = QLabel("Chưa chọn bài viết")
-        self.lbl_camp_preview_info.setStyleSheet("color: #a6adc8; font-size: 11px; font-style: italic;")
-        prev_header.addWidget(self.lbl_camp_preview_info)
-        prev_header.addStretch()
+        # Tile 2: Bình Luận Bảng Tin
+        self.tile_comment_feed = QFrame()
+        self.tile_comment_feed.setCursor(Qt.PointingHandCursor)
+        self.tile_comment_feed.mousePressEvent = lambda e: self.rad_fb_comment_feed.setChecked(True)
+        t2_l = QVBoxLayout(self.tile_comment_feed)
+        t2_l.setContentsMargins(12, 10, 12, 10)
+        t2_l.setSpacing(6)
+        t2_top = QHBoxLayout()
+        lbl_t2_ico = QLabel("💬")
+        lbl_t2_ico.setStyleSheet("font-size: 15px; border: none; background: transparent;")
+        t2_top.addWidget(lbl_t2_ico)
+        t2_top.addStretch()
+        self.rad_fb_comment_feed = QRadioButton()
+        self.rad_fb_comment_feed.setStyleSheet("border: none; background: transparent;")
+        t2_top.addWidget(self.rad_fb_comment_feed)
+        t2_l.addLayout(t2_top)
+        lbl_t2_txt = QLabel("Bình Luận Bảng Tin")
+        lbl_t2_txt.setStyleSheet("color: #cbd5e1; font-weight: bold; font-size: 12px; border: none; background: transparent;")
+        t2_l.addWidget(lbl_t2_txt)
+        tiles_row.addWidget(self.tile_comment_feed, 1)
 
-        btn_spin_test = QPushButton("👁️ Xem Biến Thể Spintax")
-        btn_spin_test.setStyleSheet("background-color: #0288d1; color: white; padding: 2px 8px; font-size: 11px; font-weight: bold;")
-        btn_spin_test.clicked.connect(self.on_preview_campaign_spin)
-        prev_header.addWidget(btn_spin_test)
-        prev_layout.addLayout(prev_header)
+        self.fb_mode_group = QButtonGroup(self)
+        self.fb_mode_group.addButton(self.rad_fb_post_groups)
+        self.fb_mode_group.addButton(self.rad_fb_comment_feed)
+        self.rad_fb_post_groups.toggled.connect(self.on_fb_action_mode_changed)
 
-        self.txt_camp_preview = QTextEdit()
-        self.txt_camp_preview.setReadOnly(True)
-        self.txt_camp_preview.setFont(QFont("Segoe UI Emoji", 11))
-        self.txt_camp_preview.setStyleSheet("background-color: #181825; color: #cdd6f4; font-size: 13px; line-height: 1.4; padding: 6px; border: 1px solid #313244; border-radius: 4px;")
-        self.txt_camp_preview.setMinimumHeight(95)
-        self.txt_camp_preview.setMaximumHeight(135)
-        prev_layout.addWidget(self.txt_camp_preview)
-        s_layout.addWidget(preview_group)
+        c1_layout.addLayout(tiles_row)
 
-        # Anti-Spam Options & Info Label
-        r2 = QHBoxLayout()
-        self.lbl_group_count = QLabel("Target: 0 nhóm")
-        self.lbl_group_count.setStyleSheet("font-weight: bold; color: #4caf50;")
-        r2.addWidget(self.lbl_group_count)
+        # Khung lọc số Like tối thiểu (Hiện khi chọn Bình Luận Bảng Tin)
+        self.fb_comment_widget = self._create_inner_box()
+        fb_cw_layout = QVBoxLayout(self.fb_comment_widget)
+        fb_cw_layout.setContentsMargins(10, 8, 10, 8)
+        fb_cw_layout.setSpacing(6)
 
-        self.btn_manage_groups = QPushButton("📋 Chọn / Xem Nhóm Target")
-        self.btn_manage_groups.setStyleSheet("background-color: #313244; color: #89b4fa; font-weight: bold; padding: 3px 8px;")
-        self.btn_manage_groups.clicked.connect(self.open_group_selection_dialog)
-        r2.addWidget(self.btn_manage_groups)
+        fb_like_row = QHBoxLayout()
+        fb_like_row.setSpacing(4)
+        lbl_fb_min_likes = QLabel("👍 Like tối thiểu:")
+        lbl_fb_min_likes.setStyleSheet("color: #60a5fa; font-weight: bold; font-size: 11px; border: none; background: transparent;")
+        fb_like_row.addWidget(lbl_fb_min_likes)
 
-        self.btn_quick_sync = QPushButton("🔄 Đồng Bộ Nhóm")
-        self.btn_quick_sync.setToolTip("Đồng bộ danh sách nhóm giữa Nick cá nhân và tất cả Fanpage")
-        self.btn_quick_sync.setStyleSheet("background-color: #313244; color: #fab387; font-weight: bold; padding: 3px 8px;")
-        self.btn_quick_sync.clicked.connect(self.quick_sync_groups)
-        r2.addWidget(self.btn_quick_sync)
+        saved_fb_min_likes = int(self.db.get_setting("fb_min_likes", 100) or 0)
+        self.spin_fb_min_likes = QSpinBox()
+        self.spin_fb_min_likes.setRange(0, 1000000)
+        self.spin_fb_min_likes.setSingleStep(50)
+        self.spin_fb_min_likes.setValue(saved_fb_min_likes)
+        self.spin_fb_min_likes.setSuffix(" Likes")
+        self.spin_fb_min_likes.setFixedHeight(26)
+        self.spin_fb_min_likes.setStyleSheet("font-weight: bold; color: #f8fafc; background-color: #111827; padding: 2px 6px; border: 1px solid #2563eb; border-radius: 4px; font-size: 11px;")
+        self.spin_fb_min_likes.valueChanged.connect(self.save_all_config)
+        fb_like_row.addWidget(self.spin_fb_min_likes)
 
-        r2.addSpacing(15)
-        r2.addWidget(QLabel("Delay giữa 2 nhóm (Giây):"))
-        self.spin_delay_min = QSpinBox()
-        self.spin_delay_min.setRange(5, 600)
-        self.spin_delay_min.setValue(45)
-        self.spin_delay_min.valueChanged.connect(self.save_all_config)
-        r2.addWidget(self.spin_delay_min)
+        for preset_val, preset_lbl in [(0, "0"), (50, "50+"), (100, "100+"), (500, "500+"), (1000, "1K+")]:
+            btn_p = QPushButton(preset_lbl)
+            btn_p.setCursor(Qt.PointingHandCursor)
+            btn_p.setFixedHeight(24)
+            btn_p.setStyleSheet("background-color: #1e293b; color: #cbd5e1; padding: 1px 6px; font-size: 10px; border-radius: 4px; border: 1px solid #334155;")
+            btn_p.clicked.connect(lambda _, v=preset_val: self.spin_fb_min_likes.setValue(v))
+            fb_like_row.addWidget(btn_p)
+        fb_cw_layout.addLayout(fb_like_row)
 
-        r2.addWidget(QLabel("đến"))
-        self.spin_delay_max = QSpinBox()
-        self.spin_delay_max.setRange(10, 1200)
-        self.spin_delay_max.setValue(120)
-        self.spin_delay_max.valueChanged.connect(self.save_all_config)
-        r2.addWidget(self.spin_delay_max)
+        self.txt_fb_target_urls = QLineEdit()
+        self.txt_fb_target_urls.setPlaceholderText("Link bài viết cụ thể (Để trống = Tự lướt Bảng tin FB)")
+        self.txt_fb_target_urls.setFixedHeight(26)
+        self.txt_fb_target_urls.setStyleSheet("background-color: #111827; color: #cbd5e1; padding: 2px 8px; border: 1px solid #1e293b; border-radius: 4px; font-size: 11px;")
+        fb_cw_layout.addWidget(self.txt_fb_target_urls)
 
-        r2.addWidget(QLabel("Nghỉ (Phút):"))
-        self.spin_rest_min = QSpinBox()
-        self.spin_rest_min.setRange(1, 120)
-        self.spin_rest_min.setValue(10)
-        self.spin_rest_min.valueChanged.connect(self.save_all_config)
-        r2.addWidget(self.spin_rest_min)
+        self.fb_comment_widget.setVisible(False)
+        c1_layout.addWidget(self.fb_comment_widget)
 
-        r2.addWidget(QLabel("Sau số bài đăng:"))
-        self.spin_rest_after = QSpinBox()
-        self.spin_rest_after.setRange(1, 50)
-        self.spin_rest_after.setValue(5)
-        self.spin_rest_after.valueChanged.connect(self.save_all_config)
-        r2.addWidget(self.spin_rest_after)
+        # ANTI-SPAM & BẢO MẬT
+        lbl_sec = QLabel("ANTI-SPAM & BẢO MẬT")
+        lbl_sec.setStyleSheet("color: #64748b; font-size: 10px; font-weight: bold; letter-spacing: 0.5px; border: none; background: transparent; margin-top: 2px;")
+        c1_layout.addWidget(lbl_sec)
 
-        s_layout.addLayout(r2)
+        self.chk_fb_human_sim = QCheckBox("Chống xác minh con người / Checkpoint tự động")
+        self.chk_fb_human_sim.setChecked(True)
+        self.chk_fb_human_sim.toggled.connect(self.save_all_config)
+        c1_layout.addWidget(self._create_check_row(self.chk_fb_human_sim))
 
-        r3 = QHBoxLayout()
-        r3.addWidget(QLabel("Chế Độ Trình Duyệt:"))
-        self.combo_browser_mode = QComboBox()
-        self.combo_browser_mode.addItem("👁️ HIỂN THỊ TRÌNH DUYỆT (Quan sát trực tiếp)", False)
-        self.combo_browser_mode.addItem("🥷 CHẠY NGẦM HỆ THỐNG (Tự động ẩn trình duyệt)", True)
-        self.combo_browser_mode.setStyleSheet("font-weight: bold; padding: 4px;")
-        self.combo_browser_mode.currentIndexChanged.connect(self.save_all_config)
-        r3.addWidget(self.combo_browser_mode)
+        self.chk_shuffle_media = QCheckBox("Xáo trộn thứ tự hình ảnh/video ngẫu nhiên")
+        self.chk_shuffle_media.setChecked(True)
+        self.chk_shuffle_media.toggled.connect(self.save_all_config)
+        c1_layout.addWidget(self._create_check_row(self.chk_shuffle_media))
 
         self.chk_hash = QCheckBox("Thêm mã Hash ngẫu nhiên cuối bài")
         self.chk_hash.toggled.connect(self.save_all_config)
-        r3.addWidget(self.chk_hash)
+        c1_layout.addWidget(self._create_check_row(self.chk_hash))
 
-        self.chk_shuffle_media = QCheckBox("Xáo trộn thứ tự hình ảnh/video")
-        self.chk_shuffle_media.setChecked(True)
-        self.chk_shuffle_media.toggled.connect(self.save_all_config)
-        r3.addWidget(self.chk_shuffle_media)
+        c1_layout.addStretch()
+        cards_row.addWidget(card1, 1)
 
-        s_layout.addLayout(r3)
-        layout.addWidget(setup_box)
+        # -------------------------------------------------------------------------
+        # CARD 2: 2. NỘI DUNG & SPINTAX
+        # -------------------------------------------------------------------------
+        card2 = self._create_card_frame()
+        c2_layout = QVBoxLayout(card2)
+        c2_layout.setContentsMargins(16, 14, 16, 14)
+        c2_layout.setSpacing(10)
 
-        # Lên Lịch Đăng Bài Tự Động (Scheduler)
-        self.schedule_box = self.init_scheduler_ui()
-        layout.addWidget(self.schedule_box)
+        # Header Card 2
+        c2_header = QHBoxLayout()
+        lbl_num2 = QLabel("2")
+        lbl_num2.setFixedSize(22, 22)
+        lbl_num2.setAlignment(Qt.AlignCenter)
+        lbl_num2.setStyleSheet("background-color: #1e3a8a; color: #60a5fa; font-weight: bold; font-size: 11px; border-radius: 5px; border: none;")
+        c2_header.addWidget(lbl_num2)
 
-        # Execution Buttons & Progress Bar
-        exec_box = QGroupBox("Điều Khiển Đăng Bài Tự Động")
-        e_layout = QVBoxLayout(exec_box)
+        lbl_title2 = QLabel("Nội Dung & Spintax")
+        lbl_title2.setStyleSheet("color: #f8fafc; font-size: 14px; font-weight: bold; border: none; background: transparent;")
+        c2_header.addWidget(lbl_title2)
+        c2_header.addStretch()
 
-        btn_bar = QHBoxLayout()
-        self.btn_start = QPushButton("🚀 BẮT ĐẦU ĐĂNG BÀI ĐA LUỒNG")
-        self.btn_start.setStyleSheet("background-color: #2e7d32; color: white; font-weight: bold; font-size: 14px; padding: 8px;")
-        self.btn_start.clicked.connect(self.on_start)
-        btn_bar.addWidget(self.btn_start)
+        btn_spin_test = QPushButton("🔀 Xem Biến Spintax")
+        btn_spin_test.setCursor(Qt.PointingHandCursor)
+        btn_spin_test.setStyleSheet("""
+            QPushButton {
+                background: transparent;
+                color: #3b82f6;
+                border: none;
+                font-size: 11px;
+                font-weight: bold;
+                padding: 2px 4px;
+            }
+            QPushButton:hover {
+                color: #60a5fa;
+                text-decoration: underline;
+            }
+        """)
+        btn_spin_test.clicked.connect(self.on_preview_campaign_spin)
+        c2_header.addWidget(btn_spin_test)
+        c2_layout.addLayout(c2_header)
 
-        self.btn_pause = QPushButton("⏸️ Tạm Dừng")
-        self.btn_pause.setEnabled(False)
-        self.btn_pause.clicked.connect(self.on_toggle_pause)
-        btn_bar.addWidget(self.btn_pause)
+        sep2 = QFrame()
+        sep2.setFrameShape(QFrame.HLine)
+        sep2.setStyleSheet("background-color: #1e293b; border: none; max-height: 1px;")
+        c2_layout.addWidget(sep2)
 
-        self.btn_stop = QPushButton("🛑 Dừng Hẳn")
-        self.btn_stop.setStyleSheet("background-color: #c62828; color: white; font-weight: bold;")
-        self.btn_stop.setEnabled(False)
-        self.btn_stop.clicked.connect(self.on_stop)
-        btn_bar.addWidget(self.btn_stop)
+        # Box Chọn File Excel
+        excel_box = self._create_inner_box()
+        eb_layout = QVBoxLayout(excel_box)
+        eb_layout.setContentsMargins(12, 10, 12, 10)
+        eb_layout.setSpacing(8)
 
-        e_layout.addLayout(btn_bar)
+        eb_top = QHBoxLayout()
+        lbl_excel_title = QLabel("Mẫu Bài Viết (Excel)")
+        lbl_excel_title.setStyleSheet("color: #94a3b8; font-size: 11px; font-weight: 600; border: none; background: transparent;")
+        eb_top.addWidget(lbl_excel_title)
+        eb_top.addStretch()
+
+        self.lbl_excel_badge = QLabel("0 Mẫu sẵn sàng")
+        self.lbl_excel_badge.setStyleSheet("""
+            QLabel {
+                background-color: #052e16;
+                color: #10b981;
+                border: 1px solid #065f46;
+                border-radius: 4px;
+                padding: 2px 8px;
+                font-size: 10px;
+                font-weight: bold;
+            }
+        """)
+        eb_top.addWidget(self.lbl_excel_badge)
+        eb_layout.addLayout(eb_top)
+
+        eb_btns = QHBoxLayout()
+        eb_btns.setSpacing(8)
+        btn_pick_excel = QPushButton("📄  Chọn File Excel")
+        btn_pick_excel.setCursor(Qt.PointingHandCursor)
+        btn_pick_excel.setFixedHeight(34)
+        btn_pick_excel.setStyleSheet("""
+            QPushButton {
+                background-color: #2563eb;
+                color: #ffffff;
+                font-weight: bold;
+                font-size: 12px;
+                border: 1px solid #3b82f6;
+                border-radius: 6px;
+            }
+            QPushButton:hover {
+                background-color: #1d4ed8;
+            }
+        """)
+        btn_pick_excel.clicked.connect(self.on_pick_excel_file)
+        eb_btns.addWidget(btn_pick_excel, 1)
+
+        btn_reload_excel = QPushButton("🔄")
+        btn_reload_excel.setCursor(Qt.PointingHandCursor)
+        btn_reload_excel.setFixedSize(34, 34)
+        btn_reload_excel.setToolTip("Đọc lại file Excel mẫu bài viết")
+        btn_reload_excel.setStyleSheet("""
+            QPushButton {
+                background-color: #1e293b;
+                color: #cbd5e1;
+                border: 1px solid #334155;
+                border-radius: 6px;
+                font-size: 13px;
+                padding: 0px;
+            }
+            QPushButton:hover {
+                background-color: #334155;
+                color: #ffffff;
+            }
+        """)
+        btn_reload_excel.clicked.connect(self.load_all_config)
+        eb_btns.addWidget(btn_reload_excel)
+        eb_layout.addLayout(eb_btns)
+
+        self.combo_campaigns = QComboBox()
+        self.combo_campaigns.setVisible(False)
+        self.combo_campaigns.currentIndexChanged.connect(self.save_all_config)
+        self.combo_campaigns.currentIndexChanged.connect(self.update_campaign_preview)
+        eb_layout.addWidget(self.combo_campaigns)
+
+        c2_layout.addWidget(excel_box)
+
+        # Header Xem Trước Bài Viết (Mẫu #k) + Điều hướng < k / N >
+        prev_nav_row = QHBoxLayout()
+        self.lbl_preview_title = QLabel("Xem Trước Bài Viết (Mẫu #1)")
+        self.lbl_preview_title.setStyleSheet("color: #94a3b8; font-size: 11px; font-weight: 600; border: none; background: transparent;")
+        prev_nav_row.addWidget(self.lbl_preview_title)
+        prev_nav_row.addStretch()
+
+        self.btn_prev_tpl = QPushButton("‹")
+        self.btn_prev_tpl.setCursor(Qt.PointingHandCursor)
+        self.btn_prev_tpl.setFixedSize(22, 22)
+        self.btn_prev_tpl.setStyleSheet("background-color: transparent; color: #94a3b8; border: none; font-size: 15px; font-weight: bold; padding: 0;")
+        self.btn_prev_tpl.clicked.connect(self.on_prev_template)
+        prev_nav_row.addWidget(self.btn_prev_tpl)
+
+        self.lbl_tpl_counter = QLabel("1 / 1")
+        self.lbl_tpl_counter.setStyleSheet("color: #94a3b8; font-size: 11px; border: none; background: transparent; padding: 0 4px;")
+        prev_nav_row.addWidget(self.lbl_tpl_counter)
+
+        self.btn_next_tpl = QPushButton("›")
+        self.btn_next_tpl.setCursor(Qt.PointingHandCursor)
+        self.btn_next_tpl.setFixedSize(22, 22)
+        self.btn_next_tpl.setStyleSheet("background-color: transparent; color: #94a3b8; border: none; font-size: 15px; font-weight: bold; padding: 0;")
+        self.btn_next_tpl.clicked.connect(self.on_next_template)
+        prev_nav_row.addWidget(self.btn_next_tpl)
+
+        c2_layout.addLayout(prev_nav_row)
+
+        # Khung Social Post Preview (Giống hệt Ảnh 2)
+        social_preview_box = self._create_inner_box()
+        sp_layout = QVBoxLayout(social_preview_box)
+        sp_layout.setContentsMargins(12, 10, 12, 10)
+        sp_layout.setSpacing(6)
+
+        # Dòng Avatar FB + Tên tư cách đăng
+        sp_author_row = QHBoxLayout()
+        sp_author_row.setSpacing(8)
+        lbl_fb_ava = QLabel("FB")
+        lbl_fb_ava.setFixedSize(24, 24)
+        lbl_fb_ava.setAlignment(Qt.AlignCenter)
+        lbl_fb_ava.setStyleSheet("background-color: #1e3a8a; color: #60a5fa; font-weight: bold; font-size: 10px; border-radius: 12px; border: none;")
+        sp_author_row.addWidget(lbl_fb_ava)
+
+        self.lbl_preview_author = QLabel("Nick Cá Nhân")
+        self.lbl_preview_author.setStyleSheet("color: #f8fafc; font-weight: bold; font-size: 12px; border: none; background: transparent;")
+        sp_author_row.addWidget(self.lbl_preview_author)
+        sp_author_row.addStretch()
+        sp_layout.addLayout(sp_author_row)
+
+        # Nội dung bài viết mẫu
+        self.txt_camp_preview = QTextEdit()
+        self.txt_camp_preview.setReadOnly(True)
+        self.txt_camp_preview.setFont(QFont("Segoe UI Emoji", 10))
+        self.txt_camp_preview.setStyleSheet("""
+            QTextEdit {
+                background-color: transparent;
+                color: #cbd5e1;
+                font-size: 12px;
+                line-height: 1.45;
+                padding: 2px 0px;
+                border: none;
+            }
+        """)
+        self.txt_camp_preview.setMinimumHeight(95)
+        sp_layout.addWidget(self.txt_camp_preview, 1)
+
+        sp_sep = QFrame()
+        sp_sep.setFrameShape(QFrame.HLine)
+        sp_sep.setStyleSheet("background-color: #1e293b; border: none; max-height: 1px;")
+        sp_layout.addWidget(sp_sep)
+
+        # Footer: Đường dẫn ảnh bên trái | Spintax Active bên phải
+        sp_footer = QHBoxLayout()
+        self.lbl_camp_preview_info = QLabel("Đường dẫn ảnh: -")
+        self.lbl_camp_preview_info.setStyleSheet("color: #64748b; font-size: 11px; border: none; background: transparent;")
+        sp_footer.addWidget(self.lbl_camp_preview_info, 1)
+
+        lbl_spintax_active = QLabel("Spintax Active")
+        lbl_spintax_active.setStyleSheet("color: #3b82f6; font-size: 11px; font-weight: 600; text-decoration: underline; border: none; background: transparent;")
+        sp_footer.addWidget(lbl_spintax_active)
+        sp_layout.addLayout(sp_footer)
+
+        c2_layout.addWidget(social_preview_box, 1)
+        cards_row.addWidget(card2, 1)
+
+        # -------------------------------------------------------------------------
+        # CARD 3: 3. TIẾN TRÌNH & TARGET
+        # -------------------------------------------------------------------------
+        card3 = self._create_card_frame()
+        c3_layout = QVBoxLayout(card3)
+        c3_layout.setContentsMargins(16, 14, 16, 14)
+        c3_layout.setSpacing(10)
+
+        # Header Card 3
+        c3_header = QHBoxLayout()
+        lbl_num3 = QLabel("3")
+        lbl_num3.setFixedSize(22, 22)
+        lbl_num3.setAlignment(Qt.AlignCenter)
+        lbl_num3.setStyleSheet("background-color: #422006; color: #f59e0b; font-weight: bold; font-size: 11px; border-radius: 5px; border: none;")
+        c3_header.addWidget(lbl_num3)
+
+        lbl_title3 = QLabel("Tiến Trình & Target")
+        lbl_title3.setStyleSheet("color: #f8fafc; font-size: 14px; font-weight: bold; border: none; background: transparent;")
+        c3_header.addWidget(lbl_title3)
+        c3_header.addStretch()
+
+        lbl_sub3 = QLabel("Đa luồng")
+        lbl_sub3.setStyleSheet("color: #64748b; font-size: 11px; border: none; background: transparent;")
+        c3_header.addWidget(lbl_sub3)
+        c3_layout.addLayout(c3_header)
+
+        sep3 = QFrame()
+        sep3.setFrameShape(QFrame.HLine)
+        sep3.setStyleSheet("background-color: #1e293b; border: none; max-height: 1px;")
+        c3_layout.addWidget(sep3)
+
+        # Box Nhóm Target & Delay
+        target_box = self._create_inner_box()
+        tb_layout = QVBoxLayout(target_box)
+        tb_layout.setContentsMargins(12, 10, 12, 10)
+        tb_layout.setSpacing(8)
+
+        tb_top = QHBoxLayout()
+        self.lbl_group_count = QLabel("Nhóm Target (0 Nhóm)")
+        self.lbl_group_count.setStyleSheet("color: #f8fafc; font-weight: bold; font-size: 12px; border: none; background: transparent;")
+        tb_top.addWidget(self.lbl_group_count)
+        tb_top.addStretch()
+
+        self.btn_manage_groups = QPushButton("📋 Chọn nhóm")
+        self.btn_manage_groups.setCursor(Qt.PointingHandCursor)
+        self.btn_manage_groups.setFixedHeight(26)
+        self.btn_manage_groups.setStyleSheet("""
+            QPushButton {
+                background-color: #1e293b;
+                color: #60a5fa;
+                border: 1px solid #334155;
+                border-radius: 5px;
+                padding: 2px 8px;
+                font-size: 11px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #334155;
+                color: #ffffff;
+            }
+        """)
+        self.btn_manage_groups.clicked.connect(self.open_group_selection_dialog)
+        tb_top.addWidget(self.btn_manage_groups)
+
+        self.btn_quick_sync = QPushButton("🔄 Đồng bộ")
+        self.btn_quick_sync.setCursor(Qt.PointingHandCursor)
+        self.btn_quick_sync.setFixedHeight(26)
+        self.btn_quick_sync.setToolTip("Đồng bộ danh sách nhóm giữa Nick cá nhân và tất cả Fanpage")
+        self.btn_quick_sync.setStyleSheet("""
+            QPushButton {
+                background-color: #1e293b;
+                color: #cbd5e1;
+                border: 1px solid #334155;
+                border-radius: 5px;
+                padding: 2px 8px;
+                font-size: 11px;
+            }
+            QPushButton:hover {
+                background-color: #334155;
+                color: #ffffff;
+            }
+        """)
+        self.btn_quick_sync.clicked.connect(self.quick_sync_groups)
+        tb_top.addWidget(self.btn_quick_sync)
+        tb_layout.addLayout(tb_top)
+
+        # Lĩnh vực nhóm (ẩn gọn nếu chỉ có Tất cả lĩnh vực hoặc chọn nhanh)
+        cat_row = QHBoxLayout()
+        lbl_cat = QLabel("Lĩnh vực:")
+        lbl_cat.setStyleSheet("color: #64748b; font-size: 11px; border: none; background: transparent;")
+        cat_row.addWidget(lbl_cat)
+        self.combo_category = QComboBox()
+        self.combo_category.setFixedHeight(28)
+        self.combo_category.setStyleSheet("background-color: #111827; border: 1px solid #1e293b; border-radius: 5px; font-size: 11px; padding: 2px 8px;")
+        self.combo_category.currentIndexChanged.connect(self.on_category_changed)
+        cat_row.addWidget(self.combo_category, 1)
+        tb_layout.addLayout(cat_row)
+
+        # Hàng nhãn Delay & Nghỉ
+        delay_lbl_row = QHBoxLayout()
+        lbl_dl = QLabel("Delay giữa 2 nhóm (s)")
+        lbl_dl.setStyleSheet("color: #64748b; font-size: 11px; border: none; background: transparent;")
+        delay_lbl_row.addWidget(lbl_dl, 1)
+        lbl_rst = QLabel("Nghỉ (Phút) / Sau số bài")
+        lbl_rst.setStyleSheet("color: #64748b; font-size: 11px; border: none; background: transparent;")
+        delay_lbl_row.addWidget(lbl_rst, 1)
+        tb_layout.addLayout(delay_lbl_row)
+
+        # Hàng 4 ô SpinBox (Giống hệt Ảnh 2: [ 46 ] đến [ 120 ] | [ 10 ] [ 5 ])
+        delay_inp_row = QHBoxLayout()
+        delay_inp_row.setSpacing(6)
+
+        spin_css = """
+            QSpinBox {
+                background-color: #111827;
+                color: #f8fafc;
+                border: 1px solid #1e293b;
+                border-radius: 6px;
+                padding: 4px 6px;
+                font-weight: bold;
+                font-size: 12px;
+            }
+            QSpinBox:focus {
+                border: 1px solid #2563eb;
+            }
+        """
+
+        self.spin_delay_min = QSpinBox()
+        self.spin_delay_min.setRange(5, 600)
+        self.spin_delay_min.setValue(46)
+        self.spin_delay_min.setAlignment(Qt.AlignCenter)
+        self.spin_delay_min.setFixedHeight(32)
+        self.spin_delay_min.setStyleSheet(spin_css)
+        self.spin_delay_min.valueChanged.connect(self.save_all_config)
+        delay_inp_row.addWidget(self.spin_delay_min, 1)
+
+        lbl_den = QLabel("đến")
+        lbl_den.setAlignment(Qt.AlignCenter)
+        lbl_den.setStyleSheet("color: #64748b; font-size: 11px; border: none; background: transparent;")
+        delay_inp_row.addWidget(lbl_den)
+
+        self.spin_delay_max = QSpinBox()
+        self.spin_delay_max.setRange(10, 1200)
+        self.spin_delay_max.setValue(120)
+        self.spin_delay_max.setAlignment(Qt.AlignCenter)
+        self.spin_delay_max.setFixedHeight(32)
+        self.spin_delay_max.setStyleSheet(spin_css)
+        self.spin_delay_max.valueChanged.connect(self.save_all_config)
+        delay_inp_row.addWidget(self.spin_delay_max, 1)
+
+        delay_inp_row.addSpacing(6)
+
+        self.spin_rest_min = QSpinBox()
+        self.spin_rest_min.setRange(1, 120)
+        self.spin_rest_min.setValue(10)
+        self.spin_rest_min.setAlignment(Qt.AlignCenter)
+        self.spin_rest_min.setFixedHeight(32)
+        self.spin_rest_min.setStyleSheet(spin_css)
+        self.spin_rest_min.valueChanged.connect(self.save_all_config)
+        delay_inp_row.addWidget(self.spin_rest_min, 1)
+
+        self.spin_rest_after = QSpinBox()
+        self.spin_rest_after.setRange(1, 50)
+        self.spin_rest_after.setValue(5)
+        self.spin_rest_after.setAlignment(Qt.AlignCenter)
+        self.spin_rest_after.setFixedHeight(32)
+        self.spin_rest_after.setStyleSheet(spin_css)
+        self.spin_rest_after.valueChanged.connect(self.save_all_config)
+        delay_inp_row.addWidget(self.spin_rest_after, 1)
+
+        tb_layout.addLayout(delay_inp_row)
+        c3_layout.addWidget(target_box)
+
+        # Chế Độ Trình Duyệt
+        lbl_br_mode = QLabel("Chế Độ Trình Duyệt")
+        lbl_br_mode.setStyleSheet("color: #94a3b8; font-size: 11px; font-weight: 600; border: none; background: transparent;")
+        c3_layout.addWidget(lbl_br_mode)
+
+        self.combo_browser_mode = QComboBox()
+        self.combo_browser_mode.setFixedHeight(36)
+        self.combo_browser_mode.addItem("Hiển thị Trình Duyệt (Quan sát trực tiếp)", False)
+        self.combo_browser_mode.addItem("Chạy Ngầm Hệ Thống (Tự động ẩn trình duyệt)", True)
+        self.combo_browser_mode.currentIndexChanged.connect(self.save_all_config)
+        c3_layout.addWidget(self.combo_browser_mode)
+
+        # Các Checkbox tuỳ chọn tiến trình (Giống Ảnh 2)
+        self.chk_loop_forever = QCheckBox("Đăng vòng lặp liên tục (1 ➔ N ➔ 1)")
+        self.chk_loop_forever.setChecked(True)
+        self.chk_loop_forever.toggled.connect(self.save_all_config)
+        c3_layout.addWidget(self._create_check_row(self.chk_loop_forever))
+
+        self.chk_combine_comment_imgs = QCheckBox("Ghép toàn bộ ảnh trong Folder khi bình luận FB")
+        self.chk_combine_comment_imgs.setChecked(True)
+        self.chk_combine_comment_imgs.toggled.connect(self.save_all_config)
+        c3_layout.addWidget(self._create_check_row(self.chk_combine_comment_imgs))
+
+        c3_layout.addStretch()
+        cards_row.addWidget(card3, 1)
+
+        main_layout.addLayout(cards_row)
+
+        # =========================================================================
+        # PHẦN 2: THANH TIẾN TRÌNH TỔNG THỂ & CỤM NÚT ĐIỀU KHIỂN (GIỐNG HỆT ẢNH 2)
+        # =========================================================================
+        exec_card = self._create_card_frame()
+        exec_card.setFixedHeight(64)
+        e_layout = QHBoxLayout(exec_card)
+        e_layout.setContentsMargins(18, 10, 18, 10)
+        e_layout.setSpacing(20)
+
+        # Cột trái: Tiến trình tổng thể + Thanh Progress mỏng
+        prog_col = QVBoxLayout()
+        prog_col.setContentsMargins(0, 0, 0, 0)
+        prog_col.setSpacing(6)
+
+        prog_top = QHBoxLayout()
+        lbl_prog_title = QLabel("Tiến trình tổng thể")
+        lbl_prog_title.setStyleSheet("color: #94a3b8; font-size: 11px; font-weight: 600; border: none; background: transparent;")
+        prog_top.addWidget(lbl_prog_title)
+        prog_top.addStretch()
+
+        self.lbl_progress_pct = QLabel("0% (Sẵn sàng)")
+        self.lbl_progress_pct.setStyleSheet("color: #06b6d4; font-size: 11px; font-weight: bold; border: none; background: transparent;")
+        prog_top.addWidget(self.lbl_progress_pct)
+        prog_col.addLayout(prog_top)
 
         self.progress_bar = QProgressBar()
         self.progress_bar.setValue(0)
-        e_layout.addWidget(self.progress_bar)
+        self.progress_bar.setTextVisible(False)
+        self.progress_bar.setFixedHeight(6)
+        self.progress_bar.setStyleSheet("""
+            QProgressBar {
+                background-color: #1e293b;
+                border: none;
+                border-radius: 3px;
+            }
+            QProgressBar::chunk {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #2563eb, stop:1 #10b981);
+                border-radius: 3px;
+            }
+        """)
+        prog_col.addWidget(self.progress_bar)
+        e_layout.addLayout(prog_col, 1)
 
-        layout.addWidget(exec_box)
+        e_layout.addSpacing(20)
 
-        # Log Console Table (5 Columns)
+        # Cụm 3 nút điều khiển bên phải: ▶ BẮT ĐẦU CHẠY | ⏸ Tạm Dừng | ⏹ Dừng Hẳn
+        self.btn_start = QPushButton("▶   BẮT ĐẦU CHẠY")
+        self.btn_start.setCursor(Qt.PointingHandCursor)
+        self.btn_start.setFixedSize(165, 38)
+        self.btn_start.setStyleSheet("""
+            QPushButton {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #2563eb, stop:1 #4f46e5);
+                color: #ffffff;
+                font-weight: bold;
+                font-size: 12px;
+                border: 1px solid #60a5fa;
+                border-radius: 8px;
+            }
+            QPushButton:hover {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #1d4ed8, stop:1 #4338ca);
+            }
+            QPushButton:disabled {
+                background-color: #1e293b;
+                color: #64748b;
+                border: 1px solid #334155;
+            }
+        """)
+        self.btn_start.clicked.connect(self.on_start)
+        e_layout.addWidget(self.btn_start)
+
+        self.btn_pause = QPushButton("⏸   Tạm Dừng")
+        self.btn_pause.setCursor(Qt.PointingHandCursor)
+        self.btn_pause.setFixedSize(115, 38)
+        self.btn_pause.setEnabled(False)
+        self.btn_pause.setStyleSheet("""
+            QPushButton {
+                background-color: #1e293b;
+                color: #cbd5e1;
+                font-weight: 600;
+                font-size: 12px;
+                border: 1px solid #334155;
+                border-radius: 8px;
+            }
+            QPushButton:hover {
+                background-color: #334155;
+                color: #ffffff;
+            }
+            QPushButton:disabled {
+                background-color: #0f172a;
+                color: #475569;
+                border: 1px solid #1e293b;
+            }
+        """)
+        self.btn_pause.clicked.connect(self.on_toggle_pause)
+        e_layout.addWidget(self.btn_pause)
+
+        self.btn_stop = QPushButton("⏹   Dừng Hẳn")
+        self.btn_stop.setCursor(Qt.PointingHandCursor)
+        self.btn_stop.setFixedSize(115, 38)
+        self.btn_stop.setEnabled(False)
+        self.btn_stop.setStyleSheet("""
+            QPushButton {
+                background-color: #2d1219;
+                color: #f87171;
+                font-weight: 600;
+                font-size: 12px;
+                border: 1px solid #7f1d1d;
+                border-radius: 8px;
+            }
+            QPushButton:hover {
+                background-color: #451a23;
+                color: #fca5a5;
+            }
+            QPushButton:disabled {
+                background-color: #1a1118;
+                color: #7f1d1d;
+                border: 1px solid #31151c;
+            }
+        """)
+        self.btn_stop.clicked.connect(self.on_stop)
+        e_layout.addWidget(self.btn_stop)
+
+        main_layout.addWidget(exec_card)
+
+        # =========================================================================
+        # PHẦN 3: BẢNG CHI TIẾT THÔNG BÁO & LỊCH SỬ HOẠT ĐỘNG (GIỐNG HỆT ẢNH 2)
+        # =========================================================================
+        log_card = self._create_card_frame()
+        log_layout = QVBoxLayout(log_card)
+        log_layout.setContentsMargins(16, 12, 16, 12)
+        log_layout.setSpacing(8)
+
+        log_header = QHBoxLayout()
+        lbl_log_title = QLabel("Chi Tiết Thông Báo & Lịch Sử Hoạt Động")
+        lbl_log_title.setStyleSheet("color: #f8fafc; font-size: 13px; font-weight: bold; border: none; background: transparent;")
+        log_header.addWidget(lbl_log_title)
+
+        log_header.addSpacing(12)
+        self.lbl_log_status = QLabel("Trạng thái: Sẵn sàng hoạt động")
+        self.lbl_log_status.setStyleSheet("color: #64748b; font-size: 11px; border: none; background: transparent;")
+        log_header.addWidget(self.lbl_log_status)
+
+        log_header.addStretch()
+
+        self.lbl_success_counter = QLabel("●  Đã đăng 0 bài thành công")
+        self.lbl_success_counter.setStyleSheet("color: #10b981; font-size: 11px; font-weight: bold; border: none; background: transparent;")
+        log_header.addWidget(self.lbl_success_counter)
+
+        log_layout.addLayout(log_header)
+
         self.log_table = QTableWidget()
         self.log_table.setColumnCount(5)
-        self.log_table.setHorizontalHeaderLabels(["Thời Gian", "Tư Cách Đăng", "Nhóm Target", "Trạng Thái", "Chi Tiết Thông Báo"])
+        self.log_table.setHorizontalHeaderLabels(["THỜI GIAN", "TƯ CÁCH ĐĂNG", "NHÓM TARGET", "TRẠNG THÁI", "CHI TIẾT"])
+        self.log_table.verticalHeader().setVisible(False)
+        self.log_table.setShowGrid(False)
+        self.log_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.log_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.log_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.log_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.log_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Interactive)
+        self.log_table.setColumnWidth(2, 270)
+        self.log_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
         self.log_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
-        layout.addWidget(self.log_table)
+        self.log_table.cellClicked.connect(self.on_log_cell_clicked)
+        log_layout.addWidget(self.log_table, 1)
+
+        main_layout.addWidget(log_card, 1)
+
+        self._update_action_tile_styles()
+
+    def _update_action_tile_styles(self):
+        is_comment = self.rad_fb_comment_feed.isChecked()
+        active_tile_css = """
+            QFrame {
+                background-color: #132247;
+                border: 1px solid #2563eb;
+                border-radius: 8px;
+            }
+        """
+        inactive_tile_css = """
+            QFrame {
+                background-color: #0b0f19;
+                border: 1px solid #1e293b;
+                border-radius: 8px;
+            }
+            QFrame:hover {
+                border: 1px solid #334155;
+            }
+        """
+        self.tile_post_groups.setStyleSheet(inactive_tile_css if is_comment else active_tile_css)
+        self.tile_comment_feed.setStyleSheet(active_tile_css if is_comment else inactive_tile_css)
 
     def load_combos(self):
         self.load_all_config()
@@ -556,29 +1292,36 @@ class PosterTab(QWidget):
 
     def on_post_as_changed(self):
         self.update_categories_combo()
+        self.update_campaign_preview()
         self.save_all_config()
 
     def on_category_changed(self):
         self.update_group_count_label()
         self.save_all_config()
 
+    def on_fb_action_mode_changed(self):
+        is_comment = self.rad_fb_comment_feed.isChecked()
+        self.fb_comment_widget.setVisible(is_comment)
+        self._update_action_tile_styles()
+        self.save_all_config()
+
     def update_pages_combo(self, desired_page_id=None, desired_mode=None):
         self.combo_post_as.blockSignals(True)
         self.combo_post_as.clear()
-        self.combo_post_as.addItem("👤 Nick Cá Nhân (Mặc định)", {"page_id": "", "page_name": "", "mode": "SINGLE"})
+        self.combo_post_as.addItem("Nick Cá Nhân (Mặc định)", {"page_id": "", "page_name": "", "mode": "SINGLE"})
         acc_uid = self.combo_accounts.currentData()
         target_idx = 0
         if acc_uid:
             pages = self.db.get_pages(acc_uid)
             for p in pages:
-                self.combo_post_as.addItem(f"🚩 Fanpage: {p['page_name']}", {"page_id": p["page_id"], "page_name": p["page_name"], "mode": "SINGLE"})
+                self.combo_post_as.addItem(f"Fanpage: {p['page_name']}", {"page_id": p["page_id"], "page_name": p["page_name"], "mode": "SINGLE"})
                 if desired_mode == "SINGLE" and desired_page_id == p["page_id"]:
                     target_idx = self.combo_post_as.count() - 1
             if pages:
                 self.combo_post_as.addItem("🔥 TẤT CẢ FANPAGE (Chạy Đa Luồng Song Song)", {"mode": "ALL_PAGES"})
                 if desired_mode == "ALL_PAGES":
                     target_idx = self.combo_post_as.count() - 1
-                self.combo_post_as.addItem("🔥 NICK CÁ NHÂN + TẤT CẢ FANPAGE (Chạy Song Song Tất Cả)", {"mode": "ALL_PROFILES"})
+                self.combo_post_as.addItem("🔥 NICK CÁ NHÂN + TẤT CẢ FANPAGE (Chạy Song Song)", {"mode": "ALL_PROFILES"})
                 if desired_mode == "ALL_PROFILES":
                     target_idx = self.combo_post_as.count() - 1
 
@@ -624,12 +1367,7 @@ class PosterTab(QWidget):
             if mode == "ALL_PROFILES":
                 total += len(self.db.get_groups(account_uid=acc_uid, page_id="", category=category, only_selected=True))
 
-        cat_text = f" [{category}]" if category not in ["Tất cả", "Tất cả lĩnh vực", ""] else ""
-        self.lbl_group_count.setText(f"Target: {total} nhóm{cat_text}")
-        if total == 0:
-            self.lbl_group_count.setStyleSheet("font-weight: bold; color: #f38ba8;")
-        else:
-            self.lbl_group_count.setStyleSheet("font-weight: bold; color: #4caf50;")
+        self.lbl_group_count.setText(f"Nhóm Target ({total} Nhóm)")
 
     def open_group_selection_dialog(self):
         acc_uid = self.combo_accounts.currentData()
@@ -657,161 +1395,19 @@ class PosterTab(QWidget):
         self.update_group_count_label()
         self.save_all_config()
 
-    # --- SCHEDULER IMPLEMENTATION ---
-    def init_scheduler_ui(self) -> QGroupBox:
-        box = QGroupBox("⏰ Lên Lịch Đăng Bài Tự Động (Tự Chạy Theo Giờ & Thứ Trong Tuần)")
-        b_layout = QVBoxLayout(box)
+    def on_prev_template(self):
+        campaigns = self.db.get_campaigns()
+        if not campaigns:
+            return
+        self.preview_tpl_idx = (self.preview_tpl_idx - 1) % len(campaigns)
+        self.update_campaign_preview()
 
-        # Hàng 1: Bật/Tắt & Chọn chế độ
-        r1 = QHBoxLayout()
-        self.chk_schedule_enable = QCheckBox("🔔 BẬT HẸN GIỜ ĐĂNG BÀI (Chỉ cần mở phần mềm để đó, đến giờ tự đăng)")
-        self.chk_schedule_enable.setStyleSheet("font-size: 13px; font-weight: bold; color: #a6e3a1; padding: 2px;")
-        self.chk_schedule_enable.toggled.connect(self.on_schedule_enabled_toggled)
-        r1.addWidget(self.chk_schedule_enable)
-
-        r1.addSpacing(20)
-        r1.addWidget(QLabel("Chế độ hẹn giờ:"))
-        self.combo_schedule_mode = QComboBox()
-        self.combo_schedule_mode.addItem("📅 Đăng theo các mốc giờ cố định trong ngày", "FIXED")
-        self.combo_schedule_mode.addItem("⏳ Đăng lặp lại trong khung thời gian", "WINDOW")
-        self.combo_schedule_mode.currentIndexChanged.connect(self.on_schedule_mode_changed)
-        r1.addWidget(self.combo_schedule_mode, stretch=1)
-        b_layout.addLayout(r1)
-
-        # Hàng 2: Chọn các thứ trong tuần
-        r2 = QHBoxLayout()
-        r2.addWidget(QLabel("Lặp lại vào các ngày:"))
-        self.day_checkboxes = {}
-        day_labels = [(1, "Thứ 2"), (2, "Thứ 3"), (3, "Thứ 4"), (4, "Thứ 5"), (5, "Thứ 6"), (6, "Thứ 7"), (7, "Chủ Nhật")]
-        for dow, text in day_labels:
-            chk = QCheckBox(text)
-            chk.setChecked(True)
-            chk.toggled.connect(self.save_scheduler_settings)
-            self.day_checkboxes[dow] = chk
-            r2.addWidget(chk)
-
-        r2.addSpacing(10)
-        btn_all = QPushButton("Tất Cả")
-        btn_all.setStyleSheet("padding: 2px 6px; font-size: 11px;")
-        btn_all.clicked.connect(lambda: self.set_days_preset("ALL"))
-        r2.addWidget(btn_all)
-
-        btn_weekdays = QPushButton("T2 - T6")
-        btn_weekdays.setStyleSheet("padding: 2px 6px; font-size: 11px;")
-        btn_weekdays.clicked.connect(lambda: self.set_days_preset("WEEKDAYS"))
-        r2.addWidget(btn_weekdays)
-
-        btn_weekend = QPushButton("T7 & CN")
-        btn_weekend.setStyleSheet("padding: 2px 6px; font-size: 11px;")
-        btn_weekend.clicked.connect(lambda: self.set_days_preset("WEEKEND"))
-        r2.addWidget(btn_weekend)
-
-        r2.addStretch()
-        b_layout.addLayout(r2)
-
-        # Hàng 3: Cấu hình giờ (Container động)
-        self.frame_fixed = QWidget()
-        f_layout = QHBoxLayout(self.frame_fixed)
-        f_layout.setContentsMargins(0, 0, 0, 0)
-        f_layout.addWidget(QLabel("Mốc giờ đăng:"))
-        self.time_picker = QTimeEdit()
-        self.time_picker.setDisplayFormat("HH:mm")
-        self.time_picker.setTime(QTime(9, 0))
-        f_layout.addWidget(self.time_picker)
-
-        btn_add_time = QPushButton("➕ Thêm Giờ")
-        btn_add_time.setStyleSheet("background-color: #1976d2; color: white; font-weight: bold; padding: 4px 8px;")
-        btn_add_time.clicked.connect(lambda: self.add_fixed_time(self.time_picker.time().toString("HH:mm")))
-        f_layout.addWidget(btn_add_time)
-
-        f_layout.addWidget(QLabel("Giờ đã đặt:"))
-        self.txt_fixed_display = QLineEdit()
-        self.txt_fixed_display.setReadOnly(True)
-        self.txt_fixed_display.setPlaceholderText("Chưa có mốc giờ nào (VD: 09:00, 14:30...)")
-        f_layout.addWidget(self.txt_fixed_display, stretch=1)
-
-        btn_clear_t = QPushButton("🗑️ Xóa")
-        btn_clear_t.clicked.connect(self.clear_fixed_times)
-        f_layout.addWidget(btn_clear_t)
-
-        f_layout.addSpacing(10)
-        f_layout.addWidget(QLabel("Giờ vàng gợi ý:"))
-        for g_time in ["09:00", "11:30", "14:30", "20:00"]:
-            btn_gold = QPushButton(f"+ {g_time}")
-            btn_gold.setStyleSheet("background-color: #313244; color: #89b4fa; padding: 2px 6px; font-size: 11px;")
-            btn_gold.clicked.connect(lambda _, t=g_time: self.add_fixed_time(t))
-            f_layout.addWidget(btn_gold)
-        b_layout.addWidget(self.frame_fixed)
-
-        self.frame_window = QWidget()
-        w_layout = QHBoxLayout(self.frame_window)
-        w_layout.setContentsMargins(0, 0, 0, 0)
-        w_layout.addWidget(QLabel("Khung giờ bắt đầu từ:"))
-        self.time_win_start = QTimeEdit()
-        self.time_win_start.setDisplayFormat("HH:mm")
-        self.time_win_start.setTime(QTime(8, 30))
-        self.time_win_start.timeChanged.connect(self.save_scheduler_settings)
-        w_layout.addWidget(self.time_win_start)
-
-        w_layout.addWidget(QLabel("Đến:"))
-        self.time_win_end = QTimeEdit()
-        self.time_win_end.setDisplayFormat("HH:mm")
-        self.time_win_end.setTime(QTime(21, 30))
-        self.time_win_end.timeChanged.connect(self.save_scheduler_settings)
-        w_layout.addWidget(self.time_win_end)
-
-        w_layout.addWidget(QLabel("Lặp lại sau mỗi (Phút):"))
-        self.spin_win_interval = QSpinBox()
-        self.spin_win_interval.setRange(10, 720)
-        self.spin_win_interval.setValue(60)
-        self.spin_win_interval.valueChanged.connect(self.save_scheduler_settings)
-        w_layout.addWidget(self.spin_win_interval)
-        w_layout.addStretch()
-        self.frame_window.setVisible(False)
-        b_layout.addWidget(self.frame_window)
-
-        # Hàng 4: Trạng thái & Đồng hồ đếm ngược Realtime
-        self.lbl_schedule_status = QLabel("⚪ Trạng thái: Hẹn giờ đang tắt.")
-        self.lbl_schedule_status.setStyleSheet("color: #a6adc8; font-size: 13px; font-weight: bold; padding: 6px; background-color: #181825; border-radius: 6px;")
-        b_layout.addWidget(self.lbl_schedule_status)
-
-        return box
-
-    def on_schedule_mode_changed(self):
-        is_fixed = self.combo_schedule_mode.currentData() == "FIXED"
-        self.frame_fixed.setVisible(is_fixed)
-        self.frame_window.setVisible(not is_fixed)
-        self.save_scheduler_settings()
-
-    def on_schedule_enabled_toggled(self, enabled: bool):
-        if enabled:
-            self.chk_schedule_enable.setStyleSheet("font-size: 13px; font-weight: bold; color: #a6e3a1; padding: 2px;")
-        else:
-            self.chk_schedule_enable.setStyleSheet("font-size: 13px; font-weight: bold; color: #f38ba8; padding: 2px;")
-        self.save_scheduler_settings()
-
-    def set_days_preset(self, preset: str):
-        for dow, chk in self.day_checkboxes.items():
-            if preset == "ALL":
-                chk.setChecked(True)
-            elif preset == "WEEKDAYS":
-                chk.setChecked(dow <= 5)
-            elif preset == "WEEKEND":
-                chk.setChecked(dow > 5)
-        self.save_scheduler_settings()
-
-    def add_fixed_time(self, time_str: str):
-        time_str = time_str.strip()
-        if time_str and time_str not in self.fixed_times_list:
-            self.fixed_times_list.append(time_str)
-            self.fixed_times_list.sort()
-            self.txt_fixed_display.setText(", ".join(self.fixed_times_list))
-            self.save_scheduler_settings()
-
-    def clear_fixed_times(self):
-        self.fixed_times_list.clear()
-        self.txt_fixed_display.clear()
-        self.save_scheduler_settings()
+    def on_next_template(self):
+        campaigns = self.db.get_campaigns()
+        if not campaigns:
+            return
+        self.preview_tpl_idx = (self.preview_tpl_idx + 1) % len(campaigns)
+        self.update_campaign_preview()
 
     def save_all_config(self):
         if getattr(self, "_is_loading_config", False):
@@ -827,8 +1423,11 @@ class PosterTab(QWidget):
             "post_as_mode": mode,
             "post_as_page_id": page_id,
             "post_as_page_name": page_name,
+            "fb_action_mode": "COMMENT_FEED" if self.rad_fb_comment_feed.isChecked() else "POST_GROUPS",
+            "fb_min_likes": self.spin_fb_min_likes.value(),
+            "fb_human_sim": self.chk_fb_human_sim.isChecked(),
             "category": self.combo_category.currentText() or "Tất cả lĩnh vực",
-            "campaign_id": self.combo_campaigns.currentData() or 0,
+            "campaign_id": -1,
             "delay_min": self.spin_delay_min.value(),
             "delay_max": self.spin_delay_max.value(),
             "rest_min": self.spin_rest_min.value(),
@@ -836,30 +1435,15 @@ class PosterTab(QWidget):
             "browser_headless": bool(self.combo_browser_mode.currentData()),
             "chk_hash": self.chk_hash.isChecked(),
             "chk_shuffle_media": self.chk_shuffle_media.isChecked(),
-            "schedule_enabled": self.chk_schedule_enable.isChecked(),
-            "schedule_mode": self.combo_schedule_mode.currentData() or "FIXED",
-            "schedule_days": [dow for dow, chk in self.day_checkboxes.items() if chk.isChecked()],
-            "schedule_fixed_times": list(self.fixed_times_list),
-            "schedule_window_start": self.time_win_start.time().toString("HH:mm"),
-            "schedule_window_end": self.time_win_end.time().toString("HH:mm"),
-            "schedule_window_interval": self.spin_win_interval.value()
+            "chk_loop_forever": self.chk_loop_forever.isChecked()
         }
         self.db.set_setting("poster_config", config)
-        self.db.set_setting("scheduler_config", {
-            "enabled": config["schedule_enabled"],
-            "mode": config["schedule_mode"],
-            "days": config["schedule_days"],
-            "fixed_times": config["schedule_fixed_times"],
-            "window_start": config["schedule_window_start"],
-            "window_end": config["schedule_window_end"],
-            "window_interval": config["schedule_window_interval"]
-        })
+        self.db.set_setting("fb_min_likes", config["fb_min_likes"])
 
     def load_all_config(self):
         self._is_loading_config = True
         try:
             config = self.db.get_setting("poster_config", {})
-            sched_old = self.db.get_setting("scheduler_config", {})
 
             # 1. Nạp danh sách tài khoản
             accounts = self.db.get_accounts()
@@ -868,26 +1452,30 @@ class PosterTab(QWidget):
             self.combo_accounts.clear()
             acc_idx = 0
             for i, a in enumerate(accounts):
-                self.combo_accounts.addItem(f"{a['name']} ({a['uid']})", a['uid'])
+                pages_cnt = len(self.db.get_pages(a['uid']))
+                suffix = " [Multi-Account]" if pages_cnt > 0 else ""
+                self.combo_accounts.addItem(f"{a['name']} ({a['uid']}){suffix}", a['uid'])
                 if cur_acc and a['uid'] == cur_acc:
                     acc_idx = i
             if accounts:
                 self.combo_accounts.setCurrentIndex(acc_idx)
             self.combo_accounts.blockSignals(False)
 
-            # 2. Nạp danh sách mẫu nội dung (Chiến dịch)
+            # 2. Nạp danh sách mẫu nội dung từ file Excel
             campaigns = self.db.get_campaigns()
-            cur_camp = config.get("campaign_id") or self.combo_campaigns.currentData()
             self.combo_campaigns.blockSignals(True)
             self.combo_campaigns.clear()
-            camp_idx = 0
-            for i, c in enumerate(campaigns):
+            excel_path = get_configured_excel_path(self.db)
+            self.combo_campaigns.addItem(
+                f"🔁 [Xoay Vòng Tất Cả {len(campaigns)} Mẫu Trong '{os.path.basename(excel_path)}']",
+                -1
+            )
+            for c in campaigns:
                 self.combo_campaigns.addItem(c["title"], c["id"])
-                if cur_camp and c["id"] == cur_camp:
-                    camp_idx = i
-            if campaigns:
-                self.combo_campaigns.setCurrentIndex(camp_idx)
+            self.combo_campaigns.setCurrentIndex(0)
             self.combo_campaigns.blockSignals(False)
+
+            self.lbl_excel_badge.setText(f"{len(campaigns)} Mẫu sẵn sàng")
 
             # 3. Nạp danh sách Tư cách đăng (Fanpage / Nick cá nhân)
             saved_mode = config.get("post_as_mode", "SINGLE")
@@ -917,63 +1505,77 @@ class PosterTab(QWidget):
                 self.chk_hash.setChecked(bool(config["chk_hash"]))
             if "chk_shuffle_media" in config:
                 self.chk_shuffle_media.setChecked(bool(config["chk_shuffle_media"]))
+            if "chk_loop_forever" in config:
+                self.chk_loop_forever.setChecked(bool(config["chk_loop_forever"]))
 
-            # 6. Cấu hình Lịch Hẹn
-            sched = config if "schedule_enabled" in config else sched_old
-            is_enabled = bool(sched.get("schedule_enabled", sched.get("enabled", False)))
-            self.chk_schedule_enable.blockSignals(True)
-            self.chk_schedule_enable.setChecked(is_enabled)
-            self.chk_schedule_enable.blockSignals(False)
-            if is_enabled:
-                self.chk_schedule_enable.setStyleSheet("font-size: 13px; font-weight: bold; color: #a6e3a1; padding: 2px;")
-            else:
-                self.chk_schedule_enable.setStyleSheet("font-size: 13px; font-weight: bold; color: #f38ba8; padding: 2px;")
-
-            sched_mode = sched.get("schedule_mode", sched.get("mode", "FIXED"))
-            s_idx = self.combo_schedule_mode.findData(sched_mode)
-            if s_idx >= 0:
-                self.combo_schedule_mode.setCurrentIndex(s_idx)
-            self.on_schedule_mode_changed()
-
-            saved_days = set(sched.get("schedule_days", sched.get("days", [1, 2, 3, 4, 5, 6, 7])))
-            for dow, chk in self.day_checkboxes.items():
-                chk.blockSignals(True)
-                chk.setChecked(dow in saved_days)
-                chk.blockSignals(False)
-
-            self.fixed_times_list = list(sched.get("schedule_fixed_times", sched.get("fixed_times", [])))
-            self.txt_fixed_display.setText(", ".join(self.fixed_times_list))
-
-            w_start = sched.get("schedule_window_start", sched.get("window_start", "08:30"))
-            self.time_win_start.setTime(QTime.fromString(w_start, "HH:mm"))
-
-            w_end = sched.get("schedule_window_end", sched.get("window_end", "21:30"))
-            self.time_win_end.setTime(QTime.fromString(w_end, "HH:mm"))
-
-            w_int = sched.get("schedule_window_interval", sched.get("window_interval", 60))
-            self.spin_win_interval.setValue(int(w_int))
+            if "fb_action_mode" in config:
+                if config["fb_action_mode"] == "COMMENT_FEED":
+                    self.rad_fb_comment_feed.setChecked(True)
+                else:
+                    self.rad_fb_post_groups.setChecked(True)
+                self.on_fb_action_mode_changed()
+            if "fb_min_likes" in config:
+                self.spin_fb_min_likes.setValue(int(config["fb_min_likes"]))
+            if "fb_human_sim" in config:
+                self.chk_fb_human_sim.setChecked(bool(config["fb_human_sim"]))
 
             self.update_group_count_label()
             self.update_campaign_preview()
         finally:
             self._is_loading_config = False
 
+    def on_pick_excel_file(self):
+        cur_path = get_configured_excel_path(self.db)
+        start_dir = os.path.dirname(cur_path) if (cur_path and os.path.exists(os.path.dirname(cur_path))) else r"E:\Affiliate"
+        if not os.path.exists(start_dir):
+            start_dir = ""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Chọn File Excel Mẫu Bài Viết (.xlsx)",
+            start_dir,
+            "Excel Files (*.xlsx);;All Files (*.*)"
+        )
+        if file_path:
+            set_configured_excel_path(self.db, file_path)
+            self.preview_tpl_idx = 0
+            self.load_all_config()
+
     def update_campaign_preview(self):
-        camp_id = self.combo_campaigns.currentData()
-        if not camp_id:
-            self.txt_camp_preview.clear()
-            self.lbl_camp_preview_info.setText("Chưa chọn bài viết")
-            return
-        campaigns = self.db.get_campaigns()
-        camp = next((c for c in campaigns if c["id"] == camp_id), None)
-        if camp:
-            content = camp.get("content", "")
-            media_count = len(camp.get("images", []))
-            self.txt_camp_preview.setPlainText(content)
-            self.lbl_camp_preview_info.setText(f"📋 '{camp['title']}' | 📎 {media_count} tệp ảnh/video | 📝 {len(content)} ký tự")
+        page_info = self.combo_post_as.currentData() or {}
+        p_name = page_info.get("page_name", "") if isinstance(page_info, dict) else ""
+        mode = page_info.get("mode", "SINGLE") if isinstance(page_info, dict) else "SINGLE"
+        if mode == "ALL_PAGES":
+            author_str = "Tất cả Fanpage"
+        elif mode == "ALL_PROFILES":
+            author_str = "Nick cá nhân + Tất cả Fanpage"
+        elif p_name:
+            author_str = f"Fanpage: {p_name}"
         else:
-            self.txt_camp_preview.clear()
-            self.lbl_camp_preview_info.setText("Chưa chọn bài viết")
+            author_str = "Nick Cá Nhân"
+        self.lbl_preview_author.setText(author_str)
+
+        campaigns = self.db.get_campaigns()
+        excel_path = get_configured_excel_path(self.db)
+        if not campaigns:
+            self.lbl_preview_title.setText("Xem Trước Bài Viết (Chưa có mẫu)")
+            self.lbl_tpl_counter.setText("0 / 0")
+            self.txt_camp_preview.setPlainText(f"⚠️ Chưa có mẫu bài viết nào trong file Excel:\n{excel_path}")
+            self.lbl_camp_preview_info.setText("Đường dẫn ảnh: (Trống)")
+            return
+
+        if self.preview_tpl_idx >= len(campaigns):
+            self.preview_tpl_idx = 0
+
+        camp = campaigns[self.preview_tpl_idx]
+        idx_1 = self.preview_tpl_idx + 1
+        self.lbl_preview_title.setText(f"Xem Trước Bài Viết (Mẫu #{idx_1})")
+        self.lbl_tpl_counter.setText(f"{idx_1} / {len(campaigns)}")
+
+        content = camp.get("content", "")
+        media_count = len(camp.get("raw_media_paths") or camp.get("media_paths") or [])
+        folder_str = camp.get("folder_path", "")
+        self.txt_camp_preview.setPlainText(content)
+        self.lbl_camp_preview_info.setText(f"Đường dẫn ảnh: {folder_str} ({media_count} ảnh)")
 
     def on_preview_campaign_spin(self):
         content = self.txt_camp_preview.toPlainText().strip()
@@ -984,147 +1586,44 @@ class PosterTab(QWidget):
         parsed = SpintaxParser.parse(content)
         QMessageBox.information(self, "Xem Thử Biến Thể Bài Viết (Spintax Preview)", parsed)
 
-    def save_scheduler_settings(self):
-        self.save_all_config()
-
-    def load_scheduler_settings(self):
-        self.load_all_config()
-
-    def init_scheduler_timer(self):
-        self.scheduler_timer = QTimer(self)
-        self.scheduler_timer.setInterval(1000)
-        self.scheduler_timer.timeout.connect(self.on_schedule_tick)
-        self.scheduler_timer.start()
-
-    def on_schedule_tick(self):
-        if not self.chk_schedule_enable.isChecked():
-            self.lbl_schedule_status.setText("⚪ Chế độ hẹn giờ đang TẮT. Tích chọn 'Bật hẹn giờ đăng bài' bên trên để tự động chạy.")
-            self.lbl_schedule_status.setStyleSheet("color: #a6adc8; font-size: 13px; font-weight: bold; padding: 6px; background-color: #181825; border-radius: 6px;")
-            return
-
-        now = QDateTime.currentDateTime()
-        selected_days = [dow for dow, chk in self.day_checkboxes.items() if chk.isChecked()]
-        if not selected_days:
-            self.lbl_schedule_status.setText("⚠️ Chưa chọn ngày lặp lại nào trong tuần (T2 - CN)!")
-            self.lbl_schedule_status.setStyleSheet("color: #f38ba8; font-size: 13px; font-weight: bold; padding: 6px; background-color: #181825; border-radius: 6px;")
-            return
-
-        mode = self.combo_schedule_mode.currentData()
-
-        # CHẾ ĐỘ 1: CÁC MỐC GIỜ CỐ ĐỊNH
-        if mode == "FIXED":
-            if not self.fixed_times_list:
-                self.lbl_schedule_status.setText("⚠️ Chưa thêm mốc giờ đăng nào! Vui lòng bấm '➕ Thêm Giờ' bên trên.")
-                self.lbl_schedule_status.setStyleSheet("color: #f9e2af; font-size: 13px; font-weight: bold; padding: 6px; background-color: #181825; border-radius: 6px;")
-                return
-
-            next_run = None
-            for day_offset in range(8):
-                cand_date = now.date().addDays(day_offset)
-                if cand_date.dayOfWeek() not in selected_days:
-                    continue
-
-                for t_str in self.fixed_times_list:
-                    t_val = QTime.fromString(t_str, "HH:mm")
-                    cand_dt = QDateTime(cand_date, t_val)
-                    if cand_dt > now.addSecs(-1):
-                        if next_run is None or cand_dt < next_run:
-                            next_run = cand_dt
-
-                if next_run and next_run > now:
-                    break
-
-            if next_run:
-                secs_left = now.secsTo(next_run)
-                day_names = {1: "Thứ 2", 2: "Thứ 3", 3: "Thứ 4", 4: "Thứ 5", 5: "Thứ 6", 6: "Thứ 7", 7: "Chủ Nhật"}
-                day_str = "Hôm nay" if next_run.date() == now.date() else day_names.get(next_run.date().dayOfWeek(), "")
-
-                # Khi đến đúng giờ hẹn
-                if secs_left <= 0:
-                    trigger_key = next_run.toString("yyyy-MM-dd HH:mm")
-                    if self.last_triggered_key != trigger_key:
-                        self.last_triggered_key = trigger_key
-                        self.trigger_scheduled_run(f"Đúng giờ hẹn {next_run.toString('HH:mm')}")
-
-                h = max(0, secs_left // 3600)
-                m = max(0, (secs_left % 3600) // 60)
-                s = max(0, secs_left % 60)
-                self.lbl_schedule_status.setText(f"⏰ ĐANG BẬT HẸN GIỜ: Lần đăng kế tiếp: {day_str} lúc {next_run.toString('HH:mm:ss')} (Còn lại: {h:02d}h {m:02d}m {s:02d}s)")
-                self.lbl_schedule_status.setStyleSheet("color: #a6e3a1; font-size: 13px; font-weight: bold; padding: 6px; background-color: #11111b; border: 1px solid #2e7d32; border-radius: 6px;")
-
-        # CHẾ ĐỘ 2: LẶP LẠI TRONG KHOẢNG THỜI GIAN
-        else:
-            win_start = self.time_win_start.time()
-            win_end = self.time_win_end.time()
-            interval_sec = self.spin_win_interval.value() * 60
-            curr_dow = now.date().dayOfWeek()
-
-            if curr_dow in selected_days and win_start <= now.time() <= win_end:
-                now_ts = time.time()
-                elapsed = now_ts - self.last_window_run_ts
-                if elapsed >= interval_sec:
-                    self.last_window_run_ts = now_ts
-                    self.trigger_scheduled_run(f"Khung giờ ({win_start.toString('HH:mm')} - {win_end.toString('HH:mm')})")
-                    remaining = interval_sec
-                else:
-                    remaining = int(interval_sec - elapsed)
-
-                m = remaining // 60
-                s = remaining % 60
-                self.lbl_schedule_status.setText(f"⏰ ĐANG TRONG KHUNG GIỜ ({win_start.toString('HH:mm')} - {win_end.toString('HH:mm')}): Lần đăng tiếp theo sau {m:02d}m {s:02d}s")
-                self.lbl_schedule_status.setStyleSheet("color: #a6e3a1; font-size: 13px; font-weight: bold; padding: 6px; background-color: #11111b; border: 1px solid #2e7d32; border-radius: 6px;")
-            else:
-                self.lbl_schedule_status.setText(f"⏳ Ngoài khung giờ đăng bài ({win_start.toString('HH:mm')} - {win_end.toString('HH:mm')}). Tự động chạy khi đến khung giờ hẹn.")
-                self.lbl_schedule_status.setStyleSheet("color: #fab387; font-size: 13px; font-weight: bold; padding: 6px; background-color: #181825; border-radius: 6px;")
-
-    def trigger_scheduled_run(self, reason: str):
-        if any(w.isRunning() for w in self.workers):
-            self.add_log_row(time.strftime("%H:%M:%S"), "LỊCH HẸN", "-", "WAITING", f"[{reason}] Đến giờ hẹn nhưng ca đăng trước đang hoạt động, hoãn lại để chống xung đột.")
-            return
-
+    def on_start(self):
         acc_uid = self.combo_accounts.currentData()
-        camp_id = self.combo_campaigns.currentData()
-        if not acc_uid or not camp_id:
-            self.add_log_row(time.strftime("%H:%M:%S"), "LỊCH HẸN", "-", "FAILED", f"[{reason}] Lỗi: Chưa chọn Tài khoản hoặc Mẫu nội dung trong cấu hình!")
-            return
-
-        camp_title = self.combo_campaigns.currentText()
-        page_info = self.combo_post_as.currentData() or {}
-        p_name = page_info.get("page_name", "") if isinstance(page_info, dict) else ""
-        mode = page_info.get("mode", "SINGLE") if isinstance(page_info, dict) else "SINGLE"
-        prof_desc = f"Fanpage: {p_name}" if p_name else "Nick cá nhân"
-        if mode == "ALL_PAGES":
-            prof_desc = "Tất cả Fanpage"
-        elif mode == "ALL_PROFILES":
-            prof_desc = "Nick cá nhân + Tất cả Fanpage"
-
-        self.add_log_row(time.strftime("%H:%M:%S"), "LỊCH HẸN", "-", "INFO", f"🔔 [{reason}] Bắt đầu tự động đăng bài theo cấu hình đã lưu: [{prof_desc}] | Mẫu: '{camp_title}'...")
-        self.on_start(is_scheduled=True)
-
-    def on_start(self, is_scheduled: bool = False):
-        acc_uid = self.combo_accounts.currentData()
-        camp_id = self.combo_campaigns.currentData()
+        camp_id = -1  # Mặc định xoay vòng lần lượt toàn bộ mẫu trong file Excel
         page_info = self.combo_post_as.currentData() or {}
         mode = page_info.get("mode", "SINGLE") if isinstance(page_info, dict) else "SINGLE"
         category = self.combo_category.currentText()
 
         if not acc_uid:
-            if is_scheduled:
-                self.add_log_row(time.strftime("%H:%M:%S"), "LỊCH HẸN", "-", "FAILED", "Chưa chọn tài khoản Facebook trong cấu hình!")
-            else:
-                QMessageBox.warning(self, "Cảnh báo", "Vui lòng chọn tài khoản Facebook!")
+            QMessageBox.warning(self, "Cảnh báo", "Vui lòng chọn tài khoản Facebook!")
             return
-        if not camp_id:
-            if is_scheduled:
-                self.add_log_row(time.strftime("%H:%M:%S"), "LỊCH HẸN", "-", "FAILED", "Chưa chọn mẫu nội dung bài đăng!")
-            else:
-                QMessageBox.warning(self, "Cảnh báo", "Vui lòng chọn mẫu nội dung bài đăng!")
+
+        campaigns = self.db.get_campaigns()
+        if not campaigns:
+            QMessageBox.warning(self, "Cảnh báo", "Không tìm thấy mẫu nội dung nào trong file Excel! Vui lòng kiểm tra lại file Excel.")
             return
 
         target_configs = []
         all_pages = self.db.get_pages(acc_uid)
+        action_mode = "COMMENT_FEED" if self.rad_fb_comment_feed.isChecked() else "POST_GROUPS"
+        min_likes = self.spin_fb_min_likes.value()
+        human_sim = self.chk_fb_human_sim.isChecked()
+        raw_urls = [u.strip() for u in self.txt_fb_target_urls.text().replace("\n", ",").split(",") if u.strip()]
 
-        if mode == "SINGLE":
+        if action_mode == "COMMENT_FEED":
+            if mode == "SINGLE":
+                page_id = page_info.get("page_id", "")
+                page_name = page_info.get("page_name", "")
+                target_configs.append({"page_id": page_id, "page_name": page_name})
+            elif mode == "ALL_PAGES":
+                for p in all_pages:
+                    target_configs.append({"page_id": p["page_id"], "page_name": p["page_name"]})
+                if not target_configs:
+                    target_configs.append({"page_id": "", "page_name": ""})
+            elif mode == "ALL_PROFILES":
+                target_configs.append({"page_id": "", "page_name": ""})
+                for p in all_pages:
+                    target_configs.append({"page_id": p["page_id"], "page_name": p["page_name"]})
+        elif mode == "SINGLE":
             page_id = page_info.get("page_id", "")
             page_name = page_info.get("page_name", "")
             groups = self.db.get_groups(account_uid=acc_uid, page_id=page_id, category=category, only_selected=True)
@@ -1132,36 +1631,26 @@ class PosterTab(QWidget):
                 all_acc_groups = self.db.get_groups(account_uid=acc_uid, only_selected=True)
                 if all_acc_groups:
                     target_desc = f"Fanpage '{page_name}'" if page_name else "Nick cá nhân"
-                    if is_scheduled:
+                    reply = QMessageBox.question(
+                        self,
+                        "Chưa Có Nhóm Nào Được Chọn",
+                        f"Chưa có nhóm nào được chọn cho {target_desc}.\n\n"
+                        f"Hệ thống phát hiện tài khoản có {len(all_acc_groups)} nhóm ở Fanpage/Nick khác. "
+                        f"Bạn có muốn tự động đồng bộ nhóm sang {target_desc} để đăng ngay không?",
+                        QMessageBox.Yes | QMessageBox.No,
+                        QMessageBox.Yes
+                    )
+                    if reply == QMessageBox.Yes:
                         self.db.sync_groups_across_pages(acc_uid)
                         groups = self.db.get_groups(account_uid=acc_uid, page_id=page_id, category=category, only_selected=True)
-                        if groups:
-                            self.add_log_row(time.strftime("%H:%M:%S"), "LỊCH HẸN", "-", "INFO", f"🔄 Tự động đồng bộ {len(groups)} nhóm sang {target_desc} để thực hiện lịch đăng...")
-                    else:
-                        reply = QMessageBox.question(
-                            self,
-                            "Chưa Có Nhóm Nào Được Chọn",
-                            f"Chưa có nhóm nào được chọn cho {target_desc}.\n\n"
-                            f"Hệ thống phát hiện tài khoản có {len(all_acc_groups)} nhóm ở Fanpage/Nick khác. "
-                            f"Bạn có muốn tự động đồng bộ nhóm sang {target_desc} để đăng ngay không?",
-                            QMessageBox.Yes | QMessageBox.No,
-                            QMessageBox.Yes
-                        )
-                        if reply == QMessageBox.Yes:
-                            self.db.sync_groups_across_pages(acc_uid)
-                            groups = self.db.get_groups(account_uid=acc_uid, page_id=page_id, category=category, only_selected=True)
-                            self.update_group_count_label()
+                        self.update_group_count_label()
 
             if groups:
                 target_configs.append({"page_id": page_id, "page_name": page_name})
             else:
                 target_desc = f"Fanpage '{page_name}'" if page_name else "Nick cá nhân"
                 cat_desc = f" thuộc lĩnh vực '{category}'" if category not in ["Tất cả", "Tất cả lĩnh vực", ""] else ""
-                msg = f"Chưa chọn nhóm nào{cat_desc} cho {target_desc}!"
-                if is_scheduled:
-                    self.add_log_row(time.strftime("%H:%M:%S"), "LỊCH HẸN", "-", "FAILED", msg)
-                else:
-                    QMessageBox.warning(self, "Cảnh báo", msg)
+                QMessageBox.warning(self, "Cảnh báo", f"Chưa chọn nhóm nào{cat_desc} cho {target_desc}!")
                 return
 
         elif mode == "ALL_PAGES":
@@ -1178,11 +1667,7 @@ class PosterTab(QWidget):
                         if groups:
                             target_configs.append({"page_id": p["page_id"], "page_name": p["page_name"]})
             if not target_configs:
-                msg = "Không tìm thấy Fanpage nào có tích chọn nhóm để đăng!"
-                if is_scheduled:
-                    self.add_log_row(time.strftime("%H:%M:%S"), "LỊCH HẸN", "-", "FAILED", msg)
-                else:
-                    QMessageBox.warning(self, "Cảnh báo", msg)
+                QMessageBox.warning(self, "Cảnh báo", "Không tìm thấy Fanpage nào có tích chọn nhóm để đăng!")
                 return
 
         elif mode == "ALL_PROFILES":
@@ -1205,11 +1690,7 @@ class PosterTab(QWidget):
                         if groups:
                             target_configs.append({"page_id": p["page_id"], "page_name": p["page_name"]})
             if not target_configs:
-                msg = "Không tìm thấy Nick cá nhân hay Fanpage nào có tích chọn nhóm!"
-                if is_scheduled:
-                    self.add_log_row(time.strftime("%H:%M:%S"), "LỊCH HẸN", "-", "FAILED", msg)
-                else:
-                    QMessageBox.warning(self, "Cảnh báo", msg)
+                QMessageBox.warning(self, "Cảnh báo", "Không tìm thấy Nick cá nhân hay Fanpage nào có tích chọn nhóm!")
                 return
 
         anti_config = AntiSpamConfig(
@@ -1225,9 +1706,14 @@ class PosterTab(QWidget):
         self.btn_pause.setEnabled(True)
         self.btn_stop.setEnabled(True)
         self.log_table.setRowCount(0)
+        self.success_post_count = 0
+        self.lbl_success_counter.setText("●  Đã đăng 0 bài thành công")
+        self.progress_bar.setValue(0)
+        self.lbl_progress_pct.setText("0% (Đang chạy...)")
         self.workers = []
 
         headless_mode = bool(self.combo_browser_mode.currentData())
+        loop_forever = self.chk_loop_forever.isChecked()
 
         for cfg in target_configs:
             w = PosterWorker(
@@ -1237,7 +1723,12 @@ class PosterTab(QWidget):
                 anti_config=anti_config,
                 headless=headless_mode,
                 post_as_page_name=cfg["page_name"],
-                category=category
+                category=category,
+                loop_forever=loop_forever,
+                action_mode=action_mode,
+                min_likes=min_likes,
+                human_simulation=human_sim,
+                target_urls=raw_urls
             )
             w.log_signal.connect(self.add_log_row)
             w.progress_signal.connect(self.update_progress)
@@ -1257,9 +1748,9 @@ class PosterTab(QWidget):
                 w.pause()
 
         if is_paused:
-            self.btn_pause.setText("⏸️ Tạm Dừng")
+            self.btn_pause.setText("⏸   Tạm Dừng")
         else:
-            self.btn_pause.setText("▶️ Tiếp Tục")
+            self.btn_pause.setText("▶   Tiếp Tục")
 
     def on_stop(self):
         for w in self.workers:
@@ -1269,34 +1760,100 @@ class PosterTab(QWidget):
         if all(not w.isRunning() for w in self.workers):
             self.btn_start.setEnabled(True)
             self.btn_pause.setEnabled(False)
-            self.btn_pause.setText("⏸️ Tạm Dừng")
+            self.btn_pause.setText("⏸   Tạm Dừng")
             self.btn_stop.setEnabled(False)
+            self.progress_bar.setValue(100)
+            self.lbl_progress_pct.setText("100% (Hoàn thành)")
             self.emit_status("Hoàn thành tất cả các tiến trình đăng bài!")
 
     def update_progress(self, current: int, total: int):
         if total > 0:
             pct = int((current / total) * 100)
             self.progress_bar.setValue(pct)
+            status_suffix = "Hoàn thành" if pct >= 100 else f"{current}/{total}"
+            self.lbl_progress_pct.setText(f"{pct}% ({status_suffix})")
+        elif current > 0:
+            self.progress_bar.setValue(min(100, current * 10))
+            self.lbl_progress_pct.setText(f"Đã xử lý {current} bài")
 
     def emit_status(self, msg: str):
+        self.lbl_log_status.setText(f"Trạng thái: {msg}")
         self.status_updated.emit(msg)
+
+    def on_log_cell_clicked(self, row: int, col: int):
+        for check_col in (2, 4):
+            item = self.log_table.item(row, check_col)
+            if item:
+                url = item.data(Qt.UserRole) or ""
+                if not url:
+                    txt = item.text().strip()
+                    if "http://" in txt or "https://" in txt:
+                        for part in txt.split():
+                            if part.startswith("http://") or part.startswith("https://"):
+                                url = part.strip()
+                                break
+                if url and url.startswith("http"):
+                    if col in (2, 4):
+                        webbrowser.open(url)
+                        return
 
     def add_log_row(self, ts: str, profile_label: str, group_name: str, status: str, message: str):
         row = self.log_table.rowCount()
         self.log_table.insertRow(row)
 
-        self.log_table.setItem(row, 0, QTableWidgetItem(ts))
-        self.log_table.setItem(row, 1, QTableWidgetItem(profile_label))
-        self.log_table.setItem(row, 2, QTableWidgetItem(group_name))
+        ts_item = QTableWidgetItem(ts)
+        ts_item.setForeground(QColor("#64748b"))
+        self.log_table.setItem(row, 0, ts_item)
 
-        st_item = QTableWidgetItem(status)
-        if status in ["SUCCESS"]:
-            st_item.setForeground(Qt.green)
+        prof_item = QTableWidgetItem(profile_label)
+        prof_item.setForeground(QColor("#f8fafc"))
+        font_bold = prof_item.font()
+        font_bold.setBold(True)
+        prof_item.setFont(font_bold)
+        self.log_table.setItem(row, 1, prof_item)
+
+        grp_item = QTableWidgetItem(group_name)
+        if group_name.startswith("http"):
+            grp_item.setData(Qt.UserRole, group_name)
+            grp_item.setForeground(QColor("#60a5fa"))
+        else:
+            grp_item.setForeground(QColor("#94a3b8"))
+        self.log_table.setItem(row, 2, grp_item)
+
+        if status == "SUCCESS":
+            self.success_post_count += 1
+            self.lbl_success_counter.setText(f"●  Đã đăng {self.success_post_count} bài thành công")
+            st_item = QTableWidgetItem("Thành công")
+            st_item.setForeground(QColor("#10b981"))
         elif status in ["FAILED", "ERROR"]:
-            st_item.setForeground(Qt.red)
-        elif status in ["WAITING", "RESTING", "POSTING"]:
-            st_item.setForeground(Qt.yellow)
+            st_item = QTableWidgetItem("Thất bại")
+            st_item.setForeground(QColor("#ef4444"))
+        elif status == "POSTING":
+            st_item = QTableWidgetItem("Đang xử lý")
+            st_item.setForeground(QColor("#38bdf8"))
+        elif status in ["WAITING", "RESTING"]:
+            st_item = QTableWidgetItem("Đang nghỉ")
+            st_item.setForeground(QColor("#f59e0b"))
+        else:
+            st_item = QTableWidgetItem(status)
+            st_item.setForeground(QColor("#94a3b8"))
+        st_item.setFont(font_bold)
         self.log_table.setItem(row, 3, st_item)
 
-        self.log_table.setItem(row, 4, QTableWidgetItem(message))
+        # Kiểm tra xem có URL trong message hoặc group_name để hiển thị "Xem bài viết" giống Ảnh 2
+        extracted_url = ""
+        if group_name.startswith("http"):
+            extracted_url = group_name
+        for token in message.split():
+            if token.startswith("http://") or token.startswith("https://"):
+                extracted_url = token.strip()
+                break
+
+        detail_item = QTableWidgetItem(message)
+        if extracted_url:
+            detail_item.setData(Qt.UserRole, extracted_url)
+            detail_item.setToolTip(f"Nhấn để mở bài viết: {extracted_url}")
+            if status == "SUCCESS":
+                detail_item.setForeground(QColor("#3b82f6"))
+        self.log_table.setItem(row, 4, detail_item)
         self.log_table.scrollToBottom()

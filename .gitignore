@@ -28,6 +28,7 @@ test_out.txt
 .pytest_cache/
 .coverage
 htmlcov/
+media_cache/
 
 # OS generated
 Thumbs.db

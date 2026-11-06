@@ -518,14 +518,24 @@ class Database:
             return cursor.lastrowid
 
     def get_campaigns(self) -> List[Dict[str, Any]]:
+        try:
+            from core.excel_loader import get_configured_excel_path, load_posts_from_excel
+            excel_path = get_configured_excel_path(self)
+            if excel_path and os.path.exists(excel_path):
+                posts = load_posts_from_excel(excel_path)
+                if posts:
+                    return posts
+        except Exception:
+            pass
         with self._get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT * FROM campaigns ORDER BY id DESC")
+            cursor.execute("SELECT * FROM campaigns ORDER BY id ASC")
             rows = cursor.fetchall()
             res = []
             for r in rows:
                 item = dict(r)
                 item["media_paths"] = json.loads(item["media_paths"]) if item["media_paths"] else []
+                item["images"] = item["media_paths"]
                 res.append(item)
             return res
 
