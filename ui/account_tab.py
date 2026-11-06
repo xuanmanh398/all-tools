@@ -86,6 +86,8 @@ class OpenBrowserWorker(QThread):
 
 
 class AccountTab(QWidget):
+    account_changed = Signal()
+
     def __init__(self, db: Database):
         super().__init__()
         self.db = db
@@ -184,6 +186,7 @@ class AccountTab(QWidget):
             cw_layout.addWidget(btn_del)
 
             self.table.setCellWidget(row, 5, cell_widget)
+        self.account_changed.emit()
 
     def on_open_browser_account(self, acc: dict):
         desc = f"Tài khoản {acc['name']} (UID: {acc['uid']})"

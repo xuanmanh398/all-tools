@@ -40,6 +40,8 @@ hiddenimports = [
     'ui.poster_tab',
     'ui.system_tray',
     'ui.floating_widget',
+    'ui.fb_comment_tab',
+    'ui.home_dashboard',
 ]
 
 a = Analysis(

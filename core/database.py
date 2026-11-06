@@ -248,6 +248,31 @@ class Database:
                 )
             """)
 
+            # Bảng Mẫu Nội Dung Comment Facebook (Auto Comment)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS comment_campaigns (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title TEXT,
+                    content TEXT,
+                    media_paths TEXT DEFAULT '',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            # Bảng Nhật Ký Comment Facebook (Auto Comment Logs)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS comment_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    account_uid TEXT,
+                    account_name TEXT DEFAULT '',
+                    target_url TEXT,
+                    content TEXT,
+                    status TEXT,
+                    message TEXT
+                )
+            """)
+
             conn.commit()
 
     # --- ACCOUNTS ---
@@ -645,4 +670,58 @@ class Database:
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("DELETE FROM threads_logs")
+            conn.commit()
+
+    # --- FB COMMENT CAMPAIGNS & LOGS ---
+    def save_comment_campaign(self, title: str, content: str, media_paths: str = "") -> int:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO comment_campaigns (title, content, media_paths)
+                VALUES (?, ?, ?)
+            """, (title, content, media_paths))
+            conn.commit()
+            return cursor.lastrowid
+
+    def update_comment_campaign(self, campaign_id: int, title: str, content: str, media_paths: str = ""):
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE comment_campaigns
+                SET title = ?, content = ?, media_paths = ?
+                WHERE id = ?
+            """, (title, content, media_paths, campaign_id))
+            conn.commit()
+
+    def get_comment_campaigns(self) -> List[Dict[str, Any]]:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM comment_campaigns ORDER BY id DESC")
+            return [dict(row) for row in cursor.fetchall()]
+
+    def delete_comment_campaign(self, campaign_id: int):
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM comment_campaigns WHERE id = ?", (campaign_id,))
+            conn.commit()
+
+    def add_comment_log(self, account_uid: str, account_name: str, target_url: str, content: str, status: str, message: str):
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO comment_logs (account_uid, account_name, target_url, content, status, message)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (account_uid, account_name, target_url, content, status, message))
+            conn.commit()
+
+    def get_comment_logs(self, limit: int = 150) -> List[Dict[str, Any]]:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM comment_logs ORDER BY id DESC LIMIT ?", (limit,))
+            return [dict(row) for row in cursor.fetchall()]
+
+    def clear_comment_logs(self):
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM comment_logs")
             conn.commit()

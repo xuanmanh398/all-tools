@@ -59,3 +59,4 @@ out/
 *.njsproj
 *.sln
 *.sw?
+.machine_id

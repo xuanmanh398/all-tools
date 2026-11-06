@@ -52,6 +52,8 @@ hiddenimports = [
     'ui.system_tray',
     'ui.floating_widget',
     'ui.license_dialog',
+    'ui.fb_comment_tab',
+    'ui.home_dashboard',
 ]
 
 excludes = [
