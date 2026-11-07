@@ -1,4 +1,4 @@
-import os
+﻿import os
 import re
 import csv
 import io
@@ -10,15 +10,15 @@ import ctypes
 from datetime import datetime
 from typing import Tuple, Dict, Any, Optional
 
-# Link Cloudflare D1 Worker (Hệ thống bản quyền siêu tốc ~40ms kết hợp Web Admin)
-# Điền link Worker của bạn tại đây (VD: "https://tools-marketing-license.xxx.workers.dev")
-DEFAULT_D1_WORKER_URL = ""
+# Link Cloudflare D1 Worker (Há»‡ thá»‘ng báº£n quyá»n siÃªu tá»‘c ~40ms káº¿t há»£p Web Admin)
+# Äiá»n link Worker cá»§a báº¡n táº¡i Ä‘Ã¢y (VD: "https://tools-marketing-license.xxx.workers.dev")
+DEFAULT_D1_WORKER_URL = "https://tools-marketing-license.mtools-platform.workers.dev"
 
-# Link Google Sheet quản lý danh sách Machine ID và Key kích hoạt (Dự phòng)
-DEFAULT_SHEET_URL = "https://docs.google.com/spreadsheets/d/1ZI6E1MnQHLIbzaDtdPLEszIxOZzFNqbh8l_Cx9718II/edit?usp=sharing"
+# Link Google Sheet quáº£n lÃ½ danh sÃ¡ch Machine ID vÃ  Key kÃ­ch hoáº¡t (Dá»± phÃ²ng)
+DEFAULT_SHEET_URL = ""
 
-# Link Google Apps Script Web App (Dùng để tự động đẩy Mã Máy và tự động tạo Key - Dự phòng)
-DEFAULT_WEB_APP_URL = "https://script.google.com/macros/s/AKfycbyoxT3GbOiDz-0P8o3SDfCdI7gDQPIcvERiZy3bVYkVo_frbtb87zp-VhUf0EaY7Grmfg/exec"
+# Link Google Apps Script Web App (DÃ¹ng Ä‘á»ƒ tá»± Ä‘á»™ng Ä‘áº©y MÃ£ MÃ¡y vÃ  tá»± Ä‘á»™ng táº¡o Key - Dá»± phÃ²ng)
+DEFAULT_WEB_APP_URL = ""
 
 DATE_FORMATS = [
     "%Y-%m-%d",
@@ -35,7 +35,7 @@ DATE_FORMATS = [
 _CACHED_MACHINE_ID: Optional[str] = None
 
 def get_windows_machine_guid() -> str:
-    """Lấy MachineGuid cố định từ Windows Registry (không thay đổi trừ khi cài lại Windows)."""
+    """Láº¥y MachineGuid cá»‘ Ä‘á»‹nh tá»« Windows Registry (khÃ´ng thay Ä‘á»•i trá»« khi cÃ i láº¡i Windows)."""
     try:
         key = winreg.OpenKey(
             winreg.HKEY_LOCAL_MACHINE,
@@ -50,7 +50,7 @@ def get_windows_machine_guid() -> str:
         return ""
 
 def get_c_drive_volume_serial() -> str:
-    """Lấy Serial Number của phân vùng ổ đĩa C:\\ qua Win32 API (tức thì, không timeout)."""
+    """Láº¥y Serial Number cá»§a phÃ¢n vÃ¹ng á»• Ä‘Ä©a C:\\ qua Win32 API (tá»©c thÃ¬, khÃ´ng timeout)."""
     try:
         serial = ctypes.c_ulong()
         kernel32 = ctypes.windll.kernel32
@@ -61,7 +61,7 @@ def get_c_drive_volume_serial() -> str:
     return ""
 
 def get_cpu_info() -> str:
-    """Lấy thông tin CPU cố định từ Registry (tức thì, không dùng powershell)."""
+    """Láº¥y thÃ´ng tin CPU cá»‘ Ä‘á»‹nh tá»« Registry (tá»©c thÃ¬, khÃ´ng dÃ¹ng powershell)."""
     try:
         key = winreg.OpenKey(
             winreg.HKEY_LOCAL_MACHINE,
@@ -76,7 +76,7 @@ def get_cpu_info() -> str:
         return ""
 
 def get_bios_info() -> str:
-    """Lấy thông tin BIOS/Mainboard từ Registry."""
+    """Láº¥y thÃ´ng tin BIOS/Mainboard tá»« Registry."""
     for prop in ("BaseBoardSerialNumber", "SystemSerialNumber", "BIOSVersion"):
         try:
             key = winreg.OpenKey(
@@ -96,16 +96,16 @@ def get_bios_info() -> str:
 
 def save_persistent_machine_id(machine_id: str, db=None):
     """
-    Lưu trữ Machine ID vĩnh viễn vào 3 cấp độ:
+    LÆ°u trá»¯ Machine ID vÄ©nh viá»…n vÃ o 3 cáº¥p Ä‘á»™:
     1. SQLite Database
     2. Registry Windows HKCU\\Software\\AutoPost
-    3. Tệp tin bảo mật trong %APPDATA%\\Auto Post\\.machine_id
+    3. Tá»‡p tin báº£o máº­t trong %APPDATA%\\Auto Post\\.machine_id
     """
     if not machine_id or not machine_id.startswith("CWAI-"):
         return
     machine_id = machine_id.strip().upper()
 
-    # 1. Lưu vào Database
+    # 1. LÆ°u vÃ o Database
     try:
         if db is not None:
             db.set_setting("persistent_machine_id", machine_id)
@@ -115,7 +115,7 @@ def save_persistent_machine_id(machine_id: str, db=None):
     except Exception:
         pass
 
-    # 2. Lưu vào Registry HKCU
+    # 2. LÆ°u vÃ o Registry HKCU
     try:
         reg_key = winreg.CreateKeyEx(
             winreg.HKEY_CURRENT_USER,
@@ -128,7 +128,7 @@ def save_persistent_machine_id(machine_id: str, db=None):
     except Exception:
         pass
 
-    # 3. Lưu vào AppData file
+    # 3. LÆ°u vÃ o AppData file
     try:
         appdata = os.environ.get("APPDATA") or ""
         if appdata:
@@ -141,32 +141,32 @@ def save_persistent_machine_id(machine_id: str, db=None):
 
 def load_persistent_machine_id(db=None) -> Optional[str]:
     """
-    Đọc Machine ID đã lưu trước đó từ các nguồn lưu trữ cố định:
-    1. DB license_hwid (giữ nguyên key đã kích hoạt thành công)
+    Äá»c Machine ID Ä‘Ã£ lÆ°u trÆ°á»›c Ä‘Ã³ tá»« cÃ¡c nguá»“n lÆ°u trá»¯ cá»‘ Ä‘á»‹nh:
+    1. DB license_hwid (giá»¯ nguyÃªn key Ä‘Ã£ kÃ­ch hoáº¡t thÃ nh cÃ´ng)
     2. DB persistent_machine_id
     3. Registry HKCU\\Software\\AutoPost
-    4. Tệp tin %APPDATA%\\Auto Post\\.machine_id
+    4. Tá»‡p tin %APPDATA%\\Auto Post\\.machine_id
     """
-    # 1. Kiểm tra SQLite DB
+    # 1. Kiá»ƒm tra SQLite DB
     try:
         target_db = db
         if target_db is None:
             from core.database import Database
             target_db = Database()
         
-        # Nếu đã có license_hwid hợp lệ
+        # Náº¿u Ä‘Ã£ cÃ³ license_hwid há»£p lá»‡
         hwid = target_db.get_setting("license_hwid")
         if hwid and hwid.strip().startswith("CWAI-"):
             return hwid.strip().upper()
         
-        # Hoặc persistent_machine_id đã lưu
+        # Hoáº·c persistent_machine_id Ä‘Ã£ lÆ°u
         pid = target_db.get_setting("persistent_machine_id")
         if pid and pid.strip().startswith("CWAI-"):
             return pid.strip().upper()
     except Exception:
         pass
 
-    # 2. Kiểm tra Registry HKCU
+    # 2. Kiá»ƒm tra Registry HKCU
     try:
         reg_key = winreg.OpenKey(
             winreg.HKEY_CURRENT_USER,
@@ -181,7 +181,7 @@ def load_persistent_machine_id(db=None) -> Optional[str]:
     except Exception:
         pass
 
-    # 3. Kiểm tra AppData file
+    # 3. Kiá»ƒm tra AppData file
     try:
         appdata = os.environ.get("APPDATA") or ""
         if appdata:
@@ -198,31 +198,31 @@ def load_persistent_machine_id(db=None) -> Optional[str]:
 
 def get_machine_id(db=None) -> str:
     """
-    Sinh Machine ID duy nhất, cố định 100% theo phần cứng máy tính người dùng.
-    Định dạng: CWAI-XXXX-XXXX-XXXX-XXXX
-    - Tuyệt đối không dùng uuid.getnode() (bị đổi MAC khi cắm rút mạng/wifi/VPN).
-    - Tuyệt đối không gọi powershell/wmic timeout.
-    - Lưu vĩnh viễn vào DB, Registry, AppData ngay lần khởi chạy đầu tiên.
+    Sinh Machine ID duy nháº¥t, cá»‘ Ä‘á»‹nh 100% theo pháº§n cá»©ng mÃ¡y tÃ­nh ngÆ°á»i dÃ¹ng.
+    Äá»‹nh dáº¡ng: CWAI-XXXX-XXXX-XXXX-XXXX
+    - Tuyá»‡t Ä‘á»‘i khÃ´ng dÃ¹ng uuid.getnode() (bá»‹ Ä‘á»•i MAC khi cáº¯m rÃºt máº¡ng/wifi/VPN).
+    - Tuyá»‡t Ä‘á»‘i khÃ´ng gá»i powershell/wmic timeout.
+    - LÆ°u vÄ©nh viá»…n vÃ o DB, Registry, AppData ngay láº§n khá»Ÿi cháº¡y Ä‘áº§u tiÃªn.
     """
     global _CACHED_MACHINE_ID
     if _CACHED_MACHINE_ID:
         return _CACHED_MACHINE_ID
 
-    # 1. Đọc mã máy đã lưu từ trước nếu có
+    # 1. Äá»c mÃ£ mÃ¡y Ä‘Ã£ lÆ°u tá»« trÆ°á»›c náº¿u cÃ³
     saved = load_persistent_machine_id(db)
     if saved:
         _CACHED_MACHINE_ID = saved
         save_persistent_machine_id(saved, db)
         return saved
 
-    # 2. Nếu lần đầu tiên chạy máy mới: trích xuất các đặc trưng phần cứng bất biến
+    # 2. Náº¿u láº§n Ä‘áº§u tiÃªn cháº¡y mÃ¡y má»›i: trÃ­ch xuáº¥t cÃ¡c Ä‘áº·c trÆ°ng pháº§n cá»©ng báº¥t biáº¿n
     guid = get_windows_machine_guid()
     vol = get_c_drive_volume_serial()
     cpu = get_cpu_info()
     bios = get_bios_info()
     comp_name = os.environ.get("COMPUTERNAME", "")
 
-    # Chuỗi định danh phần cứng kết hợp
+    # Chuá»—i Ä‘á»‹nh danh pháº§n cá»©ng káº¿t há»£p
     raw_hw = f"{guid}|{vol}|{cpu}|{bios}|{comp_name}".strip().lower()
     sha = hashlib.sha256(raw_hw.encode("utf-8")).hexdigest().upper()
     formatted = f"CWAI-{sha[:4]}-{sha[4:8]}-{sha[8:12]}-{sha[12:16]}"
@@ -233,8 +233,8 @@ def get_machine_id(db=None) -> str:
 
 def normalize_google_sheet_csv_url(url: str) -> str:
     """
-    Chuyển đổi URL xem / chỉnh sửa Google Sheet sang định dạng CSV Export trực tiếp.
-    Hỗ trợ mọi link Google Sheet chia sẻ (Bất kỳ ai có liên kết đều có thể xem).
+    Chuyá»ƒn Ä‘á»•i URL xem / chá»‰nh sá»­a Google Sheet sang Ä‘á»‹nh dáº¡ng CSV Export trá»±c tiáº¿p.
+    Há»— trá»£ má»i link Google Sheet chia sáº» (Báº¥t ká»³ ai cÃ³ liÃªn káº¿t Ä‘á»u cÃ³ thá»ƒ xem).
     """
     if not url:
         return ""
@@ -256,21 +256,21 @@ MONTH_MAP = {
 
 def parse_expiry_date(raw_expiry: str) -> Tuple[Optional[datetime], bool, str]:
     """
-    Phân tích chuỗi ngày hết hạn từ máy chủ hoặc cache.
-    Hỗ trợ mọi định dạng: ISO (YYYY-MM-DD), Date string tiếng Anh (Sat Oct 31 2026...),
-    Định dạng Việt Nam (DD/MM/YYYY), hoặc chuỗi chứa 'Hạn: DD/MM/YYYY'.
+    PhÃ¢n tÃ­ch chuá»—i ngÃ y háº¿t háº¡n tá»« mÃ¡y chá»§ hoáº·c cache.
+    Há»— trá»£ má»i Ä‘á»‹nh dáº¡ng: ISO (YYYY-MM-DD), Date string tiáº¿ng Anh (Sat Oct 31 2026...),
+    Äá»‹nh dáº¡ng Viá»‡t Nam (DD/MM/YYYY), hoáº·c chuá»—i chá»©a 'Háº¡n: DD/MM/YYYY'.
     """
     if not raw_expiry:
-        return None, False, "Chưa thiết lập ngày hết hạn"
+        return None, False, "ChÆ°a thiáº¿t láº­p ngÃ y háº¿t háº¡n"
     
     raw_clean = str(raw_expiry).strip().upper()
-    if any(k in raw_clean for k in ["LIFETIME", "VINH VIEN", "VĨNH VIỄN", "PERMANENT", "FOREVER", "UNLIMITED"]):
-        return None, True, "Vĩnh viễn (Không giới hạn thời gian)"
+    if any(k in raw_clean for k in ["LIFETIME", "VINH VIEN", "VÄ¨NH VIá»„N", "PERMANENT", "FOREVER", "UNLIMITED"]):
+        return None, True, "VÄ©nh viá»…n (KhÃ´ng giá»›i háº¡n thá»i gian)"
 
     now = datetime.now()
     dt = None
 
-    # 1. Nhận diện dạng chuỗi ngày tiếng Anh (Sat Oct 31 2026...)
+    # 1. Nháº­n diá»‡n dáº¡ng chuá»—i ngÃ y tiáº¿ng Anh (Sat Oct 31 2026...)
     match_mon = re.search(r"([A-Za-z]{3})\s+(\d{1,2})\s+(\d{4})", str(raw_expiry))
     if match_mon:
         m_str, d_str, y_str = match_mon.groups()
@@ -281,7 +281,7 @@ def parse_expiry_date(raw_expiry: str) -> Tuple[Optional[datetime], bool, str]:
             except Exception:
                 pass
 
-    # 2. Nhận diện định dạng DD/MM/YYYY (bao gồm cả chuỗi chứa 'Hạn: DD/MM/YYYY')
+    # 2. Nháº­n diá»‡n Ä‘á»‹nh dáº¡ng DD/MM/YYYY (bao gá»“m cáº£ chuá»—i chá»©a 'Háº¡n: DD/MM/YYYY')
     if not dt:
         match_dmy = re.search(r"(\d{1,2})[/.-](\d{1,2})[/.-](\d{4})", str(raw_expiry))
         if match_dmy:
@@ -291,7 +291,7 @@ def parse_expiry_date(raw_expiry: str) -> Tuple[Optional[datetime], bool, str]:
             except Exception:
                 pass
 
-    # 3. Nhận diện định dạng ISO YYYY-MM-DD
+    # 3. Nháº­n diá»‡n Ä‘á»‹nh dáº¡ng ISO YYYY-MM-DD
     if not dt:
         match_ymd = re.search(r"(\d{4})[/.-](\d{1,2})[/.-](\d{1,2})", str(raw_expiry))
         if match_ymd:
@@ -301,7 +301,7 @@ def parse_expiry_date(raw_expiry: str) -> Tuple[Optional[datetime], bool, str]:
             except Exception:
                 pass
 
-    # 4. Fallback các định dạng strptime thông thường
+    # 4. Fallback cÃ¡c Ä‘á»‹nh dáº¡ng strptime thÃ´ng thÆ°á»ng
     if not dt:
         for fmt in DATE_FORMATS:
             try:
@@ -318,19 +318,19 @@ def parse_expiry_date(raw_expiry: str) -> Tuple[Optional[datetime], bool, str]:
         date_str = dt.strftime("%d/%m/%Y")
         remaining_days = (dt - now).days
         if not is_valid or remaining_days < 0:
-            return dt, False, f"Đã hết hạn vào ngày {date_str}"
+            return dt, False, f"ÄÃ£ háº¿t háº¡n vÃ o ngÃ y {date_str}"
         elif remaining_days == 0:
-            return dt, True, f"Hết hạn hôm nay (Hạn: {date_str})"
+            return dt, True, f"Háº¿t háº¡n hÃ´m nay (Háº¡n: {date_str})"
         else:
-            return dt, True, f"Còn {remaining_days} ngày (Hạn: {date_str})"
+            return dt, True, f"CÃ²n {remaining_days} ngÃ y (Háº¡n: {date_str})"
 
-    return None, False, f"Định dạng ngày không hợp lệ: '{raw_expiry}'"
+    return None, False, f"Äá»‹nh dáº¡ng ngÃ y khÃ´ng há»£p lá»‡: '{raw_expiry}'"
 
 
 def auto_register_machine(web_app_url: str = None, machine_id: str = None, db=None) -> Tuple[bool, str, Dict[str, Any]]:
     """
-    Tự động gửi Machine ID lên máy chủ (Cloudflare D1 Worker hoặc Google Sheet Web App):
-    - Kiểm tra xem máy đã được cấp Key chưa để tự động nạp về máy.
+    Tá»± Ä‘á»™ng gá»­i Machine ID lÃªn mÃ¡y chá»§ (Cloudflare D1 Worker hoáº·c Google Sheet Web App):
+    - Kiá»ƒm tra xem mÃ¡y Ä‘Ã£ Ä‘Æ°á»£c cáº¥p Key chÆ°a Ä‘á»ƒ tá»± Ä‘á»™ng náº¡p vá» mÃ¡y.
     """
     import requests
     if not machine_id:
@@ -338,14 +338,14 @@ def auto_register_machine(web_app_url: str = None, machine_id: str = None, db=No
 
     url = (web_app_url or (db.get_setting("license_d1_url") if db else "") or DEFAULT_D1_WORKER_URL or DEFAULT_WEB_APP_URL).strip()
     if not url:
-        return False, "Chưa cấu hình đường dẫn máy chủ bản quyền.", {}
+        return False, "ChÆ°a cáº¥u hÃ¬nh Ä‘Æ°á»ng dáº«n mÃ¡y chá»§ báº£n quyá»n.", {}
 
     computer_name = os.environ.get("COMPUTERNAME", "")
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)"
     }
 
-    # 1. HỖ TRỢ CLOUDFLARE D1 WORKER (Siêu tốc ~40ms)
+    # 1. Há»– TRá»¢ CLOUDFLARE D1 WORKER (SiÃªu tá»‘c ~40ms)
     if "workers.dev" in url or "cloudflare" in url or "/api/" in url:
         endpoint = url.rstrip("/")
         if not endpoint.endswith("/api/auto-register") and not endpoint.endswith("/api/verify"):
@@ -367,7 +367,7 @@ def auto_register_machine(web_app_url: str = None, machine_id: str = None, db=No
                 exp_display = (data.get("expiry_display") or "").strip()
                 status = (data.get("status") or "ACTIVE").strip()
                 is_valid = bool(data.get("valid", False))
-                msg = data.get("message", "Đã kết nối máy chủ Cloudflare D1 thành công!")
+                msg = data.get("message", "ÄÃ£ káº¿t ná»‘i mÃ¡y chá»§ Cloudflare D1 thÃ nh cÃ´ng!")
                 info = {
                     "machine_id": machine_id,
                     "license_key": key,
@@ -380,12 +380,12 @@ def auto_register_machine(web_app_url: str = None, machine_id: str = None, db=No
                 }
                 return is_valid, msg, info
             else:
-                return False, f"Máy chủ Cloudflare phản hồi mã lỗi {resp.status_code}", {}
+                return False, f"MÃ¡y chá»§ Cloudflare pháº£n há»“i mÃ£ lá»—i {resp.status_code}", {}
         except Exception as e:
-            return False, f"Lỗi kết nối máy chủ Cloudflare: {str(e)}", {}
+            return False, f"Lá»—i káº¿t ná»‘i mÃ¡y chá»§ Cloudflare: {str(e)}", {}
 
     if "script.google.com" not in url:
-        return False, "Đường dẫn máy chủ không hợp lệ.", {}
+        return False, "ÄÆ°á»ng dáº«n mÃ¡y chá»§ khÃ´ng há»£p lá»‡.", {}
 
     try:
         resp = requests.get(
@@ -406,8 +406,8 @@ def auto_register_machine(web_app_url: str = None, machine_id: str = None, db=No
             exp_display = (data.get("expiry_display") or "").strip()
             status = (data.get("status") or "ACTIVE").strip()
             is_valid = bool(data.get("valid", False))
-            msg = data.get("message", "Đã kết nối máy chủ thành công!")
-            if not is_valid and ("hết hạn" in msg.lower() or "expired" in msg.lower() or "hết hạn" in exp_display.lower()):
+            msg = data.get("message", "ÄÃ£ káº¿t ná»‘i mÃ¡y chá»§ thÃ nh cÃ´ng!")
+            if not is_valid and ("háº¿t háº¡n" in msg.lower() or "expired" in msg.lower() or "háº¿t háº¡n" in exp_display.lower()):
                 status = "EXPIRED"
 
             info = {
@@ -422,26 +422,26 @@ def auto_register_machine(web_app_url: str = None, machine_id: str = None, db=No
             }
             return True, msg, info
         else:
-            return False, f"Lỗi phản hồi từ máy chủ (HTTP {resp.status_code})", {}
+            return False, f"Lá»—i pháº£n há»“i tá»« mÃ¡y chá»§ (HTTP {resp.status_code})", {}
     except Exception as e:
-        return False, f"Lỗi kết nối khi tự động đăng ký: {str(e)}", {}
+        return False, f"Lá»—i káº¿t ná»‘i khi tá»± Ä‘á»™ng Ä‘Äƒng kÃ½: {str(e)}", {}
 
 def verify_license_online(sheet_url: str, machine_id: str, entered_key: str) -> Tuple[bool, str, Dict[str, Any]]:
     """
-    Xác thực bản quyền trực tuyến:
-    1. Ưu tiên kiểm tra qua Cloudflare D1 Worker (nếu link là workers.dev hoặc đã cấu hình D1).
-    2. Fallback sang Google Apps Script Web App hoặc Google Sheet CSV.
+    XÃ¡c thá»±c báº£n quyá»n trá»±c tuyáº¿n:
+    1. Æ¯u tiÃªn kiá»ƒm tra qua Cloudflare D1 Worker (náº¿u link lÃ  workers.dev hoáº·c Ä‘Ã£ cáº¥u hÃ¬nh D1).
+    2. Fallback sang Google Apps Script Web App hoáº·c Google Sheet CSV.
     """
     import requests
 
     if not sheet_url:
-        return False, "Chưa cấu hình liên kết máy chủ bản quyền.", {}
+        return False, "ChÆ°a cáº¥u hÃ¬nh liÃªn káº¿t mÃ¡y chá»§ báº£n quyá»n.", {}
     
     if not machine_id:
-        return False, "Không thể xác định Mã Máy (Machine ID).", {}
+        return False, "KhÃ´ng thá»ƒ xÃ¡c Ä‘á»‹nh MÃ£ MÃ¡y (Machine ID).", {}
         
     if not entered_key:
-        return False, "Vui lòng nhập Key kích hoạt bản quyền.", {}
+        return False, "Vui lÃ²ng nháº­p Key kÃ­ch hoáº¡t báº£n quyá»n.", {}
 
     curr_mid = machine_id.strip().upper()
     curr_key = entered_key.strip().upper()
@@ -452,7 +452,7 @@ def verify_license_online(sheet_url: str, machine_id: str, entered_key: str) -> 
         }
 
         # -------------------------------------------------------------
-        # 1. XÁC THỰC QUA CLOUDFLARE D1 WORKER (Tốc độ ~40ms)
+        # 1. XÃC THá»°C QUA CLOUDFLARE D1 WORKER (Tá»‘c Ä‘á»™ ~40ms)
         # -------------------------------------------------------------
         if "workers.dev" in sheet_url or "cloudflare" in sheet_url or "/api/" in sheet_url:
             verify_endpoint = sheet_url.rstrip("/")
@@ -486,18 +486,18 @@ def verify_license_online(sheet_url: str, machine_id: str, entered_key: str) -> 
                     "verified_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 }
                 if is_valid:
-                    return True, msg or f"Kích hoạt thành công! Hạn dùng: {exp_disp}", info
+                    return True, msg or f"KÃ­ch hoáº¡t thÃ nh cÃ´ng! Háº¡n dÃ¹ng: {exp_disp}", info
                 else:
-                    return False, msg or "Bản quyền không hợp lệ hoặc đã hết hạn.", info
+                    return False, msg or "Báº£n quyá»n khÃ´ng há»£p lá»‡ hoáº·c Ä‘Ã£ háº¿t háº¡n.", info
             else:
                 try:
                     err_json = resp.json()
-                    return False, err_json.get("message") or err_json.get("error") or f"Lỗi máy chủ (HTTP {resp.status_code})", {}
+                    return False, err_json.get("message") or err_json.get("error") or f"Lá»—i mÃ¡y chá»§ (HTTP {resp.status_code})", {}
                 except Exception:
-                    return False, f"Lỗi phản hồi từ máy chủ Cloudflare D1 (HTTP {resp.status_code})", {}
+                    return False, f"Lá»—i pháº£n há»“i tá»« mÃ¡y chá»§ Cloudflare D1 (HTTP {resp.status_code})", {}
 
         # -------------------------------------------------------------
-        # 2. XÁC THỰC QUA GOOGLE APPS SCRIPT WEB APP (Dự phòng)
+        # 2. XÃC THá»°C QUA GOOGLE APPS SCRIPT WEB APP (Dá»± phÃ²ng)
         # -------------------------------------------------------------
         if "script.google.com" in sheet_url:
             resp = requests.get(
@@ -526,17 +526,17 @@ def verify_license_online(sheet_url: str, machine_id: str, entered_key: str) -> 
                         "verified_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     }
                     if is_valid:
-                        return True, msg or f"Kích hoạt thành công! Hạn dùng: {info['expiry_display']}", info
+                        return True, msg or f"KÃ­ch hoáº¡t thÃ nh cÃ´ng! Háº¡n dÃ¹ng: {info['expiry_display']}", info
                     else:
-                        return False, msg or "Bản quyền không hợp lệ hoặc đã hết hạn.", info
+                        return False, msg or "Báº£n quyá»n khÃ´ng há»£p lá»‡ hoáº·c Ä‘Ã£ háº¿t háº¡n.", info
                 except Exception as e:
-                    return False, f"Lỗi đọc dữ liệu từ máy chủ: {e}", {}
+                    return False, f"Lá»—i Ä‘á»c dá»¯ liá»‡u tá»« mÃ¡y chá»§: {e}", {}
 
-        # Ngược lại, đọc trực tiếp từ Google Sheet qua CSV export
+        # NgÆ°á»£c láº¡i, Ä‘á»c trá»±c tiáº¿p tá»« Google Sheet qua CSV export
         csv_url = normalize_google_sheet_csv_url(sheet_url)
         resp = requests.get(csv_url, headers=headers, timeout=12)
         
-        # Nếu link gviz không tải được hoặc rỗng, thử link export CSV truyền thống
+        # Náº¿u link gviz khÃ´ng táº£i Ä‘Æ°á»£c hoáº·c rá»—ng, thá»­ link export CSV truyá»n thá»‘ng
         if resp.status_code != 200 or len(resp.content.strip()) == 0:
             match = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", sheet_url)
             if match:
@@ -546,33 +546,33 @@ def verify_license_online(sheet_url: str, machine_id: str, entered_key: str) -> 
                     resp = resp_alt
 
         if resp.status_code != 200:
-            return False, f"Không thể tải dữ liệu từ máy chủ (Mã HTTP: {resp.status_code}).", {}
+            return False, f"KhÃ´ng thá»ƒ táº£i dá»¯ liá»‡u tá»« mÃ¡y chá»§ (MÃ£ HTTP: {resp.status_code}).", {}
 
         content = resp.content.decode("utf-8-sig", errors="ignore").strip()
         if not content:
-            return False, "Hệ thống bản quyền hiện chưa có dữ liệu.", {}
+            return False, "Há»‡ thá»‘ng báº£n quyá»n hiá»‡n chÆ°a cÃ³ dá»¯ liá»‡u.", {}
 
         reader = csv.DictReader(io.StringIO(content))
         if not reader.fieldnames:
-            return False, "Dữ liệu bản quyền rỗng hoặc không đúng định dạng.", {}
+            return False, "Dá»¯ liá»‡u báº£n quyá»n rá»—ng hoáº·c khÃ´ng Ä‘Ãºng Ä‘á»‹nh dáº¡ng.", {}
 
-        # Chuẩn hóa tên cột để hỗ trợ cả tiếng Anh lẫn tiếng Việt
+        # Chuáº©n hÃ³a tÃªn cá»™t Ä‘á»ƒ há»— trá»£ cáº£ tiáº¿ng Anh láº«n tiáº¿ng Viá»‡t
         field_map = {}
         for f in reader.fieldnames:
             norm = f.strip().lower().replace(" ", "_")
-            if norm in ("machine_id", "machineid", "hwid", "ma_may", "mã_máy", "id"):
+            if norm in ("machine_id", "machineid", "hwid", "ma_may", "mÃ£_mÃ¡y", "id"):
                 field_map["machine_id"] = f
-            elif norm in ("license_key", "licensekey", "key", "ma_key", "mã_key", "ma_kich_hoat", "mã_kích_hoạt"):
+            elif norm in ("license_key", "licensekey", "key", "ma_key", "mÃ£_key", "ma_kich_hoat", "mÃ£_kÃ­ch_hoáº¡t"):
                 field_map["license_key"] = f
-            elif norm in ("expiry_date", "expiry", "expire", "han_dung", "hạn_dùng", "ngay_het_han", "ngày_hết_hạn"):
+            elif norm in ("expiry_date", "expiry", "expire", "han_dung", "háº¡n_dÃ¹ng", "ngay_het_han", "ngÃ y_háº¿t_háº¡n"):
                 field_map["expiry_date"] = f
-            elif norm in ("status", "trang_thai", "trạng_thái"):
+            elif norm in ("status", "trang_thai", "tráº¡ng_thÃ¡i"):
                 field_map["status"] = f
-            elif norm in ("note", "ghi_chu", "ghi_chú", "khach_hang", "khách_hàng"):
+            elif norm in ("note", "ghi_chu", "ghi_chÃº", "khach_hang", "khÃ¡ch_hÃ ng"):
                 field_map["note"] = f
 
         if "machine_id" not in field_map or "license_key" not in field_map:
-            return False, "Dữ liệu thiếu cột 'Machine_ID' hoặc 'License_Key'.", {}
+            return False, "Dá»¯ liá»‡u thiáº¿u cá»™t 'Machine_ID' hoáº·c 'License_Key'.", {}
 
         curr_mid = machine_id.strip().upper()
         curr_key = entered_key.strip().upper()
@@ -587,26 +587,26 @@ def verify_license_online(sheet_url: str, machine_id: str, entered_key: str) -> 
                 break
 
         if not matched_row:
-            return False, "Mã Máy hoặc Key kích hoạt không chính xác trên hệ thống. Vui lòng kiểm tra lại hoặc liên hệ quản trị viên.", {}
+            return False, "MÃ£ MÃ¡y hoáº·c Key kÃ­ch hoáº¡t khÃ´ng chÃ­nh xÃ¡c trÃªn há»‡ thá»‘ng. Vui lÃ²ng kiá»ƒm tra láº¡i hoáº·c liÃªn há»‡ quáº£n trá»‹ viÃªn.", {}
 
-        # Kiểm tra trạng thái Status
+        # Kiá»ƒm tra tráº¡ng thÃ¡i Status
         status_col = field_map.get("status")
         status_val = (matched_row.get(status_col) or "ACTIVE").strip().upper() if status_col else "ACTIVE"
         
-        if status_val not in ("ACTIVE", "HOẠT ĐỘNG", "HOAT DONG", "OK", "ENABLED", "TRUE", "1"):
+        if status_val not in ("ACTIVE", "HOáº T Äá»˜NG", "HOAT DONG", "OK", "ENABLED", "TRUE", "1"):
             info = {
                 "machine_id": curr_mid,
                 "license_key": curr_key,
                 "status": status_val,
                 "expiry_raw": "",
-                "expiry_display": f"Bị khóa [{status_val}]",
+                "expiry_display": f"Bá»‹ khÃ³a [{status_val}]",
                 "note": "",
                 "is_valid": False,
                 "verified_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             }
-            return False, f"Key kích hoạt đang ở trạng thái khóa hoặc tạm ngưng [{status_val}]. Vui lòng liên hệ quản trị viên.", info
+            return False, f"Key kÃ­ch hoáº¡t Ä‘ang á»Ÿ tráº¡ng thÃ¡i khÃ³a hoáº·c táº¡m ngÆ°ng [{status_val}]. Vui lÃ²ng liÃªn há»‡ quáº£n trá»‹ viÃªn.", info
 
-        # Kiểm tra thời hạn Expiry_Date
+        # Kiá»ƒm tra thá»i háº¡n Expiry_Date
         expiry_col = field_map.get("expiry_date")
         expiry_val = (matched_row.get(expiry_col) or "LIFETIME").strip() if expiry_col else "LIFETIME"
         dt, is_valid, expiry_msg = parse_expiry_date(expiry_val)
@@ -626,17 +626,17 @@ def verify_license_online(sheet_url: str, machine_id: str, entered_key: str) -> 
         }
 
         if not is_valid:
-            return False, f"Key kích hoạt đã hết hạn! Chi tiết: {expiry_msg}", license_info
+            return False, f"Key kÃ­ch hoáº¡t Ä‘Ã£ háº¿t háº¡n! Chi tiáº¿t: {expiry_msg}", license_info
 
-        return True, f"Kích hoạt thành công! Hạn dùng: {expiry_msg}", license_info
+        return True, f"KÃ­ch hoáº¡t thÃ nh cÃ´ng! Háº¡n dÃ¹ng: {expiry_msg}", license_info
 
     except requests.exceptions.RequestException as e:
-        return False, f"Lỗi kết nối mạng khi kiểm tra Google Sheet: {str(e)}", {}
+        return False, f"Lá»—i káº¿t ná»‘i máº¡ng khi kiá»ƒm tra Google Sheet: {str(e)}", {}
     except Exception as e:
-        return False, f"Lỗi kiểm tra bản quyền: {str(e)}", {}
+        return False, f"Lá»—i kiá»ƒm tra báº£n quyá»n: {str(e)}", {}
 
 def save_cached_license(db, license_info: Dict[str, Any]):
-    """Lưu trữ thông tin bản quyền đã kích hoạt vào SQLite để khởi động nhanh."""
+    """LÆ°u trá»¯ thÃ´ng tin báº£n quyá»n Ä‘Ã£ kÃ­ch hoáº¡t vÃ o SQLite Ä‘á»ƒ khá»Ÿi Ä‘á»™ng nhanh."""
     try:
         raw_exp = str(license_info.get("expiry_raw", ""))
         dt, is_valid, msg = parse_expiry_date(raw_exp)
@@ -657,10 +657,10 @@ def save_cached_license(db, license_info: Dict[str, Any]):
         db.set_setting("license_note", license_info.get("note", ""))
         db.set_setting("license_verified_at", license_info.get("verified_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
     except Exception as e:
-        print(f"[ERROR] Không thể lưu cache bản quyền: {e}")
+        print(f"[ERROR] KhÃ´ng thá»ƒ lÆ°u cache báº£n quyá»n: {e}")
 
 def get_cached_license(db) -> Optional[Dict[str, Any]]:
-    """Đọc thông tin bản quyền đã lưu từ SQLite."""
+    """Äá»c thÃ´ng tin báº£n quyá»n Ä‘Ã£ lÆ°u tá»« SQLite."""
     try:
         hwid = db.get_setting("license_hwid")
         key = db.get_setting("license_key")
@@ -680,7 +680,7 @@ def get_cached_license(db) -> Optional[Dict[str, Any]]:
         return None
 
 def clear_cached_license(db):
-    """Xóa bỏ bản quyền đã lưu khi key bị thu hồi hoặc đổi key mới."""
+    """XÃ³a bá» báº£n quyá»n Ä‘Ã£ lÆ°u khi key bá»‹ thu há»“i hoáº·c Ä‘á»•i key má»›i."""
     try:
         db.set_setting("license_hwid", "")
         db.set_setting("license_key", "")
@@ -692,16 +692,16 @@ def clear_cached_license(db):
 
 def validate_license(db, timeout_online: int = 6) -> Tuple[bool, str, Dict[str, Any]]:
     """
-    Hàm kiểm tra bản quyền toàn diện khi khởi động ứng dụng:
-    - CHỈ VÀO ĐƯỢC KHI ĐÃ XÁC MINH KEY THÀNH CÔNG VÀ CÒN HẠN SỬ DỤNG.
-    - Luôn kiểm tra trực tuyến với máy chủ để cập nhật trạng thái mới nhất.
-    - Nếu máy chủ phản hồi (hết hạn, bị khóa, hoặc không hợp lệ):
-      -> Lập tức cập nhật trạng thái trong database và CHẶN, KHÔNG cho vào.
-    - Chỉ khi lỗi mạng (không thể kết nối tới máy chủ) mới dùng bộ nhớ đệm cục bộ,
-      và cục bộ cũng BẮT BUỘC phải còn hạn và ở trạng thái ACTIVE.
+    HÃ m kiá»ƒm tra báº£n quyá»n toÃ n diá»‡n khi khá»Ÿi Ä‘á»™ng á»©ng dá»¥ng:
+    - CHá»ˆ VÃ€O ÄÆ¯á»¢C KHI ÄÃƒ XÃC MINH KEY THÃ€NH CÃ”NG VÃ€ CÃ’N Háº N Sá»¬ Dá»¤NG.
+    - LuÃ´n kiá»ƒm tra trá»±c tuyáº¿n vá»›i mÃ¡y chá»§ Ä‘á»ƒ cáº­p nháº­t tráº¡ng thÃ¡i má»›i nháº¥t.
+    - Náº¿u mÃ¡y chá»§ pháº£n há»“i (háº¿t háº¡n, bá»‹ khÃ³a, hoáº·c khÃ´ng há»£p lá»‡):
+      -> Láº­p tá»©c cáº­p nháº­t tráº¡ng thÃ¡i trong database vÃ  CHáº¶N, KHÃ”NG cho vÃ o.
+    - Chá»‰ khi lá»—i máº¡ng (khÃ´ng thá»ƒ káº¿t ná»‘i tá»›i mÃ¡y chá»§) má»›i dÃ¹ng bá»™ nhá»› Ä‘á»‡m cá»¥c bá»™,
+      vÃ  cá»¥c bá»™ cÅ©ng Báº®T BUá»˜C pháº£i cÃ²n háº¡n vÃ  á»Ÿ tráº¡ng thÃ¡i ACTIVE.
     """
     current_mid = get_machine_id(db)
-    # Ưu tiên: Cloudflare D1 Worker -> Google Apps Script Web App -> Google Sheet CSV
+    # Æ¯u tiÃªn: Cloudflare D1 Worker -> Google Apps Script Web App -> Google Sheet CSV
     target_url = (
         db.get_setting("license_d1_url")
         or DEFAULT_D1_WORKER_URL
@@ -712,50 +712,50 @@ def validate_license(db, timeout_online: int = 6) -> Tuple[bool, str, Dict[str, 
     )
     cached = get_cached_license(db)
 
-    # 1. Nếu chưa từng kích hoạt bất kỳ key nào
+    # 1. Náº¿u chÆ°a tá»«ng kÃ­ch hoáº¡t báº¥t ká»³ key nÃ o
     if not cached:
-        return False, "Chưa kích hoạt bản quyền. Vui lòng nhập Key để sử dụng.", {"machine_id": current_mid}
+        return False, "ChÆ°a kÃ­ch hoáº¡t báº£n quyá»n. Vui lÃ²ng nháº­p Key Ä‘á»ƒ sá»­ dá»¥ng.", {"machine_id": current_mid}
 
-    # 2. Kiểm tra mã máy lưu trong DB có khớp với máy vật lý hiện tại không
+    # 2. Kiá»ƒm tra mÃ£ mÃ¡y lÆ°u trong DB cÃ³ khá»›p vá»›i mÃ¡y váº­t lÃ½ hiá»‡n táº¡i khÃ´ng
     if cached.get("machine_id") != current_mid:
-        return False, "Mã Máy không trùng khớp với bản quyền đã đăng ký trước đó.", {"machine_id": current_mid}
+        return False, "MÃ£ MÃ¡y khÃ´ng trÃ¹ng khá»›p vá»›i báº£n quyá»n Ä‘Ã£ Ä‘Äƒng kÃ½ trÆ°á»›c Ä‘Ã³.", {"machine_id": current_mid}
 
-    # 3. Kiểm tra trạng thái đã lưu: nếu đã bị KHÓA hoặc HẾT HẠN cục bộ
+    # 3. Kiá»ƒm tra tráº¡ng thÃ¡i Ä‘Ã£ lÆ°u: náº¿u Ä‘Ã£ bá»‹ KHÃ“A hoáº·c Háº¾T Háº N cá»¥c bá»™
     cached_status = (cached.get("status") or "").upper()
-    if cached_status in ("BLOCKED", "KHÓA", "TẠM KHÓA", "REVOKED"):
-        return False, "Bản quyền thiết bị này đang bị khóa bởi Quản trị viên.", cached
+    if cached_status in ("BLOCKED", "KHÃ“A", "Táº M KHÃ“A", "REVOKED"):
+        return False, "Báº£n quyá»n thiáº¿t bá»‹ nÃ y Ä‘ang bá»‹ khÃ³a bá»Ÿi Quáº£n trá»‹ viÃªn.", cached
     
-    # Kiểm tra ngày hết hạn cục bộ trước
+    # Kiá»ƒm tra ngÃ y háº¿t háº¡n cá»¥c bá»™ trÆ°á»›c
     expiry_raw = cached.get("expiry_raw", "")
     _, is_local_date_valid, local_expiry_msg = parse_expiry_date(expiry_raw)
     if not is_local_date_valid:
         db.set_setting("license_status", "EXPIRED")
         cached["status"] = "EXPIRED"
         cached["expiry_display"] = local_expiry_msg
-        return False, f"Bản quyền đã hết hạn! {local_expiry_msg}", cached
+        return False, f"Báº£n quyá»n Ä‘Ã£ háº¿t háº¡n! {local_expiry_msg}", cached
 
-    # 4. Thử đồng bộ trực tuyến với máy chủ thời gian thực
+    # 4. Thá»­ Ä‘á»“ng bá»™ trá»±c tuyáº¿n vá»›i mÃ¡y chá»§ thá»i gian thá»±c
     try:
         ok, msg, online_info = verify_license_online(target_url, current_mid, cached.get("license_key", ""))
         
-        # NẾU MÁY CHỦ PHẢN HỒI THÀNH CÔNG
-        # TH1: Key hợp lệ và còn hạn
+        # Náº¾U MÃY CHá»¦ PHáº¢N Há»’I THÃ€NH CÃ”NG
+        # TH1: Key há»£p lá»‡ vÃ  cÃ²n háº¡n
         if ok and online_info.get("is_valid") is True:
             status = (online_info.get("status") or "ACTIVE").strip().upper()
-            if status not in ("ACTIVE", "HOẠT ĐỘNG", "OK"):
+            if status not in ("ACTIVE", "HOáº T Äá»˜NG", "OK"):
                 db.set_setting("license_status", "BLOCKED")
                 cached["status"] = "BLOCKED"
-                return False, f"Bản quyền đang ở trạng thái khóa [{status}].", cached
+                return False, f"Báº£n quyá»n Ä‘ang á»Ÿ tráº¡ng thÃ¡i khÃ³a [{status}].", cached
             
             save_cached_license(db, online_info)
             return True, msg, online_info
 
-        # TH2: Máy chủ phản hồi nhưng BÁO KHÔNG HỢP LỆ (Hết hạn, Bị khóa, Sai key, v.v.)
-        # Đây là phản hồi chính thức từ máy chủ, KHÔNG ĐƯỢC fallback về cache cũ!
+        # TH2: MÃ¡y chá»§ pháº£n há»“i nhÆ°ng BÃO KHÃ”NG Há»¢P Lá»† (Háº¿t háº¡n, Bá»‹ khÃ³a, Sai key, v.v.)
+        # ÄÃ¢y lÃ  pháº£n há»“i chÃ­nh thá»©c tá»« mÃ¡y chá»§, KHÃ”NG ÄÆ¯á»¢C fallback vá» cache cÅ©!
         server_status = (online_info.get("status") or "").upper()
-        if "hết hạn" in msg.lower() or "expired" in msg.lower() or server_status == "EXPIRED" or not online_info.get("is_valid", True):
-            # Nếu hết hạn
-            if "hết hạn" in msg.lower() or "expired" in msg.lower() or server_status == "EXPIRED":
+        if "háº¿t háº¡n" in msg.lower() or "expired" in msg.lower() or server_status == "EXPIRED" or not online_info.get("is_valid", True):
+            # Náº¿u háº¿t háº¡n
+            if "háº¿t háº¡n" in msg.lower() or "expired" in msg.lower() or server_status == "EXPIRED":
                 db.set_setting("license_status", "EXPIRED")
                 if online_info.get("expiry_raw"):
                     db.set_setting("license_expiry_raw", online_info.get("expiry_raw"))
@@ -764,25 +764,25 @@ def validate_license(db, timeout_online: int = 6) -> Tuple[bool, str, Dict[str, 
                 cached["status"] = "EXPIRED"
                 if online_info.get("expiry_display"):
                     cached["expiry_display"] = online_info.get("expiry_display")
-                return False, msg or "Bản quyền đã hết hạn sử dụng. Vui lòng liên hệ Quản trị viên để gia hạn.", cached
+                return False, msg or "Báº£n quyá»n Ä‘Ã£ háº¿t háº¡n sá»­ dá»¥ng. Vui lÃ²ng liÃªn há»‡ Quáº£n trá»‹ viÃªn Ä‘á»ƒ gia háº¡n.", cached
 
-            # Nếu bị khóa
-            if "khóa" in msg.lower() or "blocked" in msg.lower() or server_status in ("BLOCKED", "KHÓA", "TẠM KHÓA", "REVOKED"):
+            # Náº¿u bá»‹ khÃ³a
+            if "khÃ³a" in msg.lower() or "blocked" in msg.lower() or server_status in ("BLOCKED", "KHÃ“A", "Táº M KHÃ“A", "REVOKED"):
                 db.set_setting("license_status", "BLOCKED")
                 cached["status"] = "BLOCKED"
-                return False, msg or "Bản quyền thiết bị này đang bị khóa bởi Quản trị viên.", cached
+                return False, msg or "Báº£n quyá»n thiáº¿t bá»‹ nÃ y Ä‘ang bá»‹ khÃ³a bá»Ÿi Quáº£n trá»‹ viÃªn.", cached
 
-            # Nếu máy chủ báo lỗi khác (Key không chính xác, v.v.)
+            # Náº¿u mÃ¡y chá»§ bÃ¡o lá»—i khÃ¡c (Key khÃ´ng chÃ­nh xÃ¡c, v.v.)
             db.set_setting("license_status", "INVALID")
             cached["status"] = "INVALID"
             return False, msg, cached
 
-        # TH3: Nếu chỉ là mất kết nối mạng tạm thời
+        # TH3: Náº¿u chá»‰ lÃ  máº¥t káº¿t ná»‘i máº¡ng táº¡m thá»i
         cached["expiry_display"] = local_expiry_msg
-        return True, f"Bản quyền hợp lệ: {local_expiry_msg}", cached
+        return True, f"Báº£n quyá»n há»£p lá»‡: {local_expiry_msg}", cached
 
     except Exception:
-        # Lỗi mạng ngoại lệ -> Đã kiểm tra is_local_date_valid ở trên rồi
+        # Lá»—i máº¡ng ngoáº¡i lá»‡ -> ÄÃ£ kiá»ƒm tra is_local_date_valid á»Ÿ trÃªn rá»“i
         cached["expiry_display"] = local_expiry_msg
-        return True, f"Bản quyền hợp lệ (Ngoại tuyến): {local_expiry_msg}", cached
+        return True, f"Báº£n quyá»n há»£p lá»‡ (Ngoáº¡i tuyáº¿n): {local_expiry_msg}", cached
 

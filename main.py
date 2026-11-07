@@ -136,27 +136,18 @@ def main():
 
     db = Database()
 
-    # Kiểm tra bản quyền hiện tại: nếu đã kích hoạt hợp lệ thì vào thẳng ứng dụng
+    # Luôn hiển thị hộp thoại xác minh và kiểm tra bản quyền trước khi vào ứng dụng
+    lic_dialog = LicenseDialog(db, is_blocking=True)
+    if lic_dialog.exec() != QDialog.Accepted:
+        sys.exit(0)
+
     from core.license_manager import get_cached_license, parse_expiry_date, get_machine_id
     cached = get_cached_license(db)
-    has_valid_license = False
-    if cached and cached.get("machine_id") == get_machine_id(db):
-        _, is_valid, _ = parse_expiry_date(cached.get("expiry_raw", ""))
-        if is_valid and cached.get("status") not in ("BLOCKED", "KHÓA", "TẠM KHÓA", "REVOKED", "EXPIRED"):
-            has_valid_license = True
-
-    # Nếu chưa kích hoạt hoặc hết hạn: mở hộp thoại xác minh bản quyền
-    if not has_valid_license:
-        lic_dialog = LicenseDialog(db, is_blocking=True)
-        if lic_dialog.exec() != QDialog.Accepted:
-            sys.exit(0)
-
-        cached = get_cached_license(db)
-        if not cached or cached.get("machine_id") != get_machine_id(db):
-            sys.exit(0)
-        _, is_valid, _ = parse_expiry_date(cached.get("expiry_raw", ""))
-        if not is_valid:
-            sys.exit(0)
+    if not cached or cached.get('machine_id') != get_machine_id(db):
+        sys.exit(0)
+    _, is_valid, _ = parse_expiry_date(cached.get('expiry_raw', ''))
+    if not is_valid or cached.get('status') in ('BLOCKED', 'KHÓA', 'TẠM KHÓA', 'REVOKED', 'EXPIRED'):
+        sys.exit(0)
 
     window = MainWindow()
     window.show()
