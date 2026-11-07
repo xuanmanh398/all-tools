@@ -8,7 +8,7 @@ from PySide6.QtGui import QFont, QClipboard, QIcon
 from core.license_manager import (
     get_machine_id, verify_license_online, auto_register_machine,
     save_cached_license, get_cached_license, DEFAULT_SHEET_URL,
-    DEFAULT_WEB_APP_URL, parse_expiry_date
+    DEFAULT_WEB_APP_URL, DEFAULT_D1_WORKER_URL, parse_expiry_date
 )
 
 DARK_DIALOG_QSS = """
@@ -165,8 +165,8 @@ class LicenseDialog(QDialog):
         self.load_current_status()
 
         # Tự động đẩy mã máy và lấy key khi khởi động hộp thoại
-        web_app_url = self.db.get_setting("license_web_app_url") or DEFAULT_WEB_APP_URL
-        if web_app_url:
+        server_url = self.db.get_setting("license_d1_url") or DEFAULT_D1_WORKER_URL or self.db.get_setting("license_web_app_url") or DEFAULT_WEB_APP_URL
+        if server_url:
             self.start_auto_register(silent=True)
 
     def init_ui(self):
@@ -357,8 +357,8 @@ class LicenseDialog(QDialog):
                 self.btn_continue.setEnabled(False)
 
     def start_auto_register(self, silent: bool = False):
-        web_app_url = self.db.get_setting("license_web_app_url") or DEFAULT_WEB_APP_URL
-        if not web_app_url:
+        server_url = self.db.get_setting("license_d1_url") or DEFAULT_D1_WORKER_URL or self.db.get_setting("license_web_app_url") or DEFAULT_WEB_APP_URL
+        if not server_url:
             if not silent:
                 self.start_activation()
             return
@@ -369,7 +369,7 @@ class LicenseDialog(QDialog):
         if self.is_blocking:
             self.btn_continue.setEnabled(False)
 
-        self.auto_worker = AutoRegisterWorker(web_app_url, self.machine_id)
+        self.auto_worker = AutoRegisterWorker(server_url, self.machine_id)
         self.auto_worker.finished_signal.connect(lambda ok, msg, info: self.on_auto_register_finished(ok, msg, info, silent))
         self.auto_worker.start()
 
@@ -459,14 +459,21 @@ class LicenseDialog(QDialog):
             return
 
         self.db.set_setting("last_entered_license_key", entered_key)
-        sheet_url = self.db.get_setting("license_web_app_url") or DEFAULT_WEB_APP_URL or self.db.get_setting("license_sheet_url") or DEFAULT_SHEET_URL
+        server_url = (
+            self.db.get_setting("license_d1_url")
+            or DEFAULT_D1_WORKER_URL
+            or self.db.get_setting("license_web_app_url")
+            or DEFAULT_WEB_APP_URL
+            or self.db.get_setting("license_sheet_url")
+            or DEFAULT_SHEET_URL
+        )
         
         self.btn_activate.setEnabled(False)
         self.btn_activate.setText("⏳ Đang Kiểm Tra...")
         self.lbl_status_icon.setText("⏳ Đang kết nối kiểm tra dữ liệu bản quyền...")
         self.lbl_status_icon.setStyleSheet("font-size: 13px; font-weight: bold; color: #89b4fa; border: none; background: transparent;")
 
-        self.worker = LicenseCheckWorker(sheet_url, self.machine_id, entered_key)
+        self.worker = LicenseCheckWorker(server_url, self.machine_id, entered_key)
         self.worker.finished_signal.connect(self.on_activation_finished)
         self.worker.start()
 

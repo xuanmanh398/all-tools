@@ -10,10 +10,14 @@ import ctypes
 from datetime import datetime
 from typing import Tuple, Dict, Any, Optional
 
-# Link Google Sheet quản lý danh sách Machine ID và Key kích hoạt
+# Link Cloudflare D1 Worker (Hệ thống bản quyền siêu tốc ~40ms kết hợp Web Admin)
+# Điền link Worker của bạn tại đây (VD: "https://tools-marketing-license.xxx.workers.dev")
+DEFAULT_D1_WORKER_URL = ""
+
+# Link Google Sheet quản lý danh sách Machine ID và Key kích hoạt (Dự phòng)
 DEFAULT_SHEET_URL = "https://docs.google.com/spreadsheets/d/1ZI6E1MnQHLIbzaDtdPLEszIxOZzFNqbh8l_Cx9718II/edit?usp=sharing"
 
-# Link Google Apps Script Web App (Dùng để tự động đẩy Mã Máy và tự động tạo Key)
+# Link Google Apps Script Web App (Dùng để tự động đẩy Mã Máy và tự động tạo Key - Dự phòng)
 DEFAULT_WEB_APP_URL = "https://script.google.com/macros/s/AKfycbyoxT3GbOiDz-0P8o3SDfCdI7gDQPIcvERiZy3bVYkVo_frbtb87zp-VhUf0EaY7Grmfg/exec"
 
 DATE_FORMATS = [
@@ -325,23 +329,63 @@ def parse_expiry_date(raw_expiry: str) -> Tuple[Optional[datetime], bool, str]:
 
 def auto_register_machine(web_app_url: str = None, machine_id: str = None, db=None) -> Tuple[bool, str, Dict[str, Any]]:
     """
-    Tự động gửi Machine ID lên Google Sheet qua Apps Script Web App:
-    - Nếu máy chưa có trên Sheet -> Tự động ghi vào Sheet và tự động sinh Key mới.
-    - Nếu máy đã có trên Sheet -> Lấy Key và thời hạn hiện tại về.
-    Admin chỉ cần mở Google Sheet và sửa cột Expiry_Date (thời hạn)!
+    Tự động gửi Machine ID lên máy chủ (Cloudflare D1 Worker hoặc Google Sheet Web App):
+    - Kiểm tra xem máy đã được cấp Key chưa để tự động nạp về máy.
     """
     import requests
     if not machine_id:
         machine_id = get_machine_id(db)
 
-    url = (web_app_url or DEFAULT_WEB_APP_URL).strip()
-    if not url or "script.google.com" not in url:
-        return False, "Cần dán link Web App (Google Apps Script) để tự động đẩy mã máy.", {}
+    url = (web_app_url or (db.get_setting("license_d1_url") if db else "") or DEFAULT_D1_WORKER_URL or DEFAULT_WEB_APP_URL).strip()
+    if not url:
+        return False, "Chưa cấu hình đường dẫn máy chủ bản quyền.", {}
 
     computer_name = os.environ.get("COMPUTERNAME", "")
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)"
     }
+
+    # 1. HỖ TRỢ CLOUDFLARE D1 WORKER (Siêu tốc ~40ms)
+    if "workers.dev" in url or "cloudflare" in url or "/api/" in url:
+        endpoint = url.rstrip("/")
+        if not endpoint.endswith("/api/auto-register") and not endpoint.endswith("/api/verify"):
+            endpoint += "/api/auto-register"
+        elif endpoint.endswith("/api/verify"):
+            endpoint = endpoint.replace("/api/verify", "/api/auto-register")
+
+        try:
+            resp = requests.post(
+                endpoint,
+                json={"machine_id": machine_id, "computer_name": computer_name},
+                headers={**headers, "Content-Type": "application/json"},
+                timeout=5
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                key = (data.get("license_key") or "").strip()
+                exp_raw = (data.get("expiry_raw") or "").strip()
+                exp_display = (data.get("expiry_display") or "").strip()
+                status = (data.get("status") or "ACTIVE").strip()
+                is_valid = bool(data.get("valid", False))
+                msg = data.get("message", "Đã kết nối máy chủ Cloudflare D1 thành công!")
+                info = {
+                    "machine_id": machine_id,
+                    "license_key": key,
+                    "expiry_raw": exp_raw,
+                    "expiry_display": exp_display,
+                    "status": status,
+                    "note": data.get("customer_name", ""),
+                    "is_valid": is_valid,
+                    "verified_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                }
+                return is_valid, msg, info
+            else:
+                return False, f"Máy chủ Cloudflare phản hồi mã lỗi {resp.status_code}", {}
+        except Exception as e:
+            return False, f"Lỗi kết nối máy chủ Cloudflare: {str(e)}", {}
+
+    if "script.google.com" not in url:
+        return False, "Đường dẫn máy chủ không hợp lệ.", {}
 
     try:
         resp = requests.get(
@@ -384,16 +428,14 @@ def auto_register_machine(web_app_url: str = None, machine_id: str = None, db=No
 
 def verify_license_online(sheet_url: str, machine_id: str, entered_key: str) -> Tuple[bool, str, Dict[str, Any]]:
     """
-    Tải danh sách bản quyền từ Google Sheet và kiểm tra:
-    - Machine_ID có khớp với máy không
-    - License_Key có khớp không
-    - Status có ở trạng thái ACTIVE không
-    - Expiry_Date còn hạn sử dụng không
+    Xác thực bản quyền trực tuyến:
+    1. Ưu tiên kiểm tra qua Cloudflare D1 Worker (nếu link là workers.dev hoặc đã cấu hình D1).
+    2. Fallback sang Google Apps Script Web App hoặc Google Sheet CSV.
     """
     import requests
 
     if not sheet_url:
-        return False, "Chưa cấu hình liên kết Google Sheet quản lý bản quyền.", {}
+        return False, "Chưa cấu hình liên kết máy chủ bản quyền.", {}
     
     if not machine_id:
         return False, "Không thể xác định Mã Máy (Machine ID).", {}
@@ -409,7 +451,54 @@ def verify_license_online(sheet_url: str, machine_id: str, entered_key: str) -> 
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)"
         }
 
-        # Nếu là link Apps Script Web App (script.google.com)
+        # -------------------------------------------------------------
+        # 1. XÁC THỰC QUA CLOUDFLARE D1 WORKER (Tốc độ ~40ms)
+        # -------------------------------------------------------------
+        if "workers.dev" in sheet_url or "cloudflare" in sheet_url or "/api/" in sheet_url:
+            verify_endpoint = sheet_url.rstrip("/")
+            if not verify_endpoint.endswith("/api/verify"):
+                if verify_endpoint.endswith("/api/auto-register"):
+                    verify_endpoint = verify_endpoint.replace("/api/auto-register", "/api/verify")
+                else:
+                    verify_endpoint += "/api/verify"
+
+            resp = requests.post(
+                verify_endpoint,
+                json={"machine_id": curr_mid, "license_key": curr_key},
+                headers={**headers, "Content-Type": "application/json"},
+                timeout=5
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                is_valid = bool(data.get("valid", False))
+                msg = data.get("message", "")
+                status = (data.get("status") or ("ACTIVE" if is_valid else "EXPIRED")).strip().upper()
+                exp_raw = str(data.get("expiry_raw") or "")
+                exp_disp = str(data.get("expiry_display") or "")
+                info = {
+                    "machine_id": curr_mid,
+                    "license_key": curr_key,
+                    "status": status,
+                    "expiry_raw": exp_raw,
+                    "expiry_display": exp_disp,
+                    "note": data.get("customer_name", "") or data.get("note", ""),
+                    "is_valid": is_valid,
+                    "verified_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                }
+                if is_valid:
+                    return True, msg or f"Kích hoạt thành công! Hạn dùng: {exp_disp}", info
+                else:
+                    return False, msg or "Bản quyền không hợp lệ hoặc đã hết hạn.", info
+            else:
+                try:
+                    err_json = resp.json()
+                    return False, err_json.get("message") or err_json.get("error") or f"Lỗi máy chủ (HTTP {resp.status_code})", {}
+                except Exception:
+                    return False, f"Lỗi phản hồi từ máy chủ Cloudflare D1 (HTTP {resp.status_code})", {}
+
+        # -------------------------------------------------------------
+        # 2. XÁC THỰC QUA GOOGLE APPS SCRIPT WEB APP (Dự phòng)
+        # -------------------------------------------------------------
         if "script.google.com" in sheet_url:
             resp = requests.get(
                 sheet_url,
@@ -612,8 +701,15 @@ def validate_license(db, timeout_online: int = 6) -> Tuple[bool, str, Dict[str, 
       và cục bộ cũng BẮT BUỘC phải còn hạn và ở trạng thái ACTIVE.
     """
     current_mid = get_machine_id(db)
-    # Ưu tiên URL Web App vì Apps Script phản hồi thời gian thực không bị trễ CDN
-    target_url = db.get_setting("license_web_app_url") or DEFAULT_WEB_APP_URL or db.get_setting("license_sheet_url") or DEFAULT_SHEET_URL
+    # Ưu tiên: Cloudflare D1 Worker -> Google Apps Script Web App -> Google Sheet CSV
+    target_url = (
+        db.get_setting("license_d1_url")
+        or DEFAULT_D1_WORKER_URL
+        or db.get_setting("license_web_app_url")
+        or DEFAULT_WEB_APP_URL
+        or db.get_setting("license_sheet_url")
+        or DEFAULT_SHEET_URL
+    )
     cached = get_cached_license(db)
 
     # 1. Nếu chưa từng kích hoạt bất kỳ key nào
