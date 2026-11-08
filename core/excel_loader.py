@@ -193,72 +193,6 @@ def _read_xlsx_rows(excel_path: str) -> List[List[str]]:
     return rows_data
 
 
-DEFAULT_SHORTENER_URL = "https://link.truyennha.id.vn"
-
-
-def ensure_short_links_in_excel(excel_path: str, worker_url: str = DEFAULT_SHORTENER_URL) -> bool:
-    """
-    Tự động chuẩn hóa file Excel 4 cột:
-    - Nếu Cột A có link: tự động tách chuyển sang Cột B (link gốc).
-    - Nếu Cột B có link mà Cột C trống: gọi API rút gọn tạo link https://link.truyennha.id.vn/s/... và ghi vào Cột C.
-    - Nếu Cột C đã có rồi: giữ nguyên không tạo thêm.
-    """
-    if not excel_path or not os.path.exists(excel_path):
-        return False
-    try:
-        import openpyxl
-        import requests
-
-        wb = openpyxl.load_workbook(excel_path)
-        sheet = wb.active
-        modified = False
-
-        for r in range(1, sheet.max_row + 1):
-            val_a = sheet.cell(r, 1).value
-            val_b = sheet.cell(r, 2).value
-            val_c = sheet.cell(r, 3).value
-
-            # Bỏ qua dòng tiêu đề nếu dòng 1 là tên cột
-            if r == 1:
-                str_a = str(val_a or "").strip().lower()
-                str_b = str(val_b or "").strip().lower()
-                if "nội dung" in str_a or "content" in str_a or "link" in str_b or "folder" in str_b:
-                    continue
-
-            orig_url = str(val_b or "").strip()
-            # Nếu cột B chưa có nhưng cột A có URL, tách chuyển sang cột B
-            if (not orig_url or not orig_url.startswith("http")) and val_a:
-                found = re.findall(r"(https?://[^\s]+)", str(val_a))
-                if found:
-                    orig_url = found[-1]
-                    clean_text = str(val_a).replace(orig_url, "").strip()
-                    sheet.cell(r, 1).value = clean_text
-                    sheet.cell(r, 2).value = orig_url
-                    modified = True
-
-            # Kiểm tra Cột C: nếu Cột B có link mà Cột C trống, tạo link rút gọn mới
-            short_val = str(val_c or "").strip()
-            if orig_url and orig_url.startswith("http"):
-                if not short_val or not short_val.startswith("http"):
-                    try:
-                        res = requests.post(f"{worker_url}/api/shorten", json={"url": orig_url}, timeout=6)
-                        if res.status_code == 200:
-                            data = res.json()
-                            short_link = data.get("short_url")
-                            if short_link:
-                                sheet.cell(r, 3).value = short_link
-                                modified = True
-                    except Exception:
-                        pass
-
-        if modified:
-            wb.save(excel_path)
-            return True
-    except Exception:
-        pass
-    return False
-
-
 def _is_header_row(col_a: str, col_b: str, excel_path: str = "") -> bool:
     """Kiểm tra xem dòng đầu tiên có phải là dòng tiêu đề cột hay không."""
     a_low = (col_a or "").strip().lower()
@@ -270,8 +204,7 @@ def _is_header_row(col_a: str, col_b: str, excel_path: str = "") -> bool:
     }
     header_keywords_b = {
         "folder", "thư mục", "thu muc", "hình ảnh", "hinh anh", "folder ảnh",
-        "folder hình ảnh", "image", "images", "media", "đường dẫn", "duong dan", "cột b", "cot b",
-        "link", "link shopee", "link gốc", "url"
+        "folder hình ảnh", "image", "images", "media", "đường dẫn", "duong dan", "cột b", "cot b"
     }
 
     if a_low in header_keywords_a or b_low in header_keywords_b:
@@ -284,22 +217,12 @@ def _is_header_row(col_a: str, col_b: str, excel_path: str = "") -> bool:
 def load_posts_from_excel(excel_path: str) -> List[Dict[str, Any]]:
     """
     Đọc danh sách mẫu bài viết từ file Excel (.xlsx):
-    - Cấu trúc 4 cột chuẩn:
-        + Cột A: Nội dung bài viết
-        + Cột B: Link gốc Shopee / Affiliate
-        + Cột C: Link rút gọn với domain riêng (link.truyennha.id.vn)
-        + Cột D: Folder chứa ảnh sản phẩm
-    - Nếu Cột C trống, hệ thống tự động tạo link rút gọn mới và ghi vào Cột C của file Excel.
-    - Đăng bài / bình luận sẽ tự động lấy: Nội dung (Cột A) + Link rút gọn (Cột C) và Ảnh (Cột D).
+    - Cột A: Nội dung bài viết (hỗ trợ nhiều dòng, Emoji, Spintax {A|B|C})
+    - Cột B: Đường dẫn Folder chứa hình ảnh/video của bài viết đó
+    Trả về danh sách các mẫu theo đúng thứ tự từ trên xuống dưới để đăng tuần tự & vòng lặp.
     """
     if not excel_path or not os.path.exists(excel_path):
         return []
-
-    # 1. Tự động kiểm tra và điền link rút gọn vào Cột C nếu còn trống
-    try:
-        ensure_short_links_in_excel(excel_path)
-    except Exception:
-        pass
 
     raw_rows = _read_xlsx_rows(excel_path)
     posts: List[Dict[str, Any]] = []
@@ -307,47 +230,24 @@ def load_posts_from_excel(excel_path: str) -> List[Dict[str, Any]]:
     for row_idx, row in enumerate(raw_rows, start=1):
         col_a = (row[0] if len(row) > 0 else "") or ""
         col_b = (row[1] if len(row) > 1 else "") or ""
-        col_c = (row[2] if len(row) > 2 else "") or ""
-        col_d = (row[3] if len(row) > 3 else "") or ""
 
         col_a = col_a.replace("\r\n", "\n").replace("\r", "\n").strip()
         col_b = col_b.strip()
-        col_c = col_c.strip()
-        col_d = col_d.strip()
 
-        if not col_a and not col_b and not col_c and not col_d:
+        if not col_a and not col_b:
             continue
 
         # Bỏ qua dòng tiêu đề nếu dòng 1 là tên cột
         if row_idx == 1 and _is_header_row(col_a, col_b, excel_path):
             continue
 
-        # Xác định Cấu trúc 4 cột hay 2 cột:
-        # Nếu có cột D hoặc cột B/C là URL -> Đây là bảng 4 cột:
-        # Folder ảnh ở cột D, Link rút gọn ở cột C, Link gốc ở cột B.
-        is_4_cols = bool(col_d) or (col_b.startswith("http") or col_c.startswith("http"))
-
-        if is_4_cols:
-            folder_str = col_d
-            orig_link = col_b
-            short_link = col_c
-        else:
-            folder_str = col_b
-            orig_link = ""
-            short_link = ""
-
-        # Nội dung đăng bài / comment: kết hợp Nội dung (Cột A) và Link rút gọn (Cột C)
-        final_post_text = col_a
-        if short_link:
-            final_post_text = f"{col_a}\n{short_link}".strip()
-
         # Làm sạch ký tự icon lỗi nếu có
-        if '\ufffc' in final_post_text or '\ufffd' in final_post_text:
-            final_post_text = final_post_text.replace('\ufffc', '🔹').replace('\ufffd', '🔹')
+        if '\ufffc' in col_a or '\ufffd' in col_a:
+            col_a = col_a.replace('\ufffc', '🔹').replace('\ufffd', '🔹')
 
-        resolved_folder = resolve_folder_path(folder_str, excel_path)
+        resolved_folder = resolve_folder_path(col_b, excel_path)
         folder_exists = bool(resolved_folder and os.path.isdir(resolved_folder))
-        raw_media = scan_media_in_folder(folder_str, excel_path) if folder_exists else []
+        raw_media = scan_media_in_folder(col_b, excel_path) if folder_exists else []
         upload_media = ensure_upload_compatible_media(raw_media)
 
         seq_num = len(posts) + 1
@@ -360,12 +260,9 @@ def load_posts_from_excel(excel_path: str) -> List[Dict[str, Any]]:
             "index": seq_num,
             "excel_row": row_idx,
             "title": f"Mẫu #{seq_num}: {first_line}",
-            "content": final_post_text,
-            "raw_text": col_a,
-            "orig_link": orig_link,
-            "short_link": short_link,
-            "folder_path": resolved_folder or folder_str,
-            "raw_folder_path": folder_str,
+            "content": col_a,
+            "folder_path": resolved_folder or col_b,
+            "raw_folder_path": col_b,
             "folder_exists": folder_exists,
             "raw_media_paths": raw_media,
             "media_paths": upload_media,
