@@ -1785,13 +1785,11 @@ class FBAutomationEngine:
         for idx, token in enumerate(tokens):
             is_url = token.startswith("http://") or token.startswith("https://") or token.startswith("www.")
             if is_url:
-                # Đảm bảo trước URL có khoảng trắng hoặc xuống dòng rõ ràng
+                # Gõ URL và LUÔN kích hoạt phím Space ngay sau đó để Lexical kích hoạt AutoLinkNode thành Link xanh
                 await page.keyboard.insert_text(token)
-                await page.wait_for_timeout(random.randint(120, 240))
-                # Nếu URL nằm ở cuối câu, gõ thêm phím Space thật để trình soạn thảo Lexical kích hoạt AutoLinkNode
-                if idx == len(tokens) - 1:
-                    await page.keyboard.press("Space")
-                    await page.wait_for_timeout(random.randint(150, 280))
+                await page.wait_for_timeout(random.randint(180, 320))
+                await page.keyboard.press("Space")
+                await page.wait_for_timeout(random.randint(220, 400))
             elif len(token) > 18 or any(ord(c) > 0xFFFF for c in token):
                 await page.keyboard.insert_text(token)
                 await page.wait_for_timeout(random.randint(70, 170))
@@ -2167,8 +2165,12 @@ class FBAutomationEngine:
             with open(target_file, "rb") as mf:
                 b64_data = base64.b64encode(mf.read()).decode("utf-8")
 
-            await editor.click(force=True)
-            await page.wait_for_timeout(300)
+            try:
+                # Chỉ focus mà không click vào giữa văn bản làm nhảy con trỏ
+                await page.evaluate("(el) => el && el.focus()", editor)
+            except Exception:
+                pass
+            await page.wait_for_timeout(200)
 
             pasted = await page.evaluate("""({b64, mime, filename}) => {
                 const target = document.querySelector('[data-agy-fb-active-editor="1"]') || document.activeElement;
@@ -2785,14 +2787,14 @@ class FBAutomationEngine:
                 logger_callback("INFO", f"Đang nhập nội dung bình luận: '{final_text[:50]}...'")
 
             try:
+                # Sử dụng human_type_text để phân tách URL, tự động nhấn Space biến link thành Link xanh click được
+                await self.human_type_text(page, comment_box, final_text, human_simulation=True)
+            except Exception as e_type:
+                if logger_callback:
+                    logger_callback("WARNING", f"Lỗi gõ phím mô phỏng, thử cách gõ thông thường: {e_type}")
                 await page.keyboard.insert_text(final_text)
-            except Exception:
-                if anti_spam:
-                    for char in final_text:
-                        await page.keyboard.write(char)
-                        await asyncio.sleep(anti_spam.get_typing_delay())
-                else:
-                    await page.keyboard.type(final_text, delay=35)
+                if "http" in final_text:
+                    await page.keyboard.press("Space")
 
             await asyncio.sleep(2)
 
