@@ -1831,12 +1831,7 @@ class FBAutomationEngine:
             except Exception:
                 pass
 
-        # 2. Nếu nội dung có URL, gõ thêm phím Space ở cuối để kích hoạt AutoLinkNode (Link xanh)
-        if "http://" in text or "https://" in text or "www." in text:
-            await page.wait_for_timeout(200)
-            await page.keyboard.press("Space")
-
-        # 3. Yêu cầu quan trọng: Đợi 3 giây để Facebook nhận diện link và xử lý metadata trước khi đăng
+        # 2. Đợi 3 giây để Facebook nhận diện link và xử lý metadata trước khi đăng (không thêm dấu cách ở cuối)
         await page.wait_for_timeout(3000)
 
     async def _scan_fb_feed_posts_with_likes(self, page: Page) -> List[Dict[str, Any]]:
@@ -2827,8 +2822,6 @@ class FBAutomationEngine:
                 if logger_callback:
                     logger_callback("WARNING", f"Lỗi gõ phím mô phỏng, thử cách gõ thông thường: {e_type}")
                 await page.keyboard.insert_text(final_text)
-                if "http" in final_text:
-                    await page.keyboard.press("Space")
 
             await asyncio.sleep(2)
 
