@@ -1,0 +1,13 @@
+name = "tools-marketing-license"
+main = "worker.js"
+compatibility_date = "2026-11-07"
+workers_dev = true
+
+[[routes]]
+pattern = "link.truyennha.id.vn"
+custom_domain = true
+
+[[d1_databases]]
+binding = "DB"
+database_name = "mtools-db"
+database_id = "45b0ab84-c0bc-4bcd-8895-86b68b166136"

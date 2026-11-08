@@ -27,6 +27,7 @@ hiddenimports = [
     'playwright.sync_api',
     'playwright._impl._driver',
     'requests',
+    'openpyxl',
     'sqlite3',
     'asyncio',
     'json',

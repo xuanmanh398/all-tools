@@ -27,6 +27,17 @@ export default {
         const path = url.pathname;
 
         try {
+            // 0. CHUYỂN HƯỚNG LINK RÚT GỌN (VD: /s/abc12)
+            if (path.startsWith("/s/")) {
+                const sCode = path.replace("/s/", "").trim();
+                return await handleRedirectShortLink(sCode, env);
+            }
+
+            // 0.1 API TẠO LINK RÚT GỌN (CHO PHẦN MỀM MARKETING)
+            if (path === "/api/shorten" && request.method === "POST") {
+                return await handleShortenLink(request, env);
+            }
+
             // 1. API XÁC THỰC BẢN QUYỀN TỪ PHẦN MỀM DESKTOP
             if (path === "/api/verify" && request.method === "POST") {
                 return await handleVerifyLicense(request, env);
@@ -636,4 +647,110 @@ function renderAdminWebPage(env) {
     return new Response(html, {
         headers: { "Content-Type": "text/html; charset=utf-8" }
     });
+}
+
+
+/**
+ * Xử lý tạo link rút gọn (/api/shorten)
+ */
+async function handleShortenLink(request, env) {
+    if (!env.DB) {
+        return jsonResponse({ success: false, message: "Chưa cấu hình D1 Database (Binding DB)!" }, 500);
+    }
+    const body = await request.json().catch(() => ({}));
+    let targetUrl = String(body.url || body.target_url || "").trim();
+    if (!targetUrl) {
+        return jsonResponse({ success: false, message: "Thiếu tham số url!" }, 400);
+    }
+    if (!targetUrl.startsWith("http://") && !targetUrl.startsWith("https://")) {
+        targetUrl = "https://" + targetUrl;
+    }
+
+    // Đảm bảo bảng short_links tồn tại
+    try {
+        await env.DB.prepare(`
+            CREATE TABLE IF NOT EXISTS short_links (
+                code TEXT PRIMARY KEY,
+                target_url TEXT,
+                created_at DATETIME,
+                click_count INTEGER DEFAULT 0
+            )
+        `).run();
+    } catch (e) {}
+
+    // Kiểm tra nếu link này đã được tạo trước đó
+    try {
+        const { results } = await env.DB.prepare(
+            "SELECT code FROM short_links WHERE target_url = ? LIMIT 1"
+        ).bind(targetUrl).all();
+
+        if (results && results.length > 0 && results[0].code) {
+            const existingCode = results[0].code;
+            return jsonResponse({
+                success: true,
+                code: existingCode,
+                short_url: `https://link.truyennha.id.vn/s/${existingCode}`,
+                target_url: targetUrl
+            });
+        }
+    } catch (e) {}
+
+    // Sinh code 5 ký tự ngẫu nhiên
+    const chars = "abcdefghjkmnpqrstuvwxyz23456789";
+    let code = "";
+    for (let attempt = 0; attempt < 5; attempt++) {
+        let rand = "";
+        for (let i = 0; i < 5; i++) {
+            rand += chars.charAt(Math.floor(Math.random() * chars.length));
+        }
+        try {
+            const check = await env.DB.prepare(
+                "SELECT code FROM short_links WHERE code = ? LIMIT 1"
+            ).bind(rand).all();
+            if (!check.results || check.results.length === 0) {
+                code = rand;
+                break;
+            }
+        } catch (e) {
+            code = rand;
+            break;
+        }
+    }
+    if (!code) {
+        code = Math.random().toString(36).substring(2, 7);
+    }
+
+    await env.DB.prepare(
+        "INSERT OR REPLACE INTO short_links (code, target_url, created_at, click_count) VALUES (?, ?, datetime('now', '+7 hours'), 0)"
+    ).bind(code, targetUrl).run();
+
+    const shortUrl = `https://link.truyennha.id.vn/s/${code}`;
+    return jsonResponse({
+        success: true,
+        code: code,
+        short_url: shortUrl,
+        target_url: targetUrl
+    });
+}
+
+/**
+ * Xử lý chuyển hướng khi người đọc click link (/s/:code)
+ */
+async function handleRedirectShortLink(code, env) {
+    if (!code || !env.DB) {
+        return Response.redirect("https://shopee.vn", 302);
+    }
+    try {
+        const { results } = await env.DB.prepare(
+            "SELECT target_url FROM short_links WHERE code = ? LIMIT 1"
+        ).bind(code).all();
+
+        if (results && results.length > 0 && results[0].target_url) {
+            const targetUrl = results[0].target_url;
+            env.DB.prepare("UPDATE short_links SET click_count = click_count + 1 WHERE code = ?").bind(code).run().catch(() => {});
+            return Response.redirect(targetUrl, 302);
+        }
+    } catch (e) {}
+
+    return Response.redirect("https://shopee.vn", 302);
 }
