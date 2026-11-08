@@ -30,7 +30,7 @@ export default {
             // 0. CHUYỂN HƯỚNG LINK RÚT GỌN (VD: /s/abc12)
             if (path.startsWith("/s/")) {
                 const sCode = path.replace("/s/", "").trim();
-                return await handleRedirectShortLink(sCode, env);
+                return await handleRedirectShortLink(sCode, env, request);
             }
 
             // 0.1 API TẠO LINK RÚT GỌN (CHO PHẦN MỀM MARKETING)
@@ -736,21 +736,85 @@ async function handleShortenLink(request, env) {
 /**
  * Xử lý chuyển hướng khi người đọc click link (/s/:code)
  */
-async function handleRedirectShortLink(code, env) {
+async function handleRedirectShortLink(code, env, request) {
     if (!code || !env.DB) {
         return Response.redirect("https://shopee.vn", 302);
     }
+    let targetUrl = "https://shopee.vn";
     try {
         const { results } = await env.DB.prepare(
             "SELECT target_url FROM short_links WHERE code = ? LIMIT 1"
         ).bind(code).all();
 
         if (results && results.length > 0 && results[0].target_url) {
-            const targetUrl = results[0].target_url;
+            targetUrl = results[0].target_url;
             env.DB.prepare("UPDATE short_links SET click_count = click_count + 1 WHERE code = ?").bind(code).run().catch(() => {});
-            return Response.redirect(targetUrl, 302);
         }
     } catch (e) {}
 
-    return Response.redirect("https://shopee.vn", 302);
+    const userAgent = (request ? request.headers.get("user-agent") : "") || "";
+    const isBot = /facebookexternalhit|Facebot|Twitterbot|TelegramBot|WhatsApp/i.test(userAgent);
+
+    if (isBot) {
+        // Trả về HTML 200 OK với đầy đủ thẻ Open Graph để Facebook Bot nhận diện link 100% hợp lệ, không bị lỗi 403 của Shopee
+        const html = `<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="utf-8">
+    <title>Sản phẩm chính hãng trên Shopee</title>
+    <meta property="og:title" content="Xem chi tiết sản phẩm trên Shopee">
+    <meta property="og:description" content="Nhấn vào để xem chi tiết sản phẩm và nhận ưu đãi chính hãng trên Shopee.">
+    <meta property="og:type" content="website">
+    <meta property="og:url" content="https://link.truyennha.id.vn/s/${code}">
+    <meta property="og:site_name" content="Shopee">
+    <meta name="robots" content="index, follow">
+</head>
+<body>
+    <p>Đang chuyển hướng tới sản phẩm trên Shopee...</p>
+</body>
+</html>`;
+        return new Response(html, {
+            status: 200,
+            headers: {
+                "Content-Type": "text/html; charset=utf-8",
+                "Cache-Control": "public, max-age=86400"
+            }
+        });
+    }
+
+    // Người dùng thật bấm vào: chuyển hướng ngay lập tức (Meta refresh + JS replace)
+    const redirectHtml = `<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Đang mở Shopee...</title>
+    <meta http-equiv="refresh" content="0; url=${targetUrl}">
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; background: #fafafa; color: #333; }
+        .box { text-align: center; padding: 20px; }
+        .spinner { width: 40px; height: 40px; border: 4px solid #f3f3f3; border-top: 4px solid #ee4d2d; border-radius: 50%; animation: spin 0.8s linear infinite; margin: 0 auto 16px; }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        a { color: #ee4d2d; font-weight: bold; text-decoration: none; font-size: 16px; }
+    </style>
+</head>
+<body>
+    <div class="box">
+        <div class="spinner"></div>
+        <p>Đang chuyển đến Shopee...</p>
+        <p><a href="${targetUrl}">Bấm vào đây nếu không tự chuyển</a></p>
+    </div>
+    <script>
+        window.location.replace("${targetUrl}");
+    </script>
+</body>
+</html>`;
+
+    return new Response(redirectHtml, {
+        status: 200,
+        headers: {
+            "Content-Type": "text/html; charset=utf-8",
+            "Cache-Control": "no-cache, no-store, must-revalidate"
+        }
+    });
 }
