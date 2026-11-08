@@ -380,7 +380,8 @@ class FBAutomationEngine:
             storage_state=storage_state,
             viewport={"width": 1280, "height": 820},
             locale="vi-VN",
-            timezone_id="Asia/Ho_Chi_Minh"
+            timezone_id="Asia/Ho_Chi_Minh",
+            permissions=["clipboard-read", "clipboard-write"]
         )
 
         # Stealth chống phát hiện tự động hóa (Anti-Checkpoint / Anti-Human Verification)
@@ -1762,51 +1763,81 @@ class FBAutomationEngine:
 
     async def human_type_text(self, page: Page, editor: Any, text: str, human_simulation: bool = True):
         """
-        Nhập nội dung bình luận theo nhịp gõ phím tự nhiên của con người (Human-like Keystroke Simulation)
-        kết hợp chèn nhanh các cụm URL/Emoji và tự động kết thúc token Link bằng phím Space để Lexical
-        nhận diện Link có thể click trực tiếp.
+        Dán (Paste) nội dung bình luận vào ô soạn thảo Facebook để trình soạn thảo Lexical
+        tự động nhận diện URL thành Link xanh (AutoLinkNode), sau đó đợi 3 giây mới đăng.
         """
         if not text:
             return
         try:
-            await editor.click(force=True)
-            await page.wait_for_timeout(random.randint(250, 500))
+            # Focus nhẹ nhàng vào ô soạn thảo mà không làm nhảy con trỏ chuột vào giữa text
+            await page.evaluate("(el) => el && el.focus()", editor)
+            await page.wait_for_timeout(250)
         except Exception:
             pass
 
-        if not human_simulation:
-            await page.keyboard.insert_text(text)
-            if re.search(r"https?://\S+$", text.strip()):
-                await page.keyboard.press("Space")
-            await page.wait_for_timeout(500)
-            return
+        # 1. Thao tác Paste nội dung qua Clipboard API & phím tắt Control+v để kích hoạt Lexical Paste & AutoLink
+        pasted = False
+        try:
+            # Ghi vào clipboard của browser context
+            await page.evaluate("""async (txt) => {
+                if (navigator.clipboard && navigator.clipboard.writeText) {
+                    await navigator.clipboard.writeText(txt);
+                }
+            }""", text)
+            # Ghi vào OS clipboard qua pyperclip làm dự phòng
+            try:
+                import pyperclip
+                pyperclip.copy(text)
+            except Exception:
+                pass
 
-        tokens = [t for t in re.split(r"(\s+)", text) if t]
-        for idx, token in enumerate(tokens):
-            is_url = token.startswith("http://") or token.startswith("https://") or token.startswith("www.")
-            if is_url:
-                # Gõ URL và LUÔN kích hoạt phím Space ngay sau đó để Lexical kích hoạt AutoLinkNode thành Link xanh
-                await page.keyboard.insert_text(token)
-                await page.wait_for_timeout(random.randint(180, 320))
-                await page.keyboard.press("Space")
-                await page.wait_for_timeout(random.randint(220, 400))
-            elif len(token) > 18 or any(ord(c) > 0xFFFF for c in token):
-                await page.keyboard.insert_text(token)
-                await page.wait_for_timeout(random.randint(70, 170))
-            else:
-                for ch in token:
-                    if ch == "\n":
-                        await page.keyboard.press("Shift+Enter")
-                        await page.wait_for_timeout(random.randint(120, 260))
-                    elif ch == " ":
-                        await page.keyboard.press("Space")
-                        await page.wait_for_timeout(random.randint(25, 65))
-                    else:
-                        await page.keyboard.insert_text(ch)
-                        await page.wait_for_timeout(random.randint(18, 55))
-                if any(p in token for p in [".", ",", "!", "?", ":"]):
-                    await page.wait_for_timeout(random.randint(140, 320))
-        await page.wait_for_timeout(random.randint(500, 950))
+            # Focus và nhấn Control+v để kích hoạt sự kiện dán chuẩn từ trình duyệt
+            await page.evaluate("(el) => el && el.focus()", editor)
+            await page.keyboard.press("Control+v")
+            await page.wait_for_timeout(350)
+
+            # Kiểm tra xem ô soạn thảo đã nhận được nội dung chưa
+            content_len = await page.evaluate("(el) => (el ? (el.innerText || el.textContent || '') : '').trim().length", editor)
+            if content_len > 0:
+                pasted = True
+        except Exception:
+            pasted = False
+
+        # Fallback 1: Thử dispatch sự kiện ClipboardEvent 'paste' kèm DataTransfer
+        if not pasted:
+            try:
+                pasted = await page.evaluate("""({text}) => {
+                    const target = document.querySelector('[data-agy-fb-active-editor="1"]') || document.activeElement;
+                    if (!target) return false;
+                    target.focus();
+                    const dt = new DataTransfer();
+                    dt.setData('text/plain', text);
+                    const pasteEvent = new ClipboardEvent('paste', {
+                        bubbles: true,
+                        cancelable: true,
+                        clipboardData: dt
+                    });
+                    target.dispatchEvent(pasteEvent);
+                    return true;
+                }""", {"text": text})
+                await page.wait_for_timeout(300)
+            except Exception:
+                pasted = False
+
+        # Fallback 2: Nếu cả 2 cách paste trên chưa điền được text, dùng insert_text
+        if not pasted:
+            try:
+                await page.keyboard.insert_text(text)
+            except Exception:
+                pass
+
+        # 2. Nếu nội dung có URL, gõ thêm phím Space ở cuối để kích hoạt AutoLinkNode (Link xanh)
+        if "http://" in text or "https://" in text or "www." in text:
+            await page.wait_for_timeout(200)
+            await page.keyboard.press("Space")
+
+        # 3. Yêu cầu quan trọng: Đợi 3 giây để Facebook nhận diện link và xử lý metadata trước khi đăng
+        await page.wait_for_timeout(3000)
 
     async def _scan_fb_feed_posts_with_likes(self, page: Page) -> List[Dict[str, Any]]:
         """
@@ -2219,6 +2250,9 @@ class FBAutomationEngine:
         và chờ trạng thái 'Đang viết...' / 'Posting...' hoàn tất trước khi kết thúc.
         """
         try:
+            # Đảm bảo đợi 3 giây trước khi đăng để Facebook nhận diện link xanh và tải xong entity ranges
+            await page.wait_for_timeout(3000)
+
             # Chờ tối đa 15 giây nếu nút gửi đang bị aria-disabled="true" (do đang tải ảnh đính kèm)
             for _ in range(15):
                 is_uploading = await page.evaluate("""() => {
@@ -2842,9 +2876,10 @@ class FBAutomationEngine:
                         except Exception:
                             pass
 
-            # 6. Nhấn Enter hoặc nút gửi để gửi bình luận
+            # 6. Nhấn Enter hoặc nút gửi để gửi bình luận (đợi 3s trước khi đăng)
             if logger_callback:
-                logger_callback("INFO", "Đang gửi bình luận...")
+                logger_callback("INFO", "Đang đợi 3s rồi gửi bình luận...")
+            await asyncio.sleep(3)
 
             await page.keyboard.press("Enter")
             await asyncio.sleep(2)

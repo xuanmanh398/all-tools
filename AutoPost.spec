@@ -58,6 +58,12 @@ hiddenimports = [
 ]
 
 excludes = [
+    'PyQt5',
+    'PyQt5.QtCore',
+    'PyQt5.QtGui',
+    'PyQt5.QtWidgets',
+    'PyQt6',
+    'PySide2',
     'numpy',
     'numpy.libs',
     'scipy',
