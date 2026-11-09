@@ -1719,34 +1719,27 @@ class FBAutomationEngine:
                             const dlg = document.querySelector("div[role='dialog']");
                             if (!dlg) return { ready: false };
 
-                            const allBtns = Array.from(dlg.querySelectorAll("div[role='button'], div[aria-label], div[tabindex='0']"));
-                            let postBtn = null;
-                            for (const b of allBtns) {
-                                const a = (b.getAttribute('aria-label') || '').trim().toLowerCase();
-                                const t = (b.innerText || b.textContent || '').trim().toLowerCase();
-                                if (a === 'đăng' || a === 'post' || t === 'đăng' || t === 'post') {
-                                    postBtn = b;
-                                    break;
-                                }
-                            }
-                            if (!postBtn) {
-                                const buttons = dlg.querySelectorAll("div[role='button'][tabindex='0']");
-                                if (buttons.length > 0) postBtn = buttons[buttons.length - 1];
-                            }
+                            const all = Array.from(dlg.querySelectorAll("span, div, button"));
+                            const target = all.find(el => {
+                                const t = (el.innerText || el.textContent || '').trim().toLowerCase();
+                                return (t === 'đăng' || t === 'post') && el.children.length === 0;
+                            });
+
+                            const btn = target ? (target.closest("div[class*='x']") || target.parentElement || target) : null;
+                            const isDis = btn ? (btn.getAttribute('aria-disabled') === 'true') : true;
 
                             const text = (dlg.innerText || dlg.textContent || '').toLowerCase();
                             const isStillUploading = (text.includes('đang tải lên') || text.includes('uploading')) && !text.includes('chỉnh sửa');
-                            const isDis = postBtn ? (postBtn.getAttribute('aria-disabled') === 'true') : true;
 
                             return {
-                                ready: Boolean(postBtn && !isDis && !isStillUploading),
-                                postBtnFound: Boolean(postBtn)
+                                ready: Boolean(btn && !isDis && !isStillUploading),
+                                found: Boolean(btn)
                             };
                         }""")
                     except Exception:
                         status = {"ready": False}
 
-                    # Nếu nút Đăng đã sẵn sàng (và tối thiểu 4s để ổn định DOM)
+                    # Nếu nút Đăng đã sẵn sàng
                     if status.get("ready") and sec >= (4 if has_video else 2):
                         if logger_callback:
                             logger_callback("INFO", f"Tải {media_type_label} lên Facebook thành công (sau {sec}s). Bắt đầu bấm Đăng!")
@@ -1759,26 +1752,36 @@ class FBAutomationEngine:
             # Nhấn nút "Đăng" / "Post"
             post_clicked = False
             for attempt in range(8):
+                # Cách 1: Dùng Playwright get_by_text tìm chính xác nút Đăng ở cuối dialog
+                try:
+                    for text_label in ["Đăng", "Post"]:
+                        loc = page.locator("div[role='dialog']").get_by_text(text_label, exact=True).last
+                        if await loc.count() > 0 and await loc.is_visible():
+                            await loc.click(timeout=2500)
+                            post_clicked = True
+                            break
+                except Exception:
+                    post_clicked = False
+
+                if post_clicked:
+                    break
+
+                # Cách 2: Kích hoạt click bằng JavaScript DOM trực tiếp
                 try:
                     post_clicked = await page.evaluate("""() => {
                         const dlg = document.querySelector("div[role='dialog']");
                         if (!dlg) return false;
-                        const allBtns = Array.from(dlg.querySelectorAll("div[role='button'], div[aria-label], div[tabindex='0']"));
-                        for (const b of allBtns) {
-                            const a = (b.getAttribute('aria-label') || '').trim().toLowerCase();
-                            const t = (b.innerText || b.textContent || '').trim().toLowerCase();
-                            if (a === 'đăng' || a === 'post' || t === 'đăng' || t === 'post') {
-                                if (b.getAttribute('aria-disabled') !== 'true') {
-                                    b.click();
-                                    return true;
-                                }
-                            }
-                        }
-                        const buttons = dlg.querySelectorAll("div[role='button'][tabindex='0']");
-                        if (buttons.length > 0) {
-                            const lastBtn = buttons[buttons.length - 1];
-                            if (lastBtn.getAttribute('aria-disabled') !== 'true') {
-                                lastBtn.click();
+                        const all = Array.from(dlg.querySelectorAll("span, div, button"));
+                        const target = all.find(el => {
+                            const t = (el.innerText || el.textContent || '').trim().toLowerCase();
+                            return (t === 'đăng' || t === 'post') && el.children.length === 0;
+                        });
+                        if (target) {
+                            const btn = target.closest("div[class*='x']") || target.parentElement || target;
+                            if (btn.getAttribute('aria-disabled') !== 'true') {
+                                btn.click();
+                                target.click();
+                                if (btn.parentElement) btn.parentElement.click();
                                 return true;
                             }
                         }
@@ -1786,27 +1789,6 @@ class FBAutomationEngine:
                     }""")
                 except Exception:
                     post_clicked = False
-
-                if post_clicked:
-                    break
-
-                post_btn_selectors = [
-                    "div[role='dialog'] div[aria-label='Đăng']:not([aria-disabled='true'])",
-                    "div[role='dialog'] div[role='button']:has-text('Đăng'):not([aria-disabled='true'])",
-                    "div[role='dialog'] div[aria-label='Post']:not([aria-disabled='true'])",
-                    "div[role='dialog'] div[role='button']:has-text('Post'):not([aria-disabled='true'])",
-                    "div[role='dialog'] div[aria-label='Đăng']",
-                    "div[role='dialog'] div[role='button']:has-text('Đăng')"
-                ]
-                for sel in post_btn_selectors:
-                    try:
-                        btn = await page.query_selector(sel)
-                        if btn and await btn.is_visible():
-                            await btn.click(timeout=2000)
-                            post_clicked = True
-                            break
-                    except Exception:
-                        continue
 
                 if post_clicked:
                     break
