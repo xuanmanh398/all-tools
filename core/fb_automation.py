@@ -1707,40 +1707,25 @@ class FBAutomationEngine:
                 except Exception:
                     pass
 
-            # Chờ video tải lên hoàn tất và nút Đăng sẵn sàng
+            # Chờ video tải lên hoàn tất (nếu có video/ảnh)
             if media_attached:
-                wait_timeout = 240 if has_video else 35
                 if logger_callback:
-                    logger_callback("INFO", f"Đang chờ Facebook tải lên và xử lý {media_type_label} hoàn tất...")
+                    logger_callback("INFO", f"Đang chờ Facebook tải lên {media_type_label}...")
 
-                for sec in range(0, wait_timeout, 2):
+                for sec in range(0, 90, 2):
                     try:
-                        status = await page.evaluate("""() => {
+                        # Kiểm tra xem Facebook còn hiện chữ "Đang tải lên" hay không
+                        is_uploading = await page.evaluate("""() => {
                             const dlg = document.querySelector("div[role='dialog']");
-                            if (!dlg) return { ready: false };
-
-                            const all = Array.from(dlg.querySelectorAll("span, div, button"));
-                            const target = all.find(el => {
-                                const t = (el.innerText || el.textContent || '').trim().toLowerCase();
-                                return (t === 'đăng' || t === 'post') && el.children.length === 0;
-                            });
-
-                            const btn = target ? (target.closest("div[class*='x']") || target.parentElement || target) : null;
-                            const isDis = btn ? (btn.getAttribute('aria-disabled') === 'true') : true;
-
-                            const text = (dlg.innerText || dlg.textContent || '').toLowerCase();
-                            const isStillUploading = (text.includes('đang tải lên') || text.includes('uploading')) && !text.includes('chỉnh sửa');
-
-                            return {
-                                ready: Boolean(btn && !isDis && !isStillUploading),
-                                found: Boolean(btn)
-                            };
+                            if (!dlg) return false;
+                            const txt = (dlg.textContent || dlg.innerText || '').toLowerCase();
+                            return txt.includes('đang tải lên') || txt.includes('uploading');
                         }""")
                     except Exception:
-                        status = {"ready": False}
+                        is_uploading = False
 
-                    # Nếu nút Đăng đã sẵn sàng
-                    if status.get("ready") and sec >= (4 if has_video else 2):
+                    # Nếu không còn uploading và đã qua tối thiểu 4s để video ổn định
+                    if not is_uploading and sec >= (6 if has_video else 2):
                         if logger_callback:
                             logger_callback("INFO", f"Tải {media_type_label} lên Facebook thành công (sau {sec}s). Bắt đầu bấm Đăng!")
                         break
@@ -1752,12 +1737,12 @@ class FBAutomationEngine:
             # Nhấn nút "Đăng" / "Post"
             post_clicked = False
             for attempt in range(8):
-                # Cách 1: Dùng Playwright get_by_text tìm chính xác nút Đăng ở cuối dialog
+                # Cách 1: Playwright locator get_by_text tìm phần tử có chữ "Đăng" / "Post"
                 try:
                     for text_label in ["Đăng", "Post"]:
                         loc = page.locator("div[role='dialog']").get_by_text(text_label, exact=True).last
                         if await loc.count() > 0 and await loc.is_visible():
-                            await loc.click(timeout=2500)
+                            await loc.click(force=True, timeout=2500)
                             post_clicked = True
                             break
                 except Exception:
@@ -1771,19 +1756,19 @@ class FBAutomationEngine:
                     post_clicked = await page.evaluate("""() => {
                         const dlg = document.querySelector("div[role='dialog']");
                         if (!dlg) return false;
-                        const all = Array.from(dlg.querySelectorAll("span, div, button"));
-                        const target = all.find(el => {
+                        const all = Array.from(dlg.querySelectorAll("*"));
+                        const targets = all.filter(el => {
                             const t = (el.innerText || el.textContent || '').trim().toLowerCase();
-                            return (t === 'đăng' || t === 'post') && el.children.length === 0;
+                            return t === 'đăng' || t === 'post';
                         });
-                        if (target) {
-                            const btn = target.closest("div[class*='x']") || target.parentElement || target;
-                            if (btn.getAttribute('aria-disabled') !== 'true') {
+                        for (const target of targets.reverse()) {
+                            try {
+                                const btn = target.closest("div[class*='x']") || target.parentElement || target;
                                 btn.click();
                                 target.click();
                                 if (btn.parentElement) btn.parentElement.click();
                                 return true;
-                            }
+                            } catch (e) {}
                         }
                         return false;
                     }""")
@@ -1792,6 +1777,21 @@ class FBAutomationEngine:
 
                 if post_clicked:
                     break
+
+                # Cách 3: Click chuột chính xác vào tọa độ tâm nút Đăng ở đáy hộp thoại (Bounding Box)
+                try:
+                    dlg_elem = await page.query_selector("div[role='dialog']")
+                    if dlg_elem:
+                        box = await dlg_elem.bounding_box()
+                        if box:
+                            click_x = box['x'] + box['width'] / 2
+                            click_y = box['y'] + box['height'] - 30
+                            await page.mouse.click(click_x, click_y)
+                            post_clicked = True
+                            break
+                except Exception:
+                    pass
+
                 await asyncio.sleep(1)
 
             if not post_clicked:
