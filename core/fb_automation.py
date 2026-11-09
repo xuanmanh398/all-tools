@@ -1541,7 +1541,7 @@ class FBAutomationEngine:
                     logger_callback("ERROR", "Không thể mở khung soạn thảo bài viết!")
                 return False
 
-            # Xử lý đính kèm Video / Hình ảnh trước (hoặc sau) để tránh Link Preview ghi đè media
+            # Xử lý đính kèm Video / Hình ảnh trước (để tránh Link Preview chiếm quyền hiển thị media)
             valid_files = [f for f in (final_media or []) if os.path.exists(f)]
             has_video = any(os.path.splitext(f)[1].lower() in ['.mp4', '.mov', '.avi', '.mkv', '.webm'] for f in valid_files)
             media_attached = False
@@ -1551,39 +1551,89 @@ class FBAutomationEngine:
                 if logger_callback:
                     logger_callback("INFO", f"Đang đính kèm {len(valid_files)} tệp {media_type_label} vào bài đăng...")
 
-                # Bước 1: Tìm hoặc kích hoạt khung đính kèm Ảnh/Video trong Modal
-                file_input = await page.query_selector("div[role='dialog'] input[type='file'], input[type='file']")
+                # Bước 1: Kiểm tra xem ô input file đã có sẵn trong Modal hay chưa
+                file_input = await page.query_selector("div[role='dialog'] input[type='file']")
                 if not file_input:
-                    photo_btn_selectors = [
-                        "div[role='dialog'] div[aria-label='Ảnh/video']",
-                        "div[role='dialog'] div[aria-label='Photo/video']",
-                        "div[role='dialog'] div[aria-label*='Ảnh/video']",
-                        "div[role='dialog'] div[aria-label*='Photo/video']",
-                        "div[role='dialog'] div[aria-label*='Ảnh']",
-                        "div[role='dialog'] div[aria-label*='Photo']",
-                        "div[role='dialog'] div[aria-label*='Thêm ảnh']",
-                        "div[role='dialog'] div[aria-label*='Add photo']",
-                        "div[role='dialog'] img[src*='photo'], div[role='dialog'] img[src*='video']"
+                    # Tìm nút "Ảnh/video" trong Modal để kích hoạt khu vực tải lên
+                    photo_btn = None
+                    photo_selectors = [
+                        "div[role='dialog'] div[aria-label*='Ảnh/video' i]",
+                        "div[role='dialog'] div[aria-label*='Photo/video' i]",
+                        "div[role='dialog'] div[aria-label*='Ảnh' i]",
+                        "div[role='dialog'] div[aria-label*='Photo' i]",
+                        "div[role='dialog'] div[aria-label*='Video' i]",
+                        "div[role='dialog'] div[aria-label*='Thêm ảnh' i]",
+                        "div[role='dialog'] div[aria-label*='Add photo' i]"
                     ]
-                    for p_sel in photo_btn_selectors:
+                    for p_sel in photo_selectors:
                         try:
                             p_btn = await page.query_selector(p_sel)
                             if p_btn and await p_btn.is_visible():
-                                await p_btn.click()
-                                await asyncio.sleep(1.5)
+                                photo_btn = p_btn
                                 break
                         except Exception:
                             continue
-                    file_input = await page.query_selector("div[role='dialog'] input[type='file'], input[type='file']")
 
-                # Bước 2: Nạp tệp qua input[type='file']
-                if file_input:
+                    if not photo_btn:
+                        # Tìm nút Ảnh/Video cạnh dòng chữ "Thêm vào bài viết của bạn"
+                        photo_btn_handle = await page.evaluate_handle("""() => {
+                            const dlg = document.querySelector("div[role='dialog']");
+                            if (!dlg) return null;
+                            const buttons = Array.from(dlg.querySelectorAll("div[role='button'], div[aria-label]"));
+                            for (const b of buttons) {
+                                const label = (b.getAttribute('aria-label') || '').toLowerCase();
+                                if (label.includes('ảnh') || label.includes('photo') || label.includes('video')) {
+                                    return b;
+                                }
+                            }
+                            const allElements = Array.from(dlg.querySelectorAll("span, div"));
+                            const section = allElements.find(s => {
+                                const t = (s.innerText || '').toLowerCase();
+                                return t.includes('thêm vào bài viết') || t.includes('add to your post');
+                            });
+                            if (section) {
+                                const parent = section.closest("div") || section.parentElement;
+                                if (parent) {
+                                    const iconBtns = parent.querySelectorAll("div[role='button']");
+                                    if (iconBtns.length > 0) return iconBtns[0];
+                                }
+                            }
+                            return null;
+                        }""")
+                        if photo_btn_handle:
+                            photo_btn = photo_btn_handle.as_element()
+
+                    if photo_btn:
+                        try:
+                            # Nếu click làm mở FileChooser hệ thống
+                            try:
+                                async with page.expect_file_chooser(timeout=2000) as fc_info:
+                                    await photo_btn.click()
+                                fc = await fc_info.value
+                                await fc.set_files(valid_files)
+                                media_attached = True
+                                if logger_callback:
+                                    logger_callback("INFO", f"Đã nạp {len(valid_files)} tệp {media_type_label} qua file chooser.")
+                            except Exception:
+                                pass
+                        except Exception as pe:
+                            if logger_callback:
+                                logger_callback("WARNING", f"Lỗi click nút Ảnh/video: {pe}")
+
+                    await asyncio.sleep(2)
+
+                # Bước 2: Nạp tệp qua input[type='file'] trong dialog
+                if not media_attached:
                     try:
-                        await file_input.set_input_files(valid_files)
-                        media_attached = True
-                        if logger_callback:
-                            logger_callback("INFO", f"Đã nạp {len(valid_files)} tệp {media_type_label} vào khung đăng bài Facebook.")
-                        await asyncio.sleep(3)
+                        file_input = await page.query_selector("div[role='dialog'] input[type='file']")
+                        if not file_input:
+                            file_input = await page.wait_for_selector("div[role='dialog'] input[type='file']", timeout=5000)
+                        if file_input:
+                            await file_input.set_input_files(valid_files)
+                            media_attached = True
+                            if logger_callback:
+                                logger_callback("INFO", f"Đã nạp {len(valid_files)} tệp {media_type_label} vào khung đăng bài Facebook.")
+                            await asyncio.sleep(3)
                     except Exception as fe:
                         if logger_callback:
                             logger_callback("WARNING", f"Lỗi khi nạp file vào input: {fe}")
@@ -1634,19 +1684,26 @@ class FBAutomationEngine:
                     await page.keyboard.write(char)
                     await asyncio.sleep(anti_spam.get_typing_delay())
 
-            await asyncio.sleep(2)
+            await asyncio.sleep(2.5)
 
-            # Nếu văn bản có link làm hiện card Link Preview mà ta đang có Video/Ảnh, bấm nút gỡ card preview nếu có
+            # Nếu văn bản có link làm hiện card Link Preview mà ta đang có Video/Ảnh, tự động gỡ card preview
             if media_attached:
                 try:
-                    remove_card_btn = await page.query_selector(
-                        "div[role='dialog'] div[aria-label='Gỡ'], "
-                        "div[role='dialog'] div[aria-label='Xóa'], "
-                        "div[role='dialog'] div[aria-label='Remove']"
-                    )
-                    if remove_card_btn and await remove_card_btn.is_visible():
-                        await remove_card_btn.click()
-                        await asyncio.sleep(1)
+                    await page.evaluate("""() => {
+                        const dlg = document.querySelector("div[role='dialog']");
+                        if (!dlg) return;
+                        const buttons = Array.from(dlg.querySelectorAll("div[role='button']"));
+                        for (const b of buttons) {
+                            const a = (b.getAttribute('aria-label') || '').toLowerCase();
+                            if (a.includes('gỡ bản xem trước') || a.includes('remove preview') ||
+                                a.includes('xóa bản xem trước') || a.includes('gỡ') || a.includes('xóa')) {
+                                if (b.parentElement !== dlg) {
+                                    b.click();
+                                }
+                            }
+                        }
+                    }""")
+                    await asyncio.sleep(1)
                 except Exception:
                     pass
 
@@ -1657,28 +1714,30 @@ class FBAutomationEngine:
                     logger_callback("INFO", f"Đang chờ Facebook tải lên và xử lý {media_type_label} hoàn tất...")
 
                 for sec in range(0, wait_timeout, 3):
-                    # Kiểm tra xem có thanh tiến trình upload video hoặc nút Đăng bị disabled không
-                    is_uploading = await page.evaluate("""() => {
-                        const dlg = document.querySelector("div[role='dialog']");
-                        if (!dlg) return false;
-                        const text = (dlg.innerText || dlg.textContent || '').toLowerCase();
-                        if (text.includes('đang tải lên') || text.includes('uploading') ||
-                            text.includes('đang xử lý') || text.includes('processing') ||
-                            text.includes('chuẩn bị') || text.includes('preparing')) {
-                            return true;
-                        }
-                        const progress = dlg.querySelector('[role="progressbar"], div[aria-valuenow]');
-                        if (progress) return true;
-                        const postBtn = dlg.querySelector(
-                            "div[aria-label='Đăng'][aria-disabled='true'], " +
-                            "div[aria-label='Post'][aria-disabled='true'], " +
-                            "div[role='button']:has-text('Đăng')[aria-disabled='true']"
-                        );
-                        return Boolean(postBtn);
-                    }""")
+                    try:
+                        status = await page.evaluate("""() => {
+                            const dlg = document.querySelector("div[role='dialog']");
+                            if (!dlg) return { uploading: false, ready: false };
+                            const text = (dlg.innerText || dlg.textContent || '').toLowerCase();
+                            const isUp = text.includes('đang tải lên') || text.includes('uploading') ||
+                                         text.includes('đang xử lý') || text.includes('processing') ||
+                                         text.includes('chuẩn bị') || text.includes('preparing') ||
+                                         Boolean(dlg.querySelector('[role="progressbar"], div[aria-valuenow]'));
+                            
+                            const buttons = Array.from(dlg.querySelectorAll("div[role='button']"));
+                            const postBtn = buttons.find(b => {
+                                const t = (b.innerText || b.textContent || '').trim().toLowerCase();
+                                const a = (b.getAttribute('aria-label') || '').toLowerCase();
+                                return t === 'đăng' || t === 'post' || a === 'đăng' || a === 'post';
+                            });
+                            const isDis = postBtn ? (postBtn.getAttribute('aria-disabled') === 'true') : true;
+                            return { uploading: isUp, ready: Boolean(postBtn && !isDis) };
+                        }""")
+                    except Exception:
+                        status = {"uploading": False, "ready": True}
 
                     # Với video 45MB, cần tối thiểu 6s và chờ đến khi hết trạng thái uploading
-                    if not is_uploading and sec >= (8 if has_video else 2):
+                    if not status.get("uploading") and status.get("ready") and sec >= (6 if has_video else 2):
                         if logger_callback:
                             logger_callback("INFO", f"Đã tải {media_type_label} lên Facebook hoàn tất sau {sec}s!")
                         break
@@ -1688,63 +1747,67 @@ class FBAutomationEngine:
                     await asyncio.sleep(3)
 
             # Nhấn nút "Đăng" / "Post" (chờ đến khi nút sẵn sàng, không bị disabled)
-            post_btn_selectors = [
-                "div[role='dialog'] div[aria-label='Đăng']:not([aria-disabled='true'])",
-                "div[role='dialog'] div[role='button']:has-text('Đăng'):not([aria-disabled='true'])",
-                "div[role='dialog'] div[aria-label='Post']:not([aria-disabled='true'])",
-                "div[role='dialog'] div[role='button']:has-text('Post'):not([aria-disabled='true'])",
-                "div[role='dialog'] div[aria-label='Đăng']",
-                "div[role='dialog'] div[role='button']:has-text('Đăng')"
-            ]
+            post_clicked = False
+            for attempt in range(8):
+                try:
+                    post_clicked = await page.evaluate("""() => {
+                        const dlg = document.querySelector("div[role='dialog']");
+                        if (!dlg) return false;
+                        const buttons = Array.from(dlg.querySelectorAll("div[role='button']"));
+                        const postBtn = buttons.find(b => {
+                            const t = (b.innerText || b.textContent || '').trim().toLowerCase();
+                            const a = (b.getAttribute('aria-label') || '').toLowerCase();
+                            return (t === 'đăng' || t === 'post' || a === 'đăng' || a === 'post') &&
+                                   b.getAttribute('aria-disabled') !== 'true';
+                        });
+                        if (postBtn) {
+                            postBtn.click();
+                            return true;
+                        }
+                        return false;
+                    }""")
+                except Exception:
+                    post_clicked = False
 
-            post_btn = None
-            for _ in range(10):
+                if post_clicked:
+                    break
+
+                post_btn_selectors = [
+                    "div[role='dialog'] div[aria-label='Đăng']:not([aria-disabled='true'])",
+                    "div[role='dialog'] div[role='button']:has-text('Đăng'):not([aria-disabled='true'])",
+                    "div[role='dialog'] div[aria-label='Post']:not([aria-disabled='true'])",
+                    "div[role='dialog'] div[role='button']:has-text('Post'):not([aria-disabled='true'])"
+                ]
                 for sel in post_btn_selectors:
                     try:
                         btn = await page.query_selector(sel)
                         if btn and await btn.is_visible():
-                            is_dis = await page.evaluate("(el) => el.getAttribute('aria-disabled') === 'true'", btn)
-                            if not is_dis:
-                                post_btn = btn
-                                break
+                            await btn.click(timeout=2000)
+                            post_clicked = True
+                            break
                     except Exception:
                         continue
-                if post_btn:
+
+                if post_clicked:
                     break
                 await asyncio.sleep(1.5)
 
-            if not post_btn:
-                # Thử tìm selector button Đăng cuối Modal
-                post_btn = await page.query_selector("div[role='dialog'] div[role='button'][tabindex='0']:not([aria-disabled='true'])")
-
-            if not post_btn:
+            if not post_clicked:
                 if logger_callback:
                     logger_callback("ERROR", "Không tìm thấy nút 'Đăng' sẵn sàng!")
                 return False
-
-            try:
-                await post_btn.click(force=True)
-            except Exception:
-                pass
-
-            await page.evaluate("""(el) => {
-                if (el) {
-                    el.click();
-                    if (el.parentElement) el.parentElement.click();
-                }
-            }""", post_btn)
 
             if logger_callback:
                 logger_callback("INFO", "Đã nhấn nút Đăng. Đang chờ Facebook xử lý và đóng hộp thoại...")
 
             # Chờ hộp thoại soạn thảo đóng hoàn toàn (xác nhận bài viết đã được đăng lên Facebook)
             posted_success = False
-            for _ in range(25):
+            for _ in range(35):
                 await asyncio.sleep(1)
-                dialog_still_open = await page.evaluate("""() => {
-                    const dlg = document.querySelector("div[role='dialog']");
-                    return Boolean(dlg);
-                }""")
+                try:
+                    dialog_still_open = await page.evaluate("""() => Boolean(document.querySelector("div[role='dialog']"))""")
+                except Exception:
+                    dialog_still_open = False
                 if not dialog_still_open:
                     posted_success = True
                     break
