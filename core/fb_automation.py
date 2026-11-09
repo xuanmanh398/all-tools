@@ -1337,6 +1337,14 @@ class FBAutomationEngine:
             if logger_callback:
                 logger_callback("INFO", f"Đang điều hướng đến nhóm: {group_url}")
 
+            # Đảm bảo không còn dialog cũ sót lại trước khi vào nhóm mới
+            try:
+                if await page.query_selector("div[role='dialog']"):
+                    await page.keyboard.press("Escape")
+                    await asyncio.sleep(1)
+            except Exception:
+                pass
+
             await page.goto(group_url, wait_until="domcontentloaded", timeout=40000)
             await asyncio.sleep(3.5)
 
@@ -1554,7 +1562,6 @@ class FBAutomationEngine:
                 # Bước 1: Kiểm tra xem ô input file đã có sẵn trong Modal hay chưa
                 file_input = await page.query_selector("div[role='dialog'] input[type='file']")
                 if not file_input:
-                    # Tìm nút "Ảnh/video" trong Modal để kích hoạt khu vực tải lên
                     photo_btn = None
                     photo_selectors = [
                         "div[role='dialog'] div[aria-label*='Ảnh/video' i]",
@@ -1562,6 +1569,8 @@ class FBAutomationEngine:
                         "div[role='dialog'] div[aria-label*='Ảnh' i]",
                         "div[role='dialog'] div[aria-label*='Photo' i]",
                         "div[role='dialog'] div[aria-label*='Video' i]",
+                        "div[role='dialog'] span:has-text('Ảnh/video')",
+                        "div[role='dialog'] div:has-text('Ảnh/video')",
                         "div[role='dialog'] div[aria-label*='Thêm ảnh' i]",
                         "div[role='dialog'] div[aria-label*='Add photo' i]"
                     ]
@@ -1575,27 +1584,26 @@ class FBAutomationEngine:
                             continue
 
                     if not photo_btn:
-                        # Tìm nút Ảnh/Video cạnh dòng chữ "Thêm vào bài viết của bạn"
+                        # Tìm icon đầu tiên trong thanh "Thêm vào bài viết của bạn"
                         photo_btn_handle = await page.evaluate_handle("""() => {
                             const dlg = document.querySelector("div[role='dialog']");
                             if (!dlg) return null;
-                            const buttons = Array.from(dlg.querySelectorAll("div[role='button'], div[aria-label]"));
-                            for (const b of buttons) {
-                                const label = (b.getAttribute('aria-label') || '').toLowerCase();
-                                if (label.includes('ảnh') || label.includes('photo') || label.includes('video')) {
-                                    return b;
-                                }
-                            }
-                            const allElements = Array.from(dlg.querySelectorAll("span, div"));
-                            const section = allElements.find(s => {
-                                const t = (s.innerText || '').toLowerCase();
+                            const spans = Array.from(dlg.querySelectorAll("span, div"));
+                            const section = spans.find(s => {
+                                const t = (s.innerText || s.textContent || '').toLowerCase();
                                 return t.includes('thêm vào bài viết') || t.includes('add to your post');
                             });
                             if (section) {
-                                const parent = section.closest("div") || section.parentElement;
-                                if (parent) {
-                                    const iconBtns = parent.querySelectorAll("div[role='button']");
-                                    if (iconBtns.length > 0) return iconBtns[0];
+                                let bar = section.closest("div[class*='x']") || section.parentElement;
+                                for (let i = 0; i < 4; i++) {
+                                    if (!bar) break;
+                                    const icons = bar.querySelectorAll("svg, img, i, [role='button']");
+                                    for (const el of icons) {
+                                        if (el.contains(section) || el === section) continue;
+                                        const btn = el.closest("div[class*='x']") || el.parentElement || el;
+                                        return btn;
+                                    }
+                                    bar = bar.parentElement;
                                 }
                             }
                             return null;
@@ -1605,38 +1613,51 @@ class FBAutomationEngine:
 
                     if photo_btn:
                         try:
-                            # Nếu click làm mở FileChooser hệ thống
-                            try:
-                                async with page.expect_file_chooser(timeout=2000) as fc_info:
-                                    await photo_btn.click()
-                                fc = await fc_info.value
-                                await fc.set_files(valid_files)
-                                media_attached = True
-                                if logger_callback:
-                                    logger_callback("INFO", f"Đã nạp {len(valid_files)} tệp {media_type_label} qua file chooser.")
-                            except Exception:
-                                pass
-                        except Exception as pe:
-                            if logger_callback:
-                                logger_callback("WARNING", f"Lỗi click nút Ảnh/video: {pe}")
+                            await photo_btn.click()
+                        except Exception:
+                            pass
+                        await asyncio.sleep(1.5)
 
-                    await asyncio.sleep(2)
-
-                # Bước 2: Nạp tệp qua input[type='file'] trong dialog
-                if not media_attached:
-                    try:
-                        file_input = await page.query_selector("div[role='dialog'] input[type='file']")
-                        if not file_input:
-                            file_input = await page.wait_for_selector("div[role='dialog'] input[type='file']", timeout=5000)
-                        if file_input:
+                # Bước 2: Nạp tệp qua input[type='file'] trong dialog (chờ tối đa 8s để dropzone xuất hiện)
+                for _ in range(8):
+                    file_input = await page.query_selector("div[role='dialog'] input[type='file']")
+                    if file_input:
+                        try:
                             await file_input.set_input_files(valid_files)
                             media_attached = True
                             if logger_callback:
                                 logger_callback("INFO", f"Đã nạp {len(valid_files)} tệp {media_type_label} vào khung đăng bài Facebook.")
-                            await asyncio.sleep(3)
-                    except Exception as fe:
-                        if logger_callback:
-                            logger_callback("WARNING", f"Lỗi khi nạp file vào input: {fe}")
+                            break
+                        except Exception as fe:
+                            if logger_callback:
+                                logger_callback("WARNING", f"Lỗi khi nạp file vào input: {fe}")
+                    await asyncio.sleep(1)
+
+                # Bước 2b: Nếu vẫn chưa được, thử click trực tiếp vào vùng dropzone "Thêm ảnh/video"
+                if not media_attached:
+                    try:
+                        dropzone = await page.query_selector(
+                            "div[role='dialog'] div:has-text('Thêm ảnh/video'), "
+                            "div[role='dialog'] div:has-text('Thêm ảnh'), "
+                            "div[role='dialog'] div:has-text('Add photos/videos'), "
+                            "div[role='dialog'] div:has-text('Add photo')"
+                        )
+                        if dropzone and await dropzone.is_visible():
+                            try:
+                                async with page.expect_file_chooser(timeout=3000) as fc_info:
+                                    await dropzone.click()
+                                fc = await fc_info.value
+                                await fc.set_files(valid_files)
+                                media_attached = True
+                            except Exception:
+                                await dropzone.click()
+                                await asyncio.sleep(1.5)
+                                file_input = await page.query_selector("div[role='dialog'] input[type='file']")
+                                if file_input:
+                                    await file_input.set_input_files(valid_files)
+                                    media_attached = True
+                    except Exception:
+                        pass
 
                 # Bước 3: Nếu là ảnh và chưa nạp được bằng input, thử paste base64
                 if not media_attached and not has_video:
@@ -1666,7 +1687,21 @@ class FBAutomationEngine:
                             except Exception:
                                 pass
 
-            # Focus và nhấp vào ô nhập văn bản
+                # BẢO VỆ CHẮC CHẮN: Nếu bài đăng có video/ảnh mà không đính kèm được vào nhóm này, hủy đăng bài này
+                if valid_files and not media_attached:
+                    if logger_callback:
+                        logger_callback("WARNING", f"Không thể đính kèm {media_type_label} vào nhóm này. Bỏ qua nhóm này để tránh đăng bài thiếu video!")
+                    try:
+                        close_btn = await page.query_selector("div[role='dialog'] div[aria-label='Đóng'], div[role='dialog'] div[aria-label='Close']")
+                        if close_btn:
+                            await close_btn.click()
+                        else:
+                            await page.keyboard.press("Escape")
+                    except Exception:
+                        pass
+                    return False
+
+                        # Focus và nhấp vào ô nhập văn bản
             try:
                 editor_target = await page.query_selector("div[role='dialog'] div[role='textbox'], div[role='dialog'] div[contenteditable='true']") or editor_elem
                 if editor_target:
