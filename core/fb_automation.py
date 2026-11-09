@@ -1707,62 +1707,80 @@ class FBAutomationEngine:
                 except Exception:
                     pass
 
-            # QUAN TRỌNG: Nếu có Video hoặc nhiều Ảnh, chờ Facebook tải lên hoàn tất trước khi bấm Đăng
+            # Chờ video tải lên hoàn tất và nút Đăng sẵn sàng
             if media_attached:
                 wait_timeout = 240 if has_video else 35
                 if logger_callback:
                     logger_callback("INFO", f"Đang chờ Facebook tải lên và xử lý {media_type_label} hoàn tất...")
 
-                for sec in range(0, wait_timeout, 3):
+                for sec in range(0, wait_timeout, 2):
                     try:
                         status = await page.evaluate("""() => {
                             const dlg = document.querySelector("div[role='dialog']");
-                            if (!dlg) return { uploading: false, ready: false };
-                            const text = (dlg.innerText || dlg.textContent || '').toLowerCase();
-                            const isUp = text.includes('đang tải lên') || text.includes('uploading') ||
-                                         text.includes('đang xử lý') || text.includes('processing') ||
-                                         text.includes('chuẩn bị') || text.includes('preparing') ||
-                                         Boolean(dlg.querySelector('[role="progressbar"], div[aria-valuenow]'));
-                            
-                            const buttons = Array.from(dlg.querySelectorAll("div[role='button']"));
-                            const postBtn = buttons.find(b => {
+                            if (!dlg) return { ready: false };
+
+                            const allBtns = Array.from(dlg.querySelectorAll("div[role='button'], div[aria-label], div[tabindex='0']"));
+                            let postBtn = null;
+                            for (const b of allBtns) {
+                                const a = (b.getAttribute('aria-label') || '').trim().toLowerCase();
                                 const t = (b.innerText || b.textContent || '').trim().toLowerCase();
-                                const a = (b.getAttribute('aria-label') || '').toLowerCase();
-                                return t === 'đăng' || t === 'post' || a === 'đăng' || a === 'post';
-                            });
+                                if (a === 'đăng' || a === 'post' || t === 'đăng' || t === 'post') {
+                                    postBtn = b;
+                                    break;
+                                }
+                            }
+                            if (!postBtn) {
+                                const buttons = dlg.querySelectorAll("div[role='button'][tabindex='0']");
+                                if (buttons.length > 0) postBtn = buttons[buttons.length - 1];
+                            }
+
+                            const text = (dlg.innerText || dlg.textContent || '').toLowerCase();
+                            const isStillUploading = (text.includes('đang tải lên') || text.includes('uploading')) && !text.includes('chỉnh sửa');
                             const isDis = postBtn ? (postBtn.getAttribute('aria-disabled') === 'true') : true;
-                            return { uploading: isUp, ready: Boolean(postBtn && !isDis) };
+
+                            return {
+                                ready: Boolean(postBtn && !isDis && !isStillUploading),
+                                postBtnFound: Boolean(postBtn)
+                            };
                         }""")
                     except Exception:
-                        status = {"uploading": False, "ready": True}
+                        status = {"ready": False}
 
-                    # Với video 45MB, cần tối thiểu 6s và chờ đến khi hết trạng thái uploading
-                    if not status.get("uploading") and status.get("ready") and sec >= (6 if has_video else 2):
+                    # Nếu nút Đăng đã sẵn sàng (và tối thiểu 4s để ổn định DOM)
+                    if status.get("ready") and sec >= (4 if has_video else 2):
                         if logger_callback:
-                            logger_callback("INFO", f"Đã tải {media_type_label} lên Facebook hoàn tất sau {sec}s!")
+                            logger_callback("INFO", f"Tải {media_type_label} lên Facebook thành công (sau {sec}s). Bắt đầu bấm Đăng!")
                         break
 
-                    if logger_callback and sec > 0 and sec % 9 == 0:
+                    if logger_callback and sec > 0 and sec % 6 == 0:
                         logger_callback("INFO", f"Đang tải {media_type_label} lên Facebook ({sec}s)... Vui lòng chờ...")
-                    await asyncio.sleep(3)
+                    await asyncio.sleep(2)
 
-            # Nhấn nút "Đăng" / "Post" (chờ đến khi nút sẵn sàng, không bị disabled)
+            # Nhấn nút "Đăng" / "Post"
             post_clicked = False
             for attempt in range(8):
                 try:
                     post_clicked = await page.evaluate("""() => {
                         const dlg = document.querySelector("div[role='dialog']");
                         if (!dlg) return false;
-                        const buttons = Array.from(dlg.querySelectorAll("div[role='button']"));
-                        const postBtn = buttons.find(b => {
+                        const allBtns = Array.from(dlg.querySelectorAll("div[role='button'], div[aria-label], div[tabindex='0']"));
+                        for (const b of allBtns) {
+                            const a = (b.getAttribute('aria-label') || '').trim().toLowerCase();
                             const t = (b.innerText || b.textContent || '').trim().toLowerCase();
-                            const a = (b.getAttribute('aria-label') || '').toLowerCase();
-                            return (t === 'đăng' || t === 'post' || a === 'đăng' || a === 'post') &&
-                                   b.getAttribute('aria-disabled') !== 'true';
-                        });
-                        if (postBtn) {
-                            postBtn.click();
-                            return true;
+                            if (a === 'đăng' || a === 'post' || t === 'đăng' || t === 'post') {
+                                if (b.getAttribute('aria-disabled') !== 'true') {
+                                    b.click();
+                                    return true;
+                                }
+                            }
+                        }
+                        const buttons = dlg.querySelectorAll("div[role='button'][tabindex='0']");
+                        if (buttons.length > 0) {
+                            const lastBtn = buttons[buttons.length - 1];
+                            if (lastBtn.getAttribute('aria-disabled') !== 'true') {
+                                lastBtn.click();
+                                return true;
+                            }
                         }
                         return false;
                     }""")
@@ -1776,7 +1794,9 @@ class FBAutomationEngine:
                     "div[role='dialog'] div[aria-label='Đăng']:not([aria-disabled='true'])",
                     "div[role='dialog'] div[role='button']:has-text('Đăng'):not([aria-disabled='true'])",
                     "div[role='dialog'] div[aria-label='Post']:not([aria-disabled='true'])",
-                    "div[role='dialog'] div[role='button']:has-text('Post'):not([aria-disabled='true'])"
+                    "div[role='dialog'] div[role='button']:has-text('Post'):not([aria-disabled='true'])",
+                    "div[role='dialog'] div[aria-label='Đăng']",
+                    "div[role='dialog'] div[role='button']:has-text('Đăng')"
                 ]
                 for sel in post_btn_selectors:
                     try:
@@ -1790,7 +1810,7 @@ class FBAutomationEngine:
 
                 if post_clicked:
                     break
-                await asyncio.sleep(1.5)
+                await asyncio.sleep(1)
 
             if not post_clicked:
                 if logger_callback:
