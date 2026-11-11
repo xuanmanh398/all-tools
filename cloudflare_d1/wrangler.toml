@@ -11,3 +11,7 @@ custom_domain = true
 binding = "DB"
 database_name = "mtools-db"
 database_id = "45b0ab84-c0bc-4bcd-8895-86b68b166136"
+
+[[kv_namespaces]]
+binding = "FILES_KV"
+id = "b7afdefaaa1a47e1b8913043894fdb25"
