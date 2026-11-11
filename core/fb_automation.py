@@ -1654,9 +1654,7 @@ class FBAutomationEngine:
                         "div[role='dialog'] div[aria-label='Ảnh/Video']",
                         "div[role='dialog'] div[aria-label='Photo/Video']",
                         "div[role='dialog'] [data-visualcompletion='ignore-dynamic-aria'][aria-label='Ảnh/video']",
-                        "div[role='dialog'] [data-visualcompletion='ignore-dynamic-aria'][aria-label='Photo/video']",
-                        "div[role='dialog'] span:has-text('Ảnh/video')",
-                        "div[role='dialog'] div[role='button']:has-text('Ảnh/video')"
+                        "div[role='dialog'] [data-visualcompletion='ignore-dynamic-aria'][aria-label='Photo/video']"
                     ]
                     for p_sel in photo_selectors:
                         try:
@@ -1714,37 +1712,26 @@ class FBAutomationEngine:
                             }""", photo_btn)
                             await asyncio.sleep(1.5)
 
-                # BƯỚC 2: Nạp tệp media
-                # Cách 2a: Nếu dropzone đã hiển thị, bấm vào dropzone bằng expect_file_chooser
-                dz_elem = await page.query_selector(
-                    "div[role='dialog'] div:has-text('Thêm ảnh/video'), "
-                    "div[role='dialog'] div:has-text('Thêm ảnh'), "
-                    "div[role='dialog'] div:has-text('Add photos/videos'), "
-                    "div[role='dialog'] div:has-text('Add photo')"
-                )
-                if dz_elem and await dz_elem.is_visible():
-                    try:
-                        async with page.expect_file_chooser(timeout=3500) as fc_info:
-                            await dz_elem.click(force=True)
-                        fc = await fc_info.value
-                        await fc.set_files(valid_files)
-                        await asyncio.sleep(2)
-                    except Exception:
-                        pass
+                # BƯỚC 2: Nạp tệp trực tiếp qua thẻ input[type='file'] (KHÔNG click vùng dropzone để tránh bật Windows Explorer)
+                for _ in range(4):
+                    if await page.query_selector("div[role='dialog'] input[type='file']"):
+                        break
+                    await asyncio.sleep(0.5)
 
-                # Cách 2b: Tìm tất cả input[type='file'] trong dialog hoặc trang để nạp file
                 if not (await is_real_media_mounted()):
-                    file_inputs = await page.query_selector_all("div[role='dialog'] input[type='file'], input[type='file']")
-                    for finput in file_inputs:
+                    file_inputs = await page.query_selector_all("div[role='dialog'] input[type='file']")
+                    if not file_inputs:
+                        file_inputs = await page.query_selector_all("input[type='file']")
+                    for finput in reversed(file_inputs):
                         try:
                             await finput.set_input_files(valid_files)
-                            await asyncio.sleep(1.5)
+                            await asyncio.sleep(1.8)
                             if await is_real_media_mounted():
                                 break
                         except Exception:
                             continue
 
-                # Cách 2c: Nếu là ảnh và vẫn chưa hiển thị, dùng ClipboardEvent paste base64
+                # Cách 2b: Nếu là ảnh và vẫn chưa hiển thị, thử kéo thả / paste DataTransfer qua JavaScript (cũng không bật Explorer)
                 if not has_video and not (await is_real_media_mounted()):
                     for media_path in valid_files:
                         ext = os.path.splitext(media_path)[1].lower()
