@@ -1387,47 +1387,27 @@ class FBAutomationEngine:
             valid_files = [f for f in (final_media or []) if os.path.exists(f)]
             has_video = any(os.path.splitext(f)[1].lower() in ['.mp4', '.mov', '.avi', '.mkv', '.webm'] for f in valid_files)
 
-            composer_btn = None
-            if valid_files:
-                # Nếu có video/ảnh, ưu tiên bấm nút "Ảnh/video" ngay trên feed nhóm để mở modal có sẵn dropzone
-                feed_photo_selectors = [
-                    "div[role='main'] div[role='button']:has-text('Ảnh/video')",
-                    "div[role='main'] span:has-text('Ảnh/video')",
-                    "div[role='main'] div[aria-label='Ảnh/video']",
-                    "div[role='main'] div[aria-label='Photo/video']",
-                    "div[role='main'] div[role='button']:has-text('Photo/video')",
-                    "div[role='main'] span:has-text('Photo/video')",
-                    "div[role='button']:has-text('Ảnh/video')",
-                    "span:has-text('Ảnh/video')"
-                ]
-                for p_sel in feed_photo_selectors:
-                    try:
-                        p_el = await page.query_selector(p_sel)
-                        if p_el and await p_el.is_visible():
-                            composer_btn = p_el
-                            break
-                    except Exception:
-                        continue
+            # Tìm nút tạo bài viết ("Bạn viết gì đi...", "Bạn đang nghĩ gì?", "Write something...", v.v.)
+            # Lưu ý: Không bấm nút "Ảnh/video" ngoài feed để tránh Facebook bật hộp thoại Windows Explorer
+            composer_selectors = [
+                "div[role='button']:has-text('Bạn viết gì đi')",
+                "span:has-text('Bạn viết gì đi')",
+                "div[role='button']:has-text('Bạn đang nghĩ gì')",
+                "span:has-text('Bạn đang nghĩ gì')",
+                "div[role='button']:has-text('Write something')",
+                "span:has-text('Write something')",
+                "div[role='button']:has-text('Tạo bài viết')",
+                "span:has-text('Tạo bài viết')"
+            ]
 
-            if not composer_btn:
-                # Tìm nút tạo bài viết thông thường ("Bạn viết gì đi...", "Bạn đang nghĩ gì?", "Write something...", v.v.)
-                composer_selectors = [
-                    "div[role='button']:has-text('Bạn viết gì đi')",
-                    "span:has-text('Bạn viết gì đi')",
-                    "div[role='button']:has-text('Bạn đang nghĩ gì')",
-                    "span:has-text('Bạn đang nghĩ gì')",
-                    "div[role='button']:has-text('Write something')",
-                    "span:has-text('Write something')",
-                    "div[role='button']:has-text('Tạo bài viết')",
-                    "span:has-text('Tạo bài viết')"
-                ]
-                for sel in composer_selectors:
-                    try:
-                        composer_btn = await page.query_selector(sel)
-                        if composer_btn:
-                            break
-                    except Exception:
-                        continue
+            composer_btn = None
+            for sel in composer_selectors:
+                try:
+                    composer_btn = await page.query_selector(sel)
+                    if composer_btn:
+                        break
+                except Exception:
+                    continue
 
             # Nếu chưa tìm thấy nút tạo bài viết và có tên Fanpage, thử chuyển tương tác switcher
             if not composer_btn and post_as_page_name and post_as_page_name.strip():
@@ -1595,177 +1575,197 @@ class FBAutomationEngine:
                 if logger_callback:
                     logger_callback("INFO", f"Đang chuẩn bị đính kèm {len(valid_files)} tệp {media_type_label} vào bài đăng...")
 
-                # Hàm kiểm tra nghiêm ngặt xem media đã thực sự hiển thị trong hộp thoại chưa
-                async def is_real_media_mounted() -> bool:
+                # Chặn tuyệt đối hộp thoại Windows Explorer nếu Facebook kích hoạt file chooser bất ngờ
+                _fc_state = {"handled": False}
+                async def _intercept_file_chooser(fc):
                     try:
-                        return await page.evaluate("""() => {
-                            const dlg = document.querySelector("div[role='dialog']");
-                            if (!dlg) return false;
-
-                            // 1. Thẻ video HTML5
-                            if (dlg.querySelector("video")) return true;
-
-                            // 2. Nút gỡ media đặc thù (Gỡ ảnh / Gỡ video)
-                            const mediaRemoveBtns = dlg.querySelectorAll(
-                                "div[aria-label*='Gỡ ảnh' i], div[aria-label*='Gỡ video' i], " +
-                                "div[aria-label*='Remove photo' i], div[aria-label*='Remove video' i], " +
-                                "div[aria-label*='Xóa ảnh' i], div[aria-label*='Xóa video' i], " +
-                                "div[aria-label*='Gỡ file' i], div[aria-label*='Gỡ phương tiện' i]"
-                            );
-                            if (mediaRemoveBtns.length > 0) return true;
-
-                            // 3. Ảnh bài đăng được hiển thị (kích thước lớn >= 100x80px, loại trừ avatar và emoji)
-                            const imgs = Array.from(dlg.querySelectorAll("img"));
-                            for (const img of imgs) {
-                                if (img.closest("[aria-label*='đại diện' i], [aria-label*='profile' i]")) continue;
-                                const w = img.clientWidth || img.naturalWidth || 0;
-                                const h = img.clientHeight || img.naturalHeight || 0;
-                                if (w >= 100 && h >= 80) return true;
-                            }
-
-                            // 4. Chữ 'Chỉnh sửa tất cả' (chỉ có khi đính kèm nhiều ảnh)
-                            const txt = (dlg.innerText || dlg.textContent || '').toLowerCase();
-                            if (txt.includes('chỉnh sửa tất cả') || txt.includes('edit all')) return true;
-
-                            return false;
-                        }""")
+                        if not _fc_state["handled"]:
+                            _fc_state["handled"] = True
+                            await fc.set_files(valid_files)
                     except Exception:
-                        return False
+                        pass
 
-                # Kiểm tra xem vùng dropzone "Thêm ảnh/video" đã hiển thị chưa
-                async def is_dropzone_open() -> bool:
-                    try:
-                        dz = await page.query_selector(
-                            "div[role='dialog'] div:has-text('Thêm ảnh/video'), "
-                            "div[role='dialog'] div:has-text('Thêm ảnh'), "
-                            "div[role='dialog'] div:has-text('Add photos/videos'), "
-                            "div[role='dialog'] div:has-text('Add photo')"
-                        )
-                        return dz is not None and await dz.is_visible()
-                    except Exception:
-                        return False
-
-                # BƯỚC 1: Nếu chưa có dropzone và chưa có media, BẮT BUỘC bấm icon "Ảnh/video" ở thanh công cụ dưới
-                if not (await is_dropzone_open()) and not (await is_real_media_mounted()):
-                    photo_btn = None
-                    photo_selectors = [
-                        "div[role='dialog'] div[aria-label='Ảnh/video']",
-                        "div[role='dialog'] div[aria-label='Photo/video']",
-                        "div[role='dialog'] div[aria-label='Ảnh/Video']",
-                        "div[role='dialog'] div[aria-label='Photo/Video']",
-                        "div[role='dialog'] [data-visualcompletion='ignore-dynamic-aria'][aria-label='Ảnh/video']",
-                        "div[role='dialog'] [data-visualcompletion='ignore-dynamic-aria'][aria-label='Photo/video']"
-                    ]
-                    for p_sel in photo_selectors:
+                page.on("filechooser", _intercept_file_chooser)
+                try:
+                    # Hàm kiểm tra nghiêm ngặt xem media đã thực sự hiển thị trong hộp thoại chưa
+                    async def is_real_media_mounted() -> bool:
                         try:
-                            p_btn = await page.query_selector(p_sel)
-                            if p_btn and await p_btn.is_visible():
-                                photo_btn = p_btn
-                                break
-                        except Exception:
-                            continue
+                            return await page.evaluate("""() => {
+                                const dlg = document.querySelector("div[role='dialog']");
+                                if (!dlg) return false;
 
-                    if not photo_btn:
-                        # Tìm nút đầu tiên trong thanh "Thêm vào bài viết của bạn"
-                        photo_btn_handle = await page.evaluate_handle("""() => {
-                            const dlg = document.querySelector("div[role='dialog']");
-                            if (!dlg) return null;
-                            const allElems = Array.from(dlg.querySelectorAll("span, div, p"));
-                            const labelElem = allElems.find(el => {
-                                if (el.children.length > 0) return false;
-                                const t = (el.innerText || el.textContent || '').trim().toLowerCase();
-                                return t.includes('thêm vào bài viết') || t.includes('add to your post');
-                            });
-                            if (labelElem) {
-                                let current = labelElem.parentElement;
-                                for (let i = 0; i < 4; i++) {
-                                    if (!current || current === dlg) break;
-                                    const buttons = Array.from(current.querySelectorAll("div[role='button'], div[aria-label], div[tabindex='0']"));
-                                    const candidate = buttons.find(b => !b.contains(labelElem) && b !== labelElem);
-                                    if (candidate) return candidate;
-                                    current = current.parentElement;
+                                // 1. Thẻ video HTML5
+                                if (dlg.querySelector("video")) return true;
+
+                                // 2. Nút gỡ media đặc thù (Gỡ ảnh / Gỡ video)
+                                const mediaRemoveBtns = dlg.querySelectorAll(
+                                    "div[aria-label*='Gỡ ảnh' i], div[aria-label*='Gỡ video' i], " +
+                                    "div[aria-label*='Remove photo' i], div[aria-label*='Remove video' i], " +
+                                    "div[aria-label*='Xóa ảnh' i], div[aria-label*='Xóa video' i], " +
+                                    "div[aria-label*='Gỡ file' i], div[aria-label*='Gỡ phương tiện' i]"
+                                );
+                                if (mediaRemoveBtns.length > 0) return true;
+
+                                // 3. Ảnh bài đăng được hiển thị (kích thước lớn >= 100x80px, loại trừ avatar và emoji)
+                                const imgs = Array.from(dlg.querySelectorAll("img"));
+                                for (const img of imgs) {
+                                    if (img.closest("[aria-label*='đại diện' i], [aria-label*='profile' i]")) continue;
+                                    const w = img.clientWidth || img.naturalWidth || 0;
+                                    const h = img.clientHeight || img.naturalHeight || 0;
+                                    if (w >= 100 && h >= 80) return true;
                                 }
-                            }
-                            return null;
-                        }""")
-                        if photo_btn_handle:
-                            photo_btn = photo_btn_handle.as_element()
 
-                    if photo_btn:
-                        try:
-                            await photo_btn.click(force=True)
+                                // 4. Chữ 'Chỉnh sửa tất cả' (chỉ có khi đính kèm nhiều ảnh)
+                                const txt = (dlg.innerText || dlg.textContent || '').toLowerCase();
+                                if (txt.includes('chỉnh sửa tất cả') || txt.includes('edit all')) return true;
+
+                                return false;
+                            }""")
                         except Exception:
-                            pass
-                        # Chờ tối đa 2.5s để vùng dropzone mở ra, chỉ dùng JS click fallback nếu chưa mở
-                        dz_opened = False
-                        for _ in range(5):
-                            await asyncio.sleep(0.5)
-                            if (await is_dropzone_open()) or (await is_real_media_mounted()):
-                                dz_opened = True
-                                break
-                        if not dz_opened:
-                            await page.evaluate("""(el) => {
-                                if (el) {
-                                    const b = el.closest("div[role='button']") || el;
-                                    b.click();
-                                }
-                            }""", photo_btn)
-                            await asyncio.sleep(1.5)
+                            return False
 
-                # BƯỚC 2: Nạp tệp trực tiếp qua thẻ input[type='file'] (KHÔNG click vùng dropzone để tránh bật Windows Explorer)
-                for _ in range(4):
-                    if await page.query_selector("div[role='dialog'] input[type='file']"):
-                        break
-                    await asyncio.sleep(0.5)
-
-                if not (await is_real_media_mounted()):
-                    file_inputs = await page.query_selector_all("div[role='dialog'] input[type='file']")
-                    if not file_inputs:
-                        file_inputs = await page.query_selector_all("input[type='file']")
-                    for finput in reversed(file_inputs):
+                    # Kiểm tra xem vùng dropzone "Thêm ảnh/video" đã hiển thị chưa
+                    async def is_dropzone_open() -> bool:
                         try:
-                            await finput.set_input_files(valid_files)
-                            await asyncio.sleep(1.8)
-                            if await is_real_media_mounted():
-                                break
+                            dz = await page.query_selector(
+                                "div[role='dialog'] div:has-text('Thêm ảnh/video'), "
+                                "div[role='dialog'] div:has-text('Thêm ảnh'), "
+                                "div[role='dialog'] div:has-text('Add photos/videos'), "
+                                "div[role='dialog'] div:has-text('Add photo')"
+                            )
+                            return dz is not None and await dz.is_visible()
                         except Exception:
-                            continue
+                            return False
 
-                # Cách 2b: Nếu là ảnh và vẫn chưa hiển thị, thử kéo thả / paste DataTransfer qua JavaScript (cũng không bật Explorer)
-                if not has_video and not (await is_real_media_mounted()):
-                    for media_path in valid_files:
-                        ext = os.path.splitext(media_path)[1].lower()
-                        if ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp']:
+                    # BƯỚC 1: Nếu chưa có dropzone và chưa có media, bấm icon "Ảnh/video" ở thanh công cụ dưới
+                    if not (await is_dropzone_open()) and not (await is_real_media_mounted()):
+                        photo_btn = None
+                        photo_selectors = [
+                            "div[role='dialog'] div[aria-label='Ảnh/video']",
+                            "div[role='dialog'] div[aria-label='Photo/video']",
+                            "div[role='dialog'] div[aria-label='Ảnh/Video']",
+                            "div[role='dialog'] div[aria-label='Photo/Video']",
+                            "div[role='dialog'] [data-visualcompletion='ignore-dynamic-aria'][aria-label='Ảnh/video']",
+                            "div[role='dialog'] [data-visualcompletion='ignore-dynamic-aria'][aria-label='Photo/video']"
+                        ]
+                        for p_sel in photo_selectors:
                             try:
-                                mime, _ = mimetypes.guess_type(media_path)
-                                mime = mime or "image/png"
-                                with open(media_path, "rb") as mf:
-                                    b64_data = base64.b64encode(mf.read()).decode('utf-8')
-                                await page.evaluate("""({b64, mime, filename}) => {
-                                    const bytes = atob(b64);
-                                    const arr = new Uint8Array(bytes.length);
-                                    for (let i = 0; i < bytes.length; i++) arr[i] = bytes.charCodeAt(i);
-                                    const file = new File([arr], filename, { type: mime });
-                                    const dt = new DataTransfer();
-                                    dt.items.add(file);
-                                    const target = document.querySelector("div[role='dialog'] div[contenteditable='true']") || document.querySelector("div[contenteditable='true']");
-                                    if (target) {
-                                        target.focus();
-                                        target.dispatchEvent(new ClipboardEvent('paste', { bubbles: true, cancelable: true, clipboardData: dt }));
+                                p_btn = await page.query_selector(p_sel)
+                                if p_btn and await p_btn.is_visible():
+                                    photo_btn = p_btn
+                                    break
+                            except Exception:
+                                continue
+
+                        if not photo_btn:
+                            # Tìm nút đầu tiên trong thanh "Thêm vào bài viết của bạn"
+                            photo_btn_handle = await page.evaluate_handle("""() => {
+                                const dlg = document.querySelector("div[role='dialog']");
+                                if (!dlg) return null;
+                                const allElems = Array.from(dlg.querySelectorAll("span, div, p"));
+                                const labelElem = allElems.find(el => {
+                                    if (el.children.length > 0) return false;
+                                    const t = (el.innerText || el.textContent || '').trim().toLowerCase();
+                                    return t.includes('thêm vào bài viết') || t.includes('add to your post');
+                                });
+                                if (labelElem) {
+                                    let current = labelElem.parentElement;
+                                    for (let i = 0; i < 4; i++) {
+                                        if (!current || current === dlg) break;
+                                        const buttons = Array.from(current.querySelectorAll("div[role='button'], div[aria-label], div[tabindex='0']"));
+                                        const candidate = buttons.find(b => !b.contains(labelElem) && b !== labelElem);
+                                        if (candidate) return candidate;
+                                        current = current.parentElement;
                                     }
-                                }""", {"b64": b64_data, "mime": mime, "filename": os.path.basename(media_path)})
-                                await asyncio.sleep(2)
+                                }
+                                return null;
+                            }""")
+                            if photo_btn_handle:
+                                photo_btn = photo_btn_handle.as_element()
+
+                        if photo_btn:
+                            try:
+                                await photo_btn.click(force=True)
                             except Exception:
                                 pass
+                            dz_opened = False
+                            for _ in range(5):
+                                await asyncio.sleep(0.5)
+                                if _fc_state["handled"] or (await is_dropzone_open()) or (await is_real_media_mounted()):
+                                    dz_opened = True
+                                    break
+                            if not dz_opened:
+                                await page.evaluate("""(el) => {
+                                    if (el) {
+                                        const b = el.closest("div[role='button']") || el;
+                                        b.click();
+                                    }
+                                }""", photo_btn)
+                                await asyncio.sleep(1.5)
 
-                # BƯỚC 3: Chờ xác thực media đã thực sự xuất hiện trong hộp thoại
-                for _ in range(8):
-                    if await is_real_media_mounted():
-                        media_attached = True
-                        if logger_callback:
-                            logger_callback("INFO", f"✅ Đã xác nhận {len(valid_files)} tệp {media_type_label} hiển thị thành công trong bài đăng!")
-                        break
-                    await asyncio.sleep(1)
+                    # Nếu filechooser đã tự bắt được ở Bước 1, chờ thêm 1.5s để media hiển thị
+                    if _fc_state["handled"]:
+                        await asyncio.sleep(1.5)
+
+                    # BƯỚC 2: Nạp tệp trực tiếp qua thẻ input[type='file']
+                    if not (await is_real_media_mounted()):
+                        for _ in range(4):
+                            if await page.query_selector("div[role='dialog'] input[type='file']"):
+                                break
+                            await asyncio.sleep(0.5)
+
+                        file_inputs = await page.query_selector_all("div[role='dialog'] input[type='file']")
+                        if not file_inputs:
+                            file_inputs = await page.query_selector_all("input[type='file']")
+                        for finput in reversed(file_inputs):
+                            try:
+                                await finput.set_input_files(valid_files)
+                                await asyncio.sleep(1.8)
+                                if await is_real_media_mounted():
+                                    break
+                            except Exception:
+                                continue
+
+                    # Cách 2b: Nếu là ảnh và vẫn chưa hiển thị, thử paste DataTransfer qua JavaScript
+                    if not has_video and not (await is_real_media_mounted()):
+                        for media_path in valid_files:
+                            ext = os.path.splitext(media_path)[1].lower()
+                            if ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp']:
+                                try:
+                                    mime, _ = mimetypes.guess_type(media_path)
+                                    mime = mime or "image/png"
+                                    with open(media_path, "rb") as mf:
+                                        b64_data = base64.b64encode(mf.read()).decode('utf-8')
+                                    await page.evaluate("""({b64, mime, filename}) => {
+                                        const bytes = atob(b64);
+                                        const arr = new Uint8Array(bytes.length);
+                                        for (let i = 0; i < bytes.length; i++) arr[i] = bytes.charCodeAt(i);
+                                        const file = new File([arr], filename, { type: mime });
+                                        const dt = new DataTransfer();
+                                        dt.items.add(file);
+                                        const target = document.querySelector("div[role='dialog'] div[contenteditable='true']") || document.querySelector("div[contenteditable='true']");
+                                        if (target) {
+                                            target.focus();
+                                            target.dispatchEvent(new ClipboardEvent('paste', { bubbles: true, cancelable: true, clipboardData: dt }));
+                                        }
+                                    }""", {"b64": b64_data, "mime": mime, "filename": os.path.basename(media_path)})
+                                    await asyncio.sleep(2)
+                                except Exception:
+                                    pass
+
+                    # BƯỚC 3: Chờ xác thực media đã thực sự xuất hiện trong hộp thoại
+                    for _ in range(8):
+                        if await is_real_media_mounted():
+                            media_attached = True
+                            if logger_callback:
+                                logger_callback("INFO", f"✅ Đã xác nhận {len(valid_files)} tệp {media_type_label} hiển thị thành công trong bài đăng!")
+                            break
+                        await asyncio.sleep(1)
+                finally:
+                    try:
+                        page.remove_listener("filechooser", _intercept_file_chooser)
+                    except Exception:
+                        pass
 
                 # BẢO VỆ TUYỆT ĐỐI: Nếu không đính kèm được media, HỦY VÀ ĐÓNG HỘP THOẠI NGAY LẬP TỨC
                 if not media_attached:
