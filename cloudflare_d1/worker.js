@@ -248,6 +248,22 @@ async function handleVerifyLicense(request, env) {
         });
     }
 
+    const expiryRaw = (row.expiry_date || "").trim();
+    const isPending = currentStatus === "PENDING" || ["PENDING", "", "CHỜ KÍCH HOẠT"].includes(expiryRaw.toUpperCase());
+
+    if (isPending) {
+        return jsonResponse({
+            valid: false,
+            status: "PENDING",
+            license_key: row.license_key,
+            machine_id: machineId,
+            expiry_raw: expiryRaw,
+            expiry_display: "Chờ Admin kích hoạt",
+            customer_name: row.customer_name || "",
+            message: "Key này đang chờ Quản trị viên cấp thời hạn sử dụng!"
+        });
+    }
+
     if (!boundMachine) {
         await env.DB.prepare(
             "UPDATE licenses SET machine_id = ?, last_verified_at = datetime('now', '+7 hours') WHERE id = ?"
@@ -265,7 +281,6 @@ async function handleVerifyLicense(request, env) {
         ).bind(row.id).run();
     }
 
-    const expiryRaw = (row.expiry_date || "").trim();
     const isLifetime = ["LIFETIME", "VINH VIEN", "VĨNH VIỄN", "UNLIMITED"].includes(expiryRaw.toUpperCase());
 
     if (!isLifetime) {
@@ -316,10 +331,43 @@ async function handleAutoRegister(request, env) {
     if (results && results.length > 0) {
         const row = results[0];
         const expiryRaw = (row.expiry_date || "").trim();
-        const isLifetime = ["LIFETIME", "VĨNH VIỄN"].includes(expiryRaw.toUpperCase());
+        const rawStatus = (row.status || "ACTIVE").trim().toUpperCase();
+
+        await env.DB.prepare(
+            "UPDATE licenses SET last_verified_at = datetime('now', '+7 hours') WHERE id = ?"
+        ).bind(row.id).run().catch(() => {});
+
+        if (rawStatus === "BLOCKED" || rawStatus === "KHÓA" || rawStatus === "REVOKED") {
+            return jsonResponse({
+                valid: false,
+                status: "BLOCKED",
+                license_key: row.license_key,
+                machine_id: machineId,
+                expiry_raw: expiryRaw,
+                expiry_display: "Đã bị khóa",
+                customer_name: row.customer_name || computerName,
+                message: "Bản quyền máy này đang bị khóa bởi Quản trị viên!"
+            });
+        }
+
+        const isPending = rawStatus === "PENDING" || ["PENDING", "", "CHỜ KÍCH HOẠT"].includes(expiryRaw.toUpperCase());
+        if (isPending) {
+            return jsonResponse({
+                valid: false,
+                status: "PENDING",
+                license_key: row.license_key,
+                machine_id: machineId,
+                expiry_raw: expiryRaw,
+                expiry_display: "Chờ Admin kích hoạt",
+                customer_name: row.customer_name || computerName,
+                message: "Thiết bị đã được ghi nhận. Vui lòng chờ Admin kích hoạt thời hạn!"
+            });
+        }
+
+        const isLifetime = ["LIFETIME", "VINH VIEN", "VĨNH VIỄN", "UNLIMITED"].includes(expiryRaw.toUpperCase());
         const todayStr = getVietnamDateString();
         const isExpired = !isLifetime && expiryRaw < todayStr;
-        const status = isExpired ? "EXPIRED" : (row.status || "ACTIVE");
+        const status = isExpired ? "EXPIRED" : "ACTIVE";
 
         return jsonResponse({
             valid: status === "ACTIVE",
@@ -329,15 +377,34 @@ async function handleAutoRegister(request, env) {
             expiry_raw: expiryRaw,
             expiry_display: isLifetime ? "Vĩnh viễn" : formatDMY(expiryRaw),
             customer_name: row.customer_name || computerName,
-            message: isExpired ? "Bản quyền đã hết hạn" : "Đã đồng bộ thông tin bản quyền!"
+            message: isExpired ? `Bản quyền đã hết hạn (${formatDMY(expiryRaw)})` : "Đã đồng bộ thông tin bản quyền!"
         });
     }
 
+    // Máy mới cài đặt chưa có trên hệ thống -> Tự động sinh Key và lưu lên Web Admin (chờ Admin cấp hạn)
+    const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    const randPart = () => {
+        let s = "";
+        for (let i = 0; i < 4; i++) s += chars.charAt(Math.floor(Math.random() * chars.length));
+        return s;
+    };
+    const newKey = `CWAI-${randPart()}-${randPart()}-${randPart()}`;
+    const defaultCustomer = computerName ? `Máy mới: ${computerName}` : "Khách hàng mới";
+
+    await env.DB.prepare(`
+        INSERT INTO licenses (license_key, machine_id, customer_name, expiry_date, status, last_verified_at, note)
+        VALUES (?, ?, ?, 'PENDING', 'PENDING', datetime('now', '+7 hours'), 'Tự động tạo khi cài máy mới')
+    `).bind(newKey, machineId, defaultCustomer).run();
+
     return jsonResponse({
         valid: false,
-        status: "UNREGISTERED",
+        status: "PENDING",
+        license_key: newKey,
         machine_id: machineId,
-        message: "Thiết bị chưa được cấp Key. Vui lòng nhập Key kích hoạt!"
+        expiry_raw: "PENDING",
+        expiry_display: "Chờ Admin kích hoạt",
+        customer_name: defaultCustomer,
+        message: "Thiết bị và Key mới đã được tự động tạo trên hệ thống. Vui lòng chờ Admin cấp thời hạn!"
     });
 }
 
@@ -991,6 +1058,7 @@ function renderAdminWebPage(env) {
         .badge-active { background-color: #059669; }
         .badge-blocked { background-color: #dc2626; }
         .badge-expired { background-color: #d97706; }
+        .badge-pending { background-color: #eab308; color: #000000; }
         .btn-primary { background-color: #2563eb; border: none; }
         .form-control, .form-select { background-color: #1f2937; border-color: #374151; color: #f9fafb; }
         .form-control:focus, .form-select:focus { background-color: #1f2937; color: #ffffff; border-color: #3b82f6; }
@@ -1277,6 +1345,7 @@ function renderAdminWebPage(env) {
                         <label class="form-label">Trạng Thái:</label>
                         <select id="mStatus" class="form-select">
                             <option value="ACTIVE">ACTIVE (Đang hoạt động)</option>
+                            <option value="PENDING">PENDING (Chờ kích hoạt)</option>
                             <option value="BLOCKED">BLOCKED (Khóa bản quyền)</option>
                             <option value="EXPIRED">EXPIRED (Hết hạn)</option>
                         </select>
@@ -1438,8 +1507,10 @@ function renderAdminWebPage(env) {
                     let badgeClass = 'badge-active';
                     if (item.status === 'BLOCKED') badgeClass = 'badge-blocked';
                     else if (item.status === 'EXPIRED') badgeClass = 'badge-expired';
+                    else if (item.status === 'PENDING') badgeClass = 'badge-pending';
 
                     const boundMac = item.machine_id ? escHtml(item.machine_id) : '<span class="text-muted fst-italic">Chưa gắn máy</span>';
+                    const isPendingRow = item.status === 'PENDING' || item.expiry_date === 'PENDING';
                     html += \`<tr>
                         <td>\${item.id}</td>
                         <td class="fw-bold text-info">\${escHtml(item.license_key)}</td>
@@ -1452,6 +1523,8 @@ function renderAdminWebPage(env) {
                         <td><span class="badge \${badgeClass}">\${escHtml(item.status)}</span></td>
                         <td><small class="text-muted">\${escHtml(item.last_verified_at || '--')}</small></td>
                         <td class="text-center">
+                            \${isPendingRow ? \`<button class="btn btn-sm btn-success me-1" onclick="quickActivate(\${item.id}, 30)" title="Kích hoạt nhanh 30 ngày">⚡ 30N</button>\` : ''}
+                            \${isPendingRow ? \`<button class="btn btn-sm btn-primary me-1" onclick="quickActivate(\${item.id}, 'LIFETIME')" title="Kích hoạt vĩnh viễn">⚡ VV</button>\` : ''}
                             <button class="btn btn-sm btn-outline-info me-1" onclick="editItemById(\${item.id})">Sửa</button>
                             \${item.machine_id ? \`<button class="btn btn-sm btn-outline-warning me-1" onclick="resetMachine(\${item.id})" title="Cho phép khách đổi máy">Đổi Máy</button>\` : ''}
                             <button class="btn btn-sm btn-outline-danger" onclick="deleteItem(\${item.id})">Xóa</button>
@@ -1462,6 +1535,33 @@ function renderAdminWebPage(env) {
             } catch (e) {
                 tbody.innerHTML = '<tr><td colspan="8" class="text-center text-danger py-4">Lỗi kết nối: ' + e.message + '</td></tr>';
             }
+        }
+
+        async function quickActivate(id, days) {
+            const item = cachedLicenses.find(x => x.id === id);
+            if (!item) return;
+            let expiry = 'LIFETIME';
+            if (days !== 'LIFETIME') {
+                const d = new Date();
+                d.setDate(d.getDate() + parseInt(days));
+                expiry = d.toISOString().slice(0, 10);
+            }
+            const res = await fetch('/api/admin/save', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'X-Admin-Key': adminKey },
+                body: JSON.stringify({
+                    id: item.id,
+                    license_key: item.license_key,
+                    customer_name: item.customer_name || '',
+                    expiry_date: expiry,
+                    machine_id: item.machine_id || '',
+                    status: 'ACTIVE',
+                    note: item.note || ''
+                })
+            });
+            const j = await res.json();
+            if (j.success) loadData();
+            else alert(j.error || 'Lỗi kích hoạt nhanh!');
         }
 
         function editItemById(id) {

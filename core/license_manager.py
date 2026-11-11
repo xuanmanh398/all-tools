@@ -1,4 +1,4 @@
-﻿import os
+import os
 import re
 import csv
 import io
@@ -346,7 +346,7 @@ def auto_register_machine(web_app_url: str = None, machine_id: str = None, db=No
     }
 
     # 1. Há»– TRá»¢ CLOUDFLARE D1 WORKER (SiÃªu tá»‘c ~40ms)
-    if "workers.dev" in url or "cloudflare" in url or "/api/" in url:
+    if "workers.dev" in url or "cloudflare" in url or "/api/" in url or "truyennha.id.vn" in url:
         endpoint = url.rstrip("/")
         if not endpoint.endswith("/api/auto-register") and not endpoint.endswith("/api/verify"):
             endpoint += "/api/auto-register"
@@ -378,7 +378,7 @@ def auto_register_machine(web_app_url: str = None, machine_id: str = None, db=No
                     "is_valid": is_valid,
                     "verified_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 }
-                return is_valid, msg, info
+                return True, msg, info
             else:
                 return False, f"MÃ¡y chá»§ Cloudflare pháº£n há»“i mÃ£ lá»—i {resp.status_code}", {}
         except Exception as e:
@@ -454,7 +454,7 @@ def verify_license_online(sheet_url: str, machine_id: str, entered_key: str) -> 
         # -------------------------------------------------------------
         # 1. XÃC THá»°C QUA CLOUDFLARE D1 WORKER (Tá»‘c Ä‘á»™ ~40ms)
         # -------------------------------------------------------------
-        if "workers.dev" in sheet_url or "cloudflare" in sheet_url or "/api/" in sheet_url:
+        if "workers.dev" in sheet_url or "cloudflare" in sheet_url or "/api/" in sheet_url or "truyennha.id.vn" in sheet_url:
             verify_endpoint = sheet_url.rstrip("/")
             if not verify_endpoint.endswith("/api/verify"):
                 if verify_endpoint.endswith("/api/auto-register"):
