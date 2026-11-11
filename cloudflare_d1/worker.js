@@ -937,7 +937,6 @@ async function renderDownloadAndGuidePage(env, url) {
             <div class="d-flex align-items-center gap-2">
                 <a href="#tai-phan-mem" class="btn btn-sm btn-outline-light">📥 Tải Về</a>
                 <a href="#huong-dan" class="btn btn-sm btn-outline-info">📖 Hướng Dẫn</a>
-                <a href="/" class="btn btn-sm btn-dark border-secondary text-secondary">⚙️ Admin</a>
             </div>
         </div>
     </nav>
