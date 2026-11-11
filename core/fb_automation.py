@@ -1531,21 +1531,35 @@ class FBAutomationEngine:
                     logger_callback("WARNING", "Không tìm thấy nút tạo bài viết (Có thể nhóm bắt duyệt tham gia hoặc cấm đăng bài).")
                 return False
 
-            # Bấm mở Modal tạo bài viết (click cả element và parent div[role='button'] để đảm bảo nạp Modal)
+            # Đảm bảo không còn khung soạn thảo cũ đang mở trước khi bấm mở mới
+            try:
+                if await page.query_selector("div[role='dialog'] div[contenteditable='true'], div[role='dialog'] div[role='textbox']"):
+                    await page.keyboard.press("Escape")
+                    await asyncio.sleep(1)
+            except Exception:
+                pass
+
+            # Bấm mở Modal tạo bài viết ĐÚNG 1 LẦN (tránh click nhiều lần gây mở nhiều khung đè lên nhau)
+            composer_opened = False
             try:
                 await composer_btn.click()
             except Exception:
                 pass
 
-            await page.evaluate("""(el) => {
-                if (el) {
-                    el.click();
-                    let parent = el.closest("div[role='button']") || el.parentElement;
-                    if (parent) parent.click();
-                }
-            }""", composer_btn)
+            for _ in range(7):
+                await asyncio.sleep(0.5)
+                if await page.query_selector("div[role='dialog'] div[contenteditable='true'], div[role='dialog'] div[role='textbox']"):
+                    composer_opened = True
+                    break
 
-            await asyncio.sleep(3)
+            if not composer_opened:
+                await page.evaluate("""(el) => {
+                    if (el) {
+                        const btn = el.closest("div[role='button']") || el;
+                        btn.click();
+                    }
+                }""", composer_btn)
+                await asyncio.sleep(2.5)
 
             # Tìm ô nhập văn bản trong Modal (div[role='dialog'])
             editor_selectors = [
@@ -1684,14 +1698,21 @@ class FBAutomationEngine:
                             await photo_btn.click(force=True)
                         except Exception:
                             pass
-                        await page.evaluate("""(el) => {
-                            if (el) {
-                                el.click();
-                                const b = el.closest("div[role='button']") || el.parentElement;
-                                if (b) b.click();
-                            }
-                        }""", photo_btn)
-                        await asyncio.sleep(2)
+                        # Chờ tối đa 2.5s để vùng dropzone mở ra, chỉ dùng JS click fallback nếu chưa mở
+                        dz_opened = False
+                        for _ in range(5):
+                            await asyncio.sleep(0.5)
+                            if (await is_dropzone_open()) or (await is_real_media_mounted()):
+                                dz_opened = True
+                                break
+                        if not dz_opened:
+                            await page.evaluate("""(el) => {
+                                if (el) {
+                                    const b = el.closest("div[role='button']") || el;
+                                    b.click();
+                                }
+                            }""", photo_btn)
+                            await asyncio.sleep(1.5)
 
                 # BƯỚC 2: Nạp tệp media
                 # Cách 2a: Nếu dropzone đã hiển thị, bấm vào dropzone bằng expect_file_chooser
@@ -1803,7 +1824,7 @@ class FBAutomationEngine:
                         for (const b of buttons) {
                             const a = (b.getAttribute('aria-label') || '').toLowerCase();
                             if (a.includes('gỡ bản xem trước') || a.includes('remove preview') ||
-                                a.includes('xóa bản xem trước') || a.includes('gỡ') || a.includes('xóa')) {
+                                a.includes('xóa bản xem trước') || a.includes('remove link preview')) {
                                 if (b.parentElement !== dlg) {
                                     b.click();
                                 }
