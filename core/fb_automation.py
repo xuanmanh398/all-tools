@@ -1703,30 +1703,50 @@ class FBAutomationEngine:
                                 }""", photo_btn)
                                 await asyncio.sleep(1.5)
 
-                    # Nếu filechooser đã tự bắt được ở Bước 1, chờ thêm 1.5s để media hiển thị
+                    # Nếu filechooser đã tự bắt được ở Bước 1, chờ tối đa 6s để media hiển thị (tránh nạp trùng)
                     if _fc_state["handled"]:
-                        await asyncio.sleep(1.5)
+                        for _ in range(12):
+                            await asyncio.sleep(0.5)
+                            if await is_real_media_mounted():
+                                break
 
-                    # BƯỚC 2: Nạp tệp trực tiếp qua thẻ input[type='file']
+                    # BƯỚC 2: Nạp tệp ĐÚNG 1 LẦN qua thẻ input[type='file'] chính trong dialog (tuyệt đối không lặp gây chọn nhiều lần)
                     if not (await is_real_media_mounted()):
-                        for _ in range(4):
+                        for _ in range(6):
                             if await page.query_selector("div[role='dialog'] input[type='file']"):
                                 break
                             await asyncio.sleep(0.5)
 
-                        file_inputs = await page.query_selector_all("div[role='dialog'] input[type='file']")
-                        if not file_inputs:
-                            file_inputs = await page.query_selector_all("input[type='file']")
-                        for finput in reversed(file_inputs):
-                            try:
-                                await finput.set_input_files(valid_files)
-                                await asyncio.sleep(1.8)
-                                if await is_real_media_mounted():
-                                    break
-                            except Exception:
-                                continue
+                        target_input = await page.query_selector("div[role='dialog'] input[type='file'][multiple]")
+                        all_inputs = await page.query_selector_all("div[role='dialog'] input[type='file']")
+                        if not target_input and all_inputs:
+                            target_input = all_inputs[-1]
 
-                    # Cách 2b: Nếu là ảnh và vẫn chưa hiển thị, thử paste DataTransfer qua JavaScript
+                        if target_input:
+                            try:
+                                await target_input.set_input_files(valid_files)
+                                # Chờ tối đa 6s để Facebook render preview đầy đủ
+                                for _ in range(12):
+                                    await asyncio.sleep(0.5)
+                                    if await is_real_media_mounted():
+                                        break
+                            except Exception:
+                                pass
+
+                        # Nếu input cuối chưa ăn sau 6s và dialog có input khác, thử input còn lại đúng 1 lần
+                        if not (await is_real_media_mounted()) and len(all_inputs) > 1:
+                            fallback_input = all_inputs[0] if all_inputs[0] != target_input else None
+                            if fallback_input:
+                                try:
+                                    await fallback_input.set_input_files(valid_files)
+                                    for _ in range(10):
+                                        await asyncio.sleep(0.5)
+                                        if await is_real_media_mounted():
+                                            break
+                                except Exception:
+                                    pass
+
+                    # Cách 2b: Chỉ dùng paste Clipboard nếu sau bước trên vẫn hoàn toàn chưa có ảnh nào
                     if not has_video and not (await is_real_media_mounted()):
                         for media_path in valid_files:
                             ext = os.path.splitext(media_path)[1].lower()
@@ -1749,7 +1769,7 @@ class FBAutomationEngine:
                                             target.dispatchEvent(new ClipboardEvent('paste', { bubbles: true, cancelable: true, clipboardData: dt }));
                                         }
                                     }""", {"b64": b64_data, "mime": mime, "filename": os.path.basename(media_path)})
-                                    await asyncio.sleep(2)
+                                    await asyncio.sleep(1.5)
                                 except Exception:
                                     pass
 
@@ -1781,25 +1801,64 @@ class FBAutomationEngine:
                         pass
                     return False
 
-            # Focus và nhấp vào ô nhập văn bản
-            try:
-                editor_target = await page.query_selector("div[role='dialog'] div[role='textbox'], div[role='dialog'] div[contenteditable='true']") or editor_elem
-                if editor_target:
-                    await editor_target.click(force=True)
-                    await editor_target.focus()
-            except Exception:
-                pass
-            await asyncio.sleep(1)
+            # Cuộn ô nhập văn bản vào giữa khung hình, focus và nhập nội dung bài viết
+            if final_text and final_text.strip():
+                try:
+                    await page.evaluate("""() => {
+                        const dlg = document.querySelector("div[role='dialog']");
+                        if (!dlg) return;
+                        const ed = dlg.querySelector("div[role='textbox'][contenteditable='true']") || dlg.querySelector("div[contenteditable='true']");
+                        if (ed) {
+                            ed.scrollIntoView({ behavior: 'instant', block: 'center' });
+                            ed.focus();
+                            ed.click();
+                        }
+                    }""")
+                    await asyncio.sleep(0.6)
+                    editor_target = await page.query_selector("div[role='dialog'] div[role='textbox'][contenteditable='true'], div[role='dialog'] div[contenteditable='true']") or editor_elem
+                    if editor_target:
+                        await editor_target.click(timeout=2500)
+                        await editor_target.focus()
+                except Exception:
+                    pass
+                await asyncio.sleep(0.5)
 
-            # Nhập văn bản bài viết
-            try:
-                await page.keyboard.insert_text(final_text)
-            except Exception:
-                for char in final_text:
-                    await page.keyboard.write(char)
-                    await asyncio.sleep(anti_spam.get_typing_delay())
+                # Nhập văn bản bài viết
+                try:
+                    await page.keyboard.insert_text(final_text)
+                except Exception:
+                    for char in final_text:
+                        await page.keyboard.write(char)
+                        await asyncio.sleep(anti_spam.get_typing_delay())
 
-            await asyncio.sleep(2.5)
+                await asyncio.sleep(1.2)
+
+                # Kiểm tra lại xem chữ đã vào ô soạn thảo chưa; nếu chưa vào thì dán qua Clipboard text
+                try:
+                    has_typed = await page.evaluate("""() => {
+                        const dlg = document.querySelector("div[role='dialog']");
+                        if (!dlg) return false;
+                        const ed = dlg.querySelector("div[role='textbox'][contenteditable='true']") || dlg.querySelector("div[contenteditable='true']");
+                        return Boolean(ed && (ed.innerText || ed.textContent || '').trim().length > 0);
+                    }""")
+                    if not has_typed:
+                        await page.evaluate("""(txt) => {
+                            const dlg = document.querySelector("div[role='dialog']");
+                            if (!dlg) return;
+                            const ed = dlg.querySelector("div[role='textbox'][contenteditable='true']") || dlg.querySelector("div[contenteditable='true']");
+                            if (ed) {
+                                ed.scrollIntoView({ behavior: 'instant', block: 'center' });
+                                ed.focus();
+                                const dt = new DataTransfer();
+                                dt.setData('text/plain', txt);
+                                ed.dispatchEvent(new ClipboardEvent('paste', { bubbles: true, cancelable: true, clipboardData: dt }));
+                            }
+                        }""", final_text)
+                        await asyncio.sleep(1.0)
+                except Exception:
+                    pass
+
+            await asyncio.sleep(1.5)
 
             # Nếu văn bản có link làm hiện card Link Preview mà ta đang có Video/Ảnh, tự động gỡ card preview
             if media_attached:
@@ -1849,10 +1908,48 @@ class FBAutomationEngine:
                         logger_callback("INFO", f"Đang tải {media_type_label} lên Facebook ({sec}s)... Vui lòng chờ...")
                     await asyncio.sleep(2)
 
-            # Nhấn nút "Đăng" / "Post"
+            # Nhấn nút "Đăng" / "Post" (ưu tiên tọa độ nút xanh #0866FF trong dialog)
             post_clicked = False
             for attempt in range(8):
-                # Cách 1: Playwright locator get_by_text tìm phần tử có chữ "Đăng" / "Post"
+                # Cách 1: Lấy chính xác tọa độ nút xanh #0866FF hoặc nút có chữ Đăng/Post đang hiện và click chuột thật
+                try:
+                    btn_rect = await page.evaluate("""() => {
+                        const dlg = document.querySelector("div[role='dialog']");
+                        if (!dlg) return null;
+                        const all = Array.from(dlg.querySelectorAll("*"));
+                        // Ưu tiên tìm phần tử nền xanh #0866FF có chữ Đăng/Post hoặc chiều rộng >= 100px
+                        for (const el of all.reverse()) {
+                            const r = el.getBoundingClientRect();
+                            if (r.width < 60 || r.height < 24 || r.bottom <= 0) continue;
+                            const bg = window.getComputedStyle(el).backgroundColor;
+                            const t = (el.innerText || el.textContent || '').trim().toLowerCase();
+                            if ((bg === 'rgb(8, 102, 255)' || bg === '#0866ff') && (t === 'đăng' || t === 'post' || r.width >= 150)) {
+                                el.scrollIntoView({ behavior: 'instant', block: 'center' });
+                                const nr = el.getBoundingClientRect();
+                                return { x: nr.left + nr.width / 2, y: nr.top + nr.height / 2 };
+                            }
+                        }
+                        // Dự phòng tìm theo chữ exact Đăng / Post ở đáy dialog
+                        for (const el of all) {
+                            const r = el.getBoundingClientRect();
+                            if (r.width < 20 || r.height < 12) continue;
+                            const t = (el.innerText || el.textContent || '').trim().toLowerCase();
+                            if (t === 'đăng' || t === 'post') {
+                                el.scrollIntoView({ behavior: 'instant', block: 'center' });
+                                const nr = el.getBoundingClientRect();
+                                return { x: nr.left + nr.width / 2, y: nr.top + nr.height / 2 };
+                            }
+                        }
+                        return null;
+                    }""")
+                    if btn_rect and btn_rect.get("x") and btn_rect.get("y"):
+                        await page.mouse.click(btn_rect["x"], btn_rect["y"])
+                        post_clicked = True
+                        break
+                except Exception:
+                    pass
+
+                # Cách 2: Playwright locator get_by_text
                 try:
                     for text_label in ["Đăng", "Post"]:
                         loc = page.locator("div[role='dialog']").get_by_text(text_label, exact=True).last
@@ -1866,33 +1963,7 @@ class FBAutomationEngine:
                 if post_clicked:
                     break
 
-                # Cách 2: Kích hoạt click bằng JavaScript DOM trực tiếp (hỗ trợ div role none có màu xanh #0866FF và text Đăng)
-                try:
-                    post_clicked = await page.evaluate("""() => {
-                        const dlg = document.querySelector("div[role='dialog']");
-                        if (!dlg) return false;
-                        const all = Array.from(dlg.querySelectorAll("*"));
-                        for (const el of all.reverse()) {
-                            const bg = window.getComputedStyle(el).backgroundColor;
-                            const t = (el.innerText || el.textContent || '').trim().toLowerCase();
-                            if (bg === 'rgb(8, 102, 255)' || bg === '#0866ff' || t === 'đăng' || t === 'post') {
-                                try {
-                                    el.click();
-                                    const btn = el.closest("div[class*='x']") || el.parentElement;
-                                    if (btn) btn.click();
-                                    return true;
-                                } catch (e) {}
-                            }
-                        }
-                        return false;
-                    }""")
-                except Exception:
-                    post_clicked = False
-
-                if post_clicked:
-                    break
-
-                # Cách 3: Click chuột chính xác vào tọa độ tâm nút Đăng ở đáy hộp thoại (Bounding Box)
+                # Cách 3: Click chuột vào đáy hộp thoại (Bounding Box)
                 try:
                     dlg_elem = await page.query_selector("div[role='dialog']")
                     if dlg_elem:
