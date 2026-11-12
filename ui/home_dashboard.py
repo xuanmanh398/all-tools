@@ -1,15 +1,21 @@
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QFrame,
-    QGridLayout, QScrollArea
+    QGridLayout, QApplication, QMessageBox
 )
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QFont, QColor
+from PySide6.QtCore import Qt, Signal, QUrl
+from PySide6.QtGui import QDesktopServices
 from core.database import Database
+from core.license_manager import get_cached_license, get_machine_id, parse_expiry_date
+
+
+WEBSITE_URL = "https://link.truyennha.id.vn/tai-va-huong-dan"
+ZALO_NUMBER = "0963913615"
+ZALO_URL = f"https://zalo.me/{ZALO_NUMBER}"
 
 
 class HomeDashboardTab(QWidget):
-    # Signals để chuyển tab từ các nút thao tác nhanh
-    switch_tab_signal = Signal(str)  # "fb_comment", "fb_poster", "fb_acc", "fb_group", "threads"
+    # Giữ signal để tương thích với MainWindow
+    switch_tab_signal = Signal(str)
 
     def __init__(self, db: Database):
         super().__init__()
@@ -18,40 +24,45 @@ class HomeDashboardTab(QWidget):
 
     def init_ui(self):
         main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(16, 14, 16, 14)
-        main_layout.setSpacing(14)
+        main_layout.setContentsMargins(18, 16, 18, 16)
+        main_layout.setSpacing(16)
 
         # -------------------------------------------------------------
-        # 1. HERO BANNER CHÀO MỪNG HIỆN ĐẠI
+        # 1. HERO BANNER GIỚI THIỆU PHẦN MỀM
         # -------------------------------------------------------------
         hero_frame = QFrame()
         hero_frame.setStyleSheet("""
             QFrame {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #1e1b4b, stop:0.5 #312e81, stop:1 #0f172a);
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #1e1b4b, stop:0.55 #312e81, stop:1 #0f172a);
                 border: 1px solid #4338ca;
                 border-radius: 12px;
                 padding: 18px 24px;
             }
         """)
         hf_layout = QHBoxLayout(hero_frame)
+        hf_layout.setSpacing(16)
 
         text_box = QVBoxLayout()
-        text_box.setSpacing(4)
-        lbl_welcome = QLabel("🚀 Chào mừng đến với Tools Marketing")
-        lbl_welcome.setStyleSheet("color: #ffffff; font-size: 20px; font-weight: bold; border: none; background: transparent;")
+        text_box.setSpacing(5)
+        lbl_welcome = QLabel("⚡ Tools Marketing & Auto Post")
+        lbl_welcome.setStyleSheet("color: #ffffff; font-size: 21px; font-weight: bold; border: none; background: transparent;")
         text_box.addWidget(lbl_welcome)
 
-        lbl_sub = QLabel("Phần mềm tự động hóa marketing Facebook & Threads: Tự động comment seeding, Đăng bài nhóm, Nuôi nick đa tài khoản.")
+        lbl_sub = QLabel(
+            "Tự động đăng bài Group Facebook, Threads & Comment Seeding • "
+            "Chỉ 149k/tháng (Dùng thử FREE 5 ngày) • Nhận phát triển tools theo yêu cầu"
+        )
+        lbl_sub.setWordWrap(True)
         lbl_sub.setStyleSheet("color: #c7d2fe; font-size: 13px; border: none; background: transparent;")
         text_box.addWidget(lbl_sub)
         hf_layout.addLayout(text_box, 1)
 
-        btn_quick_comment = QPushButton("💬 Mở Auto Comment Ngay")
-        btn_quick_comment.setCursor(Qt.PointingHandCursor)
-        btn_quick_comment.setFixedHeight(42)
-        btn_quick_comment.setStyleSheet("""
+        btn_open_web = QPushButton("🌐 Mở Website Chính Thức")
+        btn_open_web.setCursor(Qt.PointingHandCursor)
+        btn_open_web.setFixedHeight(42)
+        btn_open_web.setStyleSheet("""
             QPushButton {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #10b981, stop:1 #059669);
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #2563eb, stop:1 #06b6d4);
                 color: #ffffff;
                 font-weight: bold;
                 font-size: 13px;
@@ -60,217 +71,252 @@ class HomeDashboardTab(QWidget):
                 padding: 0 18px;
             }
             QPushButton:hover {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #059669, stop:1 #047857);
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #1d4ed8, stop:1 #0891b2);
             }
         """)
-        btn_quick_comment.clicked.connect(lambda: self.switch_tab_signal.emit("fb_comment"))
-        hf_layout.addWidget(btn_quick_comment)
+        btn_open_web.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(WEBSITE_URL)))
+        hf_layout.addWidget(btn_open_web)
 
         main_layout.addWidget(hero_frame)
 
         # -------------------------------------------------------------
-        # 2. BỐN THẺ THỐNG KÊ TỔNG QUAN HỆ THỐNG
+        # 2. KHỐI THÔNG TIN BẢN QUYỀN & WEBSITE / HỖ TRỢ (2 CỘT)
         # -------------------------------------------------------------
-        stats_layout = QHBoxLayout()
-        stats_layout.setSpacing(12)
+        grid = QGridLayout()
+        grid.setSpacing(14)
 
-        self.card_acc = self._create_stat_card("👥 Tài Khoản Facebook", "0", "Đã kết nối an toàn", "#3b82f6")
-        self.card_comment = self._create_stat_card("💬 Auto Comment FB", "Sẵn sàng", "Comment UID / Nhóm / Keyword", "#10b981")
-        self.card_groups = self._create_stat_card("📑 Nhóm Facebook", "0", "Nhóm đã quét tham gia", "#8b5cf6")
-        self.card_threads = self._create_stat_card("📷 Tài Khoản Threads", "0", "Nền tảng Instagram Threads", "#f59e0b")
+        # --- CỘT 1: THÔNG TIN BẢN QUYỀN ---
+        lic_card = self._create_info_card("🛡️ THÔNG TIN BẢN QUYỀN", "#10b981")
+        lic_layout = lic_card.layout()
 
-        stats_layout.addWidget(self.card_acc)
-        stats_layout.addWidget(self.card_comment)
-        stats_layout.addWidget(self.card_groups)
-        stats_layout.addWidget(self.card_threads)
+        self.lbl_lic_status = QLabel("Trạng thái: Đang kiểm tra...")
+        self.lbl_lic_status.setStyleSheet("color: #a6e3a1; font-size: 14px; font-weight: bold; border: none;")
+        lic_layout.addWidget(self.lbl_lic_status)
 
-        main_layout.addLayout(stats_layout)
+        self.lbl_lic_expiry = QLabel("Thời hạn: --")
+        self.lbl_lic_expiry.setStyleSheet("color: #e2e8f0; font-size: 13px; border: none;")
+        lic_layout.addWidget(self.lbl_lic_expiry)
+
+        self.lbl_lic_machine = QLabel("Mã máy: --")
+        self.lbl_lic_machine.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.lbl_lic_machine.setStyleSheet("color: #94a3b8; font-size: 12px; font-family: Consolas, monospace; border: none;")
+        lic_layout.addWidget(self.lbl_lic_machine)
+
+        self.lbl_lic_key = QLabel("Key bản quyền: --")
+        self.lbl_lic_key.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.lbl_lic_key.setStyleSheet("color: #94a3b8; font-size: 12px; font-family: Consolas, monospace; border: none;")
+        lic_layout.addWidget(self.lbl_lic_key)
+
+        lic_btn_row = QHBoxLayout()
+        lic_btn_row.setSpacing(8)
+
+        btn_copy_mid = QPushButton("📋 Copy Mã Máy")
+        btn_copy_mid.setCursor(Qt.PointingHandCursor)
+        btn_copy_mid.setFixedHeight(34)
+        btn_copy_mid.setStyleSheet(self._btn_style("#334155", "#475569", "#f8fafc"))
+        btn_copy_mid.clicked.connect(self._copy_machine_id)
+        lic_btn_row.addWidget(btn_copy_mid)
+
+        btn_manage_lic = QPushButton("🔑 Quản Lý / Gia Hạn Key")
+        btn_manage_lic.setCursor(Qt.PointingHandCursor)
+        btn_manage_lic.setFixedHeight(34)
+        btn_manage_lic.setStyleSheet(self._btn_style("#065f46", "#047857", "#ecfdf5"))
+        btn_manage_lic.clicked.connect(self._open_license_dialog)
+        lic_btn_row.addWidget(btn_manage_lic)
+
+        lic_layout.addStretch()
+        lic_layout.addLayout(lic_btn_row)
+        grid.addWidget(lic_card, 0, 0)
+
+        # --- CỘT 2: WEBSITE & TẢI PHIÊN BẢN MỚI ---
+        web_card = self._create_info_card("🌐 WEBSITE & TÀI LIỆU HƯỚNG DẪN", "#3b82f6")
+        web_layout = web_card.layout()
+
+        lbl_web_desc = QLabel(
+            "Trang chủ chính thức để tải bộ cài mới nhất, xem hướng dẫn sử dụng chi tiết và kiểm tra bảng giá gói dịch vụ."
+        )
+        lbl_web_desc.setWordWrap(True)
+        lbl_web_desc.setStyleSheet("color: #cbd5e1; font-size: 12.5px; border: none;")
+        web_layout.addWidget(lbl_web_desc)
+
+        lbl_web_url = QLabel(f"Link: {WEBSITE_URL}")
+        lbl_web_url.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        lbl_web_url.setStyleSheet("color: #60a5fa; font-size: 12.5px; font-weight: bold; border: none;")
+        web_layout.addWidget(lbl_web_url)
+
+        lbl_price = QLabel("💎 Gói bản quyền: 149.000đ / tháng (Máy mới miễn phí 5 ngày dùng thử)")
+        lbl_price.setWordWrap(True)
+        lbl_price.setStyleSheet("color: #fde047; font-size: 12.5px; font-weight: bold; border: none;")
+        web_layout.addWidget(lbl_price)
+
+        web_btn_row = QHBoxLayout()
+        web_btn_row.setSpacing(8)
+
+        btn_copy_web = QPushButton("📋 Copy Link Website")
+        btn_copy_web.setCursor(Qt.PointingHandCursor)
+        btn_copy_web.setFixedHeight(34)
+        btn_copy_web.setStyleSheet(self._btn_style("#334155", "#475569", "#f8fafc"))
+        btn_copy_web.clicked.connect(lambda: self._copy_and_notify(WEBSITE_URL, "Đã copy link Website!"))
+        web_btn_row.addWidget(btn_copy_web)
+
+        btn_visit_web = QPushButton("🚀 Truy Cập Trang Tải")
+        btn_visit_web.setCursor(Qt.PointingHandCursor)
+        btn_visit_web.setFixedHeight(34)
+        btn_visit_web.setStyleSheet(self._btn_style("#1d4ed8", "#2563eb", "#ffffff"))
+        btn_visit_web.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(WEBSITE_URL)))
+        web_btn_row.addWidget(btn_visit_web)
+
+        web_layout.addStretch()
+        web_layout.addLayout(web_btn_row)
+        grid.addWidget(web_card, 0, 1)
+
+        main_layout.addLayout(grid)
 
         # -------------------------------------------------------------
-        # 3. DANH MỤC TÍNH NĂNG NHANH (QUICK ACCESS CARDS)
+        # 3. KHỐI LIÊN HỆ ADMIN, BÁO LỖI & DỊCH VỤ PHÁT TRIỂN TOOLS
         # -------------------------------------------------------------
-        lbl_section_title = QLabel("⚡ TÍNH NĂNG NỔI BẬT & THAO TÁC 1 CHẠM")
-        lbl_section_title.setStyleSheet("color: #f8fafc; font-size: 14px; font-weight: bold; margin-top: 6px;")
-        main_layout.addWidget(lbl_section_title)
+        support_card = self._create_info_card("🎧 LIÊN HỆ ADMIN & BÁO LỖI KỸ THUẬT", "#f59e0b")
+        sup_layout = support_card.layout()
 
-        grid_actions = QGridLayout()
-        grid_actions.setSpacing(12)
+        sup_row = QHBoxLayout()
+        sup_row.setSpacing(18)
 
-        # Action Card 1: Auto Comment FB (Giống trên video)
-        btn_action_comment = self._create_action_card(
-            icon="💬",
-            title="Tự Động Comment Facebook (Mới)",
-            desc="Tự động thả Like và bình luận bài viết theo UID, bài viết trong Nhóm hoặc Từ khóa. Hỗ trợ Spintax xoay nội dung chống spam.",
-            btn_text="Khởi Chạy Auto Comment  ➔",
-            color="#10b981",
-            handler=lambda: self.switch_tab_signal.emit("fb_comment")
+        sup_info = QVBoxLayout()
+        sup_info.setSpacing(6)
+
+        lbl_zalo = QLabel(f"💬 Zalo Quản Trị Viên: {ZALO_NUMBER}")
+        lbl_zalo.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        lbl_zalo.setStyleSheet("color: #34d399; font-size: 15px; font-weight: bold; border: none;")
+        sup_info.addWidget(lbl_zalo)
+
+        lbl_bug = QLabel(
+            "• Báo lỗi phần mềm: Vui lòng chụp ảnh màn hình lỗi kèm Mã Máy (Machine ID) gửi qua Zalo Admin để được xử lý nhanh nhất.\n"
+            "• Gia hạn / Nâng cấp bản quyền: Nhắn Mã Máy qua Zalo 0963913615 để kích hoạt gói 149k/tháng hoặc vĩnh viễn.\n"
+            "• Dịch vụ riêng: Nhận code & phát triển tools tự động hóa Facebook, Threads, TikTok, Shopee theo yêu cầu."
         )
-        grid_actions.addWidget(btn_action_comment, 0, 0)
+        lbl_bug.setWordWrap(True)
+        lbl_bug.setStyleSheet("color: #cbd5e1; font-size: 12.5px; line-height: 1.5; border: none;")
+        sup_info.addWidget(lbl_bug)
+        sup_row.addLayout(sup_info, 1)
 
-        # Action Card 2: Group Auto Poster
-        btn_action_post = self._create_action_card(
-            icon="🚀",
-            title="Đăng Bài Hàng Loạt Lên Nhóm FB",
-            desc="Đăng bài viết kèm ảnh/video lên hàng trăm hội nhóm Facebook theo lịch trình hẹn giờ, hỗ trợ đăng với tư cách Fanpage.",
-            btn_text="Mở Đăng Bài Nhóm  ➔",
-            color="#3b82f6",
-            handler=lambda: self.switch_tab_signal.emit("fb_poster")
-        )
-        grid_actions.addWidget(btn_action_post, 0, 1)
+        sup_btns = QVBoxLayout()
+        sup_btns.setSpacing(8)
 
-        # Action Card 3: Account Manager
-        btn_action_acc = self._create_action_card(
-            icon="👥",
-            title="Quản Lý Tài Khoản Facebook",
-            desc="Đăng nhập không giới hạn nick Facebook bằng Cookie hoặc mở trình duyệt trực tiếp 1 lần, lưu phiên làm việc tự động.",
-            btn_text="Quản Lý Tài Khoản  ➔",
-            color="#6366f1",
-            handler=lambda: self.switch_tab_signal.emit("fb_acc")
-        )
-        grid_actions.addWidget(btn_action_acc, 1, 0)
+        btn_zalo = QPushButton("💬 Nhắn Zalo Admin")
+        btn_zalo.setCursor(Qt.PointingHandCursor)
+        btn_zalo.setFixedSize(190, 38)
+        btn_zalo.setStyleSheet(self._btn_style("#059669", "#047857", "#ffffff"))
+        btn_zalo.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(ZALO_URL)))
+        sup_btns.addWidget(btn_zalo)
 
-        # Action Card 4: Threads Mass Post
-        btn_action_threads = self._create_action_card(
-            icon="📷",
-            title="Đăng Bài Tự Động Lên Threads",
-            desc="Tự động nuôi tài khoản và đăng bài viết, hình ảnh, bài bình luận hàng loạt lên nền tảng Instagram Threads.",
-            btn_text="Chuyển Sang Threads  ➔",
-            color="#f59e0b",
-            handler=lambda: self.switch_tab_signal.emit("threads")
-        )
-        grid_actions.addWidget(btn_action_threads, 1, 1)
+        btn_copy_zalo = QPushButton(f"📋 Copy SĐT: {ZALO_NUMBER}")
+        btn_copy_zalo.setCursor(Qt.PointingHandCursor)
+        btn_copy_zalo.setFixedSize(190, 36)
+        btn_copy_zalo.setStyleSheet(self._btn_style("#334155", "#475569", "#f8fafc"))
+        btn_copy_zalo.clicked.connect(lambda: self._copy_and_notify(ZALO_NUMBER, f"Đã copy số Zalo Admin: {ZALO_NUMBER}"))
+        sup_btns.addWidget(btn_copy_zalo)
 
-        main_layout.addLayout(grid_actions)
+        sup_btns.addStretch()
+        sup_row.addLayout(sup_btns)
+        sup_layout.addLayout(sup_row)
 
-        # -------------------------------------------------------------
-        # 4. HƯỚNG DẪN BẮT ĐẦU NHANH 3 BƯỚC
-        # -------------------------------------------------------------
-        guide_box = QFrame()
-        guide_box.setStyleSheet("""
-            QFrame {
-                background-color: #111625;
-                border: 1px solid #1e293b;
-                border-radius: 8px;
-                padding: 12px 16px;
-            }
-        """)
-        gb_layout = QVBoxLayout(guide_box)
-        gb_layout.setSpacing(6)
-
-        lbl_guide_title = QLabel("💡 Hướng dẫn bắt đầu nhanh:")
-        lbl_guide_title.setStyleSheet("color: #ffffff; font-weight: bold; font-size: 13px; border: none;")
-        gb_layout.addWidget(lbl_guide_title)
-
-        steps_text = QLabel(
-            "• Bước 1: Vào mục '👥 Quản lý tài khoản' để nạp Cookie hoặc mở trình duyệt đăng nhập tài khoản Facebook.\n"
-            "• Bước 2: Vào mục '💬 Auto Comment FB', chọn phương thức bình luận (theo Link bài viết, Nhóm hoặc Từ khóa) và soạn nội dung Spintax.\n"
-            "• Bước 3: Bấm nút '▶️ Bắt đầu chạy comment' để phần mềm tự động tương tác và bình luận an toàn."
-        )
-        steps_text.setStyleSheet("color: #94a3b8; font-size: 12px; line-height: 1.5; border: none;")
-        gb_layout.addWidget(steps_text)
-
-        main_layout.addWidget(guide_box)
+        main_layout.addWidget(support_card)
         main_layout.addStretch()
 
         self.refresh_stats()
 
-    def _create_stat_card(self, title: str, value: str, sub: str, accent_color: str) -> QFrame:
+    def _create_info_card(self, title: str, accent_color: str) -> QFrame:
         card = QFrame()
         card.setStyleSheet(f"""
             QFrame {{
                 background-color: #111625;
                 border: 1px solid #1e293b;
-                border-left: 4px solid {accent_color};
-                border-radius: 8px;
-                padding: 10px 14px;
+                border-top: 3px solid {accent_color};
+                border-radius: 10px;
+                padding: 14px 18px;
             }}
         """)
-        c_layout = QVBoxLayout(card)
-        c_layout.setSpacing(2)
+        layout = QVBoxLayout(card)
+        layout.setSpacing(8)
 
         lbl_t = QLabel(title)
-        lbl_t.setStyleSheet("color: #94a3b8; font-size: 12px; border: none;")
-        c_layout.addWidget(lbl_t)
-
-        lbl_v = QLabel(value)
-        lbl_v.setObjectName("val")
-        lbl_v.setStyleSheet(f"color: #ffffff; font-size: 20px; font-weight: bold; border: none; margin: 2px 0;")
-        c_layout.addWidget(lbl_v)
-
-        lbl_s = QLabel(sub)
-        lbl_s.setStyleSheet("color: #64748b; font-size: 11px; border: none;")
-        c_layout.addWidget(lbl_s)
+        lbl_t.setStyleSheet(f"color: {accent_color}; font-size: 13px; font-weight: bold; letter-spacing: 0.5px; border: none;")
+        layout.addWidget(lbl_t)
         return card
 
-    def _create_action_card(self, icon: str, title: str, desc: str, btn_text: str, color: str, handler) -> QFrame:
-        card = QFrame()
-        card.setStyleSheet("""
-            QFrame {
-                background-color: #111625;
-                border: 1px solid #1e293b;
-                border-radius: 8px;
-                padding: 12px 14px;
-            }
-            QFrame:hover {
-                border: 1px solid #334155;
-                background-color: #141c2e;
-            }
-        """)
-        c_layout = QVBoxLayout(card)
-        c_layout.setSpacing(6)
-
-        header_row = QHBoxLayout()
-        lbl_icon = QLabel(icon)
-        lbl_icon.setStyleSheet("font-size: 20px; border: none;")
-        header_row.addWidget(lbl_icon)
-
-        lbl_title = QLabel(title)
-        lbl_title.setStyleSheet("color: #ffffff; font-size: 13px; font-weight: bold; border: none;")
-        header_row.addWidget(lbl_title, 1)
-        c_layout.addLayout(header_row)
-
-        lbl_desc = QLabel(desc)
-        lbl_desc.setWordWrap(True)
-        lbl_desc.setStyleSheet("color: #94a3b8; font-size: 11px; border: none; min-height: 34px;")
-        c_layout.addWidget(lbl_desc)
-
-        btn = QPushButton(btn_text)
-        btn.setCursor(Qt.PointingHandCursor)
-        btn.setFixedHeight(32)
-        btn.setStyleSheet(f"""
+    def _btn_style(self, bg: str, hover_bg: str, fg: str) -> str:
+        return f"""
             QPushButton {{
-                background-color: #1e293b;
-                color: {color};
+                background-color: {bg};
+                color: {fg};
                 font-weight: bold;
-                border: 1px solid {color};
-                border-radius: 6px;
-                font-size: 11px;
+                font-size: 12px;
+                border: none;
+                border-radius: 7px;
+                padding: 0 12px;
             }}
             QPushButton:hover {{
-                background-color: {color};
-                color: #ffffff;
+                background-color: {hover_bg};
             }}
-        """)
-        btn.clicked.connect(handler)
-        c_layout.addWidget(btn)
+        """
 
-        return card
+    def _copy_and_notify(self, text: str, msg: str):
+        QApplication.clipboard().setText(text)
+        QMessageBox.information(self, "Thông báo", msg)
+
+    def _copy_machine_id(self):
+        mid = get_machine_id(self.db)
+        self._copy_and_notify(mid, f"Đã copy Mã Máy:\n{mid}")
+
+    def _open_license_dialog(self):
+        from ui.license_dialog import LicenseDialog
+        dlg = LicenseDialog(self.db, is_blocking=False, parent=self)
+        dlg.exec()
+        self.refresh_stats()
+        win = self.window()
+        if hasattr(win, "update_license_display"):
+            win.update_license_display()
 
     def refresh_stats(self):
         try:
-            fb_accs = len(self.db.get_accounts())
-            val_lbl = self.card_acc.findChild(QLabel, "val")
-            if val_lbl:
-                val_lbl.setText(f"{fb_accs} Tài khoản")
+            mid = get_machine_id(self.db)
+            self.lbl_lic_machine.setText(f"Mã máy: {mid}")
 
-            groups = len(self.db.get_groups())
-            val_lbl = self.card_groups.findChild(QLabel, "val")
-            if val_lbl:
-                val_lbl.setText(f"{groups} Nhóm")
+            cached = get_cached_license(self.db)
+            if not cached or cached.get("machine_id") != mid:
+                self.lbl_lic_status.setText("Trạng thái: ⚠️ Chưa kích hoạt bản quyền")
+                self.lbl_lic_status.setStyleSheet("color: #facc15; font-size: 14px; font-weight: bold; border: none;")
+                self.lbl_lic_expiry.setText("Thời hạn: Chưa có dữ liệu")
+                self.lbl_lic_key.setText("Key bản quyền: Chưa gán")
+                return
 
-            th_accs = len(self.db.get_threads_accounts())
-            val_lbl = self.card_threads.findChild(QLabel, "val")
-            if val_lbl:
-                val_lbl.setText(f"{th_accs} Tài khoản")
+            key = cached.get("license_key") or "--"
+            self.lbl_lic_key.setText(f"Key bản quyền: {key}")
+
+            status = (cached.get("status") or "").upper()
+            if status in ("BLOCKED", "KHÓA", "TẠM KHÓA", "REVOKED"):
+                self.lbl_lic_status.setText("Trạng thái: 🚫 Đã bị khóa")
+                self.lbl_lic_status.setStyleSheet("color: #f87171; font-size: 14px; font-weight: bold; border: none;")
+                self.lbl_lic_expiry.setText("Thời hạn: Vui lòng liên hệ Admin để mở khóa")
+                return
+
+            if status == "EXPIRED":
+                self.lbl_lic_status.setText("Trạng thái: 🔴 Đã hết hạn")
+                self.lbl_lic_status.setStyleSheet("color: #f87171; font-size: 14px; font-weight: bold; border: none;")
+                self.lbl_lic_expiry.setText(f"Thời hạn: {cached.get('expiry_display', 'Đã hết hạn')}")
+                return
+
+            _, is_valid, msg = parse_expiry_date(cached.get("expiry_raw", ""))
+            if not is_valid and cached.get("expiry_display"):
+                _, is_valid, msg = parse_expiry_date(cached.get("expiry_display", ""))
+
+            if is_valid:
+                self.lbl_lic_status.setText("Trạng thái: 🟢 Bản quyền đang hoạt động")
+                self.lbl_lic_status.setStyleSheet("color: #34d399; font-size: 14px; font-weight: bold; border: none;")
+                self.lbl_lic_expiry.setText(f"Thời hạn: {msg}")
+            else:
+                self.lbl_lic_status.setText("Trạng thái: 🔴 Bản quyền hết hạn / không hợp lệ")
+                self.lbl_lic_status.setStyleSheet("color: #f87171; font-size: 14px; font-weight: bold; border: none;")
+                self.lbl_lic_expiry.setText(f"Thời hạn: {msg}")
         except Exception:
             pass
