@@ -381,7 +381,7 @@ async function handleAutoRegister(request, env) {
         });
     }
 
-    // Máy mới cài đặt chưa có trên hệ thống -> Tự động sinh Key và lưu lên Web Admin (chờ Admin cấp hạn)
+    // Máy mới cài đặt chưa có trên hệ thống -> Tự động sinh Key và cấp 5 ngày dùng thử miễn phí
     const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
     const randPart = () => {
         let s = "";
@@ -390,21 +390,22 @@ async function handleAutoRegister(request, env) {
     };
     const newKey = `CWAI-${randPart()}-${randPart()}-${randPart()}`;
     const defaultCustomer = computerName ? `Máy mới: ${computerName}` : "Khách hàng mới";
+    const trialExpiry = new Date(Date.now() + 7 * 3600 * 1000 + 5 * 86400 * 1000).toISOString().slice(0, 10);
 
     await env.DB.prepare(`
         INSERT INTO licenses (license_key, machine_id, customer_name, expiry_date, status, last_verified_at, note)
-        VALUES (?, ?, ?, 'PENDING', 'PENDING', datetime('now', '+7 hours'), 'Tự động tạo khi cài máy mới')
-    `).bind(newKey, machineId, defaultCustomer).run();
+        VALUES (?, ?, ?, ?, 'ACTIVE', datetime('now', '+7 hours'), 'Dùng thử miễn phí 5 ngày')
+    `).bind(newKey, machineId, defaultCustomer, trialExpiry).run();
 
     return jsonResponse({
-        valid: false,
-        status: "PENDING",
+        valid: true,
+        status: "ACTIVE",
         license_key: newKey,
         machine_id: machineId,
-        expiry_raw: "PENDING",
-        expiry_display: "Chờ Admin kích hoạt",
+        expiry_raw: trialExpiry,
+        expiry_display: formatDMY(trialExpiry),
         customer_name: defaultCustomer,
-        message: "Thiết bị và Key mới đã được tự động tạo trên hệ thống. Vui lòng chờ Admin cấp thời hạn!"
+        message: `Đã tự động kích hoạt dùng thử miễn phí 5 ngày (đến ${formatDMY(trialExpiry)})!`
     });
 }
 
