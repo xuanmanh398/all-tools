@@ -1035,9 +1035,14 @@ async function renderDownloadAndGuidePage(env, url) {
     <main class="container py-5" style="max-width: 1100px;">
         <section id="tai-phan-mem">
             <div class="text-center mb-4">
-                <h1 class="fw-bold text-white display-6 mb-2">Tiết kiệm thời gian làm affiliate chỉ với 149k/tháng</h1>
+                <div class="d-inline-flex align-items-center gap-2 px-4 py-2 rounded-pill mb-3 shadow-lg" style="background: linear-gradient(90deg, #16a34a 0%, #eab308 100%); color: #052e16; font-weight: 800; font-size: 1.15rem; letter-spacing: 0.4px; border: 2px solid #fde047;">
+                    <span>🎁 DÙNG THỬ FREE 5 NGÀY</span>
+                    <span style="opacity: 0.75;">•</span>
+                    <span>TỰ ĐỘNG KÍCH HOẠT KHI CÀI ĐẶT</span>
+                </div>
+                <h1 class="fw-bold text-white display-6 mb-2">Tiết kiệm thời gian làm affiliate chỉ với <span style="color: #fde047;">149k/tháng</span></h1>
                 <p class="text-info fw-semibold fs-5 mb-1">Tự động đăng bài Group Facebook, Threads • Nhận phát triển tools theo yêu cầu</p>
-                <p class="text-secondary small">Cài đặt nhanh chóng - Dùng thử miễn phí 5 ngày - Hỗ trợ đa luồng Facebook & Threads</p>
+                <p class="text-light opacity-75 small">Cài đặt nhanh chóng - Hỗ trợ đa luồng Facebook & Threads - Kích hoạt tự động không cần chờ đợi</p>
             </div>
             ${heroHtml}
         </section>
