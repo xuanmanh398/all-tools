@@ -483,6 +483,7 @@ async function handleAdminFilesInit(request, env) {
     await ensureExtraTables(env);
 
     const body = await request.json().catch(() => ({}));
+    const replaceId = body.replace_id ? Number(body.replace_id) : null;
     const title = String(body.title || body.file_name || "").trim();
     const fileName = String(body.file_name || "file.bin").trim();
     const fileSize = Number(body.file_size || 0);
@@ -494,6 +495,28 @@ async function handleAdminFilesInit(request, env) {
 
     if (!title || !fileName || chunkCount <= 0) {
         return jsonResponse({ error: "Thiếu thông tin file hoặc số chunk không hợp lệ!" }, 400);
+    }
+
+    if (replaceId) {
+        const existing = await env.DB.prepare("SELECT storage_type, chunk_count FROM app_files WHERE id = ? LIMIT 1").bind(replaceId).all();
+        if (!existing.results || existing.results.length === 0) {
+            return jsonResponse({ error: "Không tìm thấy bản ghi file cần thay thế!" }, 404);
+        }
+        const oldRow = existing.results[0];
+        if (oldRow.storage_type === "kv" && env.FILES_KV) {
+            const oldCount = Number(oldRow.chunk_count || 0);
+            for (let i = 0; i < oldCount; i++) {
+                await env.FILES_KV.delete(`file_${replaceId}_chunk_${i}`).catch(() => {});
+            }
+        }
+        await env.DB.prepare(`
+            UPDATE app_files
+            SET title = ?, file_name = ?, file_size = ?, version = ?, category = ?, description = ?,
+                storage_type = 'kv', external_url = '', chunk_count = ?, content_type = ?, created_at = datetime('now', '+7 hours')
+            WHERE id = ?
+        `).bind(title, fileName, fileSize, version, category, description, chunkCount, contentType, replaceId).run();
+
+        return jsonResponse({ success: true, file_id: replaceId });
     }
 
     const res = await env.DB.prepare(`
@@ -1012,10 +1035,42 @@ async function renderDownloadAndGuidePage(env, url) {
     <main class="container py-5" style="max-width: 1100px;">
         <section id="tai-phan-mem">
             <div class="text-center mb-4">
-                <h1 class="fw-bold text-white display-6 mb-2">Tải Phần Mềm & Hướng Dẫn Sử Dụng</h1>
-                <p class="text-secondary">Cài đặt nhanh chóng - Kích hoạt tự động - Hỗ trợ đa luồng Facebook & Threads</p>
+                <h1 class="fw-bold text-white display-6 mb-2">Tiết kiệm thời gian làm affiliate chỉ với 149k/tháng</h1>
+                <p class="text-info fw-semibold fs-5 mb-1">Tự động đăng bài Group Facebook, Threads • Nhận phát triển tools theo yêu cầu</p>
+                <p class="text-secondary small">Cài đặt nhanh chóng - Dùng thử miễn phí 5 ngày - Hỗ trợ đa luồng Facebook & Threads</p>
             </div>
             ${heroHtml}
+        </section>
+
+        <section id="lien-he-zalo" class="mb-5">
+            <div class="card p-4" style="background: linear-gradient(135deg, rgba(6, 78, 59, 0.35) 0%, rgba(17, 24, 39, 0.96) 100%); border: 1px solid rgba(16, 185, 129, 0.45);">
+                <div class="row align-items-center g-4">
+                    <div class="col-md-8">
+                        <div class="d-flex align-items-center gap-2 mb-2">
+                            <span class="badge bg-success px-3 py-2">💬 HỖ TRỢ & CẤP KEY BẢN QUYỀN</span>
+                            <span class="badge bg-dark border border-success text-success px-3 py-2">Chỉ 149k/tháng</span>
+                        </div>
+                        <h4 class="fw-bold text-white mb-2">Zalo Quản Trị Viên: <span class="text-info">0963913615</span></h4>
+                        <p class="text-light opacity-75 mb-3">
+                            Quét mã QR hoặc bấm nút bên dưới để nhắn Zalo trực tiếp cho Admin kích hoạt bản quyền, gia hạn gói <strong>149k/tháng</strong> hoặc đặt làm <strong>tools tự động theo yêu cầu</strong>.
+                        </p>
+                        <div class="d-flex flex-wrap gap-2">
+                            <a href="https://zalo.me/0963913615" target="_blank" rel="noopener" class="btn btn-success fw-bold px-4 py-2">
+                                💬 Nhắn Zalo Ngay (0963913615)
+                            </a>
+                            <button type="button" class="btn btn-outline-light px-3 py-2" onclick="navigator.clipboard.writeText('0963913615').then(() => alert('Đã copy số Zalo: 0963913615'))">
+                                📋 Copy SĐT: 0963913615
+                            </button>
+                        </div>
+                    </div>
+                    <div class="col-md-4 text-center">
+                        <div class="d-inline-block bg-white p-3 rounded-3 shadow">
+                            <div id="zaloQrCode" style="width:160px;height:160px;display:flex;align-items:center;justify-content:center;"></div>
+                        </div>
+                        <div class="text-secondary small mt-2">Quét bằng Zalo để chat với Admin</div>
+                    </div>
+                </div>
+            </div>
         </section>
 
         ${filesGridHtml}
@@ -1029,9 +1084,29 @@ async function renderDownloadAndGuidePage(env, url) {
         </section>
 
         <footer class="text-center text-secondary small pt-4 border-top border-secondary border-opacity-25">
-            © 2026 Tools Marketing Platform • Hệ thống phân phối bản quyền & tài liệu chính thức
+            © 2026 Tools Marketing Platform • Zalo Admin: 0963913615 • Hệ thống phân phối bản quyền & tài liệu chính thức
         </footer>
     </main>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+    <script>
+        (function() {
+            const box = document.getElementById('zaloQrCode');
+            if (!box) return;
+            const zaloUrl = 'https://zalo.me/0963913615';
+            if (typeof QRCode !== 'undefined') {
+                new QRCode(box, {
+                    text: zaloUrl,
+                    width: 160,
+                    height: 160,
+                    colorDark: '#0f172a',
+                    colorLight: '#ffffff',
+                    correctLevel: QRCode.CorrectLevel.M
+                });
+            } else {
+                box.innerHTML = '<img src="https://api.qrserver.com/v1/create-qr-code/?size=160x160&data=' + encodeURIComponent(zaloUrl) + '" alt="QR Zalo 0963913615" width="160" height="160" style="display:block;">';
+            }
+        })();
+    </script>
 </body>
 </html>`;
 
@@ -1398,13 +1473,24 @@ function renderAdminWebPage(env) {
                         <input type="url" id="efExternalUrl" class="form-control">
                     </div>
                     <div class="mb-3">
+                        <label class="form-label">Thay thế tệp mới (tùy chọn - giữ nguyên lượt tải):</label>
+                        <input type="file" id="efReplaceFile" class="form-control">
+                        <div class="form-text text-secondary" id="efCurrentFileHint"></div>
+                        <div id="efProgressWrap" class="mt-2" style="display:none;">
+                            <div class="progress" style="height: 18px; background-color: #1f2937;">
+                                <div id="efProgressBar" class="progress-bar progress-bar-striped progress-bar-animated bg-info" style="width:0%">0%</div>
+                            </div>
+                            <small id="efProgressText" class="text-info d-block mt-1"></small>
+                        </div>
+                    </div>
+                    <div class="mb-3">
                         <label class="form-label">Mô tả:</label>
                         <textarea id="efDesc" class="form-control" rows="3"></textarea>
                     </div>
                 </div>
                 <div class="modal-footer border-secondary">
                     <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Hủy</button>
-                    <button type="button" class="btn btn-primary" onclick="submitEditFile()">💾 Lưu Thay Đổi</button>
+                    <button type="button" class="btn btn-primary" id="btnSubmitEditFile" onclick="submitEditFile()">💾 Lưu Thay Đổi</button>
                 </div>
             </div>
         </div>
@@ -1874,20 +1960,100 @@ function renderAdminWebPage(env) {
             document.getElementById('efCategory').value = f.category || 'software';
             document.getElementById('efExternalUrl').value = f.external_url || '';
             document.getElementById('efDesc').value = f.description || '';
+            document.getElementById('efReplaceFile').value = '';
+            document.getElementById('efCurrentFileHint').textContent = 'Tệp hiện tại: ' + (f.file_name || '--');
+            document.getElementById('efProgressWrap').style.display = 'none';
+            document.getElementById('efProgressBar').style.width = '0%';
+            document.getElementById('efProgressBar').textContent = '0%';
+            document.getElementById('efProgressText').textContent = '';
+            document.getElementById('btnSubmitEditFile').disabled = false;
             document.getElementById('efExternalWrap').style.display = f.storage_type === 'external' ? 'block' : 'none';
             if (!fileEditModalInstance) fileEditModalInstance = new bootstrap.Modal(document.getElementById('fileEditModal'));
             fileEditModalInstance.show();
         }
 
         async function submitEditFile() {
-            const data = {
-                id: parseInt(document.getElementById('efId').value),
-                title: document.getElementById('efTitle').value.trim(),
-                version: document.getElementById('efVersion').value.trim(),
-                category: document.getElementById('efCategory').value,
-                external_url: document.getElementById('efExternalUrl').value.trim(),
-                description: document.getElementById('efDesc').value.trim()
-            };
+            const id = parseInt(document.getElementById('efId').value);
+            const title = document.getElementById('efTitle').value.trim();
+            const version = document.getElementById('efVersion').value.trim();
+            const category = document.getElementById('efCategory').value;
+            const external_url = document.getElementById('efExternalUrl').value.trim();
+            const description = document.getElementById('efDesc').value.trim();
+            const replaceInput = document.getElementById('efReplaceFile');
+            const newFile = replaceInput && replaceInput.files ? replaceInput.files[0] : null;
+            const btn = document.getElementById('btnSubmitEditFile');
+
+            if (!title) {
+                alert('Vui lòng nhập Tên hiển thị!');
+                return;
+            }
+
+            if (newFile) {
+                const CHUNK_SIZE = 4 * 1024 * 1024;
+                const totalChunks = Math.ceil(newFile.size / CHUNK_SIZE) || 1;
+                const progWrap = document.getElementById('efProgressWrap');
+                const progBar = document.getElementById('efProgressBar');
+                const progText = document.getElementById('efProgressText');
+                progWrap.style.display = 'block';
+                btn.disabled = true;
+
+                try {
+                    progText.textContent = 'Đang khởi tạo thay thế file trên Cloudflare...';
+                    const initRes = await fetch('/api/admin/files/init', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json', 'X-Admin-Key': adminKey },
+                        body: JSON.stringify({
+                            replace_id: id,
+                            title: title,
+                            file_name: newFile.name,
+                            file_size: newFile.size,
+                            version: version,
+                            category: category,
+                            description: description,
+                            content_type: newFile.type || 'application/octet-stream',
+                            chunk_count: totalChunks
+                        })
+                    });
+                    const initJson = await initRes.json();
+                    if (!initJson.success) throw new Error(initJson.error || 'Lỗi khởi tạo thay thế file');
+
+                    for (let i = 0; i < totalChunks; i++) {
+                        const start = i * CHUNK_SIZE;
+                        const end = Math.min(start + CHUNK_SIZE, newFile.size);
+                        const slice = newFile.slice(start, end);
+                        progText.textContent = \`Đang tải lên phần \${i + 1}/\${totalChunks} (\${newFile.name})...\`;
+
+                        const chunkRes = await fetch(\`/api/admin/files/chunk?file_id=\${id}&chunk_index=\${i}\`, {
+                            method: 'POST',
+                            headers: { 'X-Admin-Key': adminKey },
+                            body: slice
+                        });
+                        const chunkJson = await chunkRes.json();
+                        if (!chunkJson.success) throw new Error(chunkJson.error || \`Lỗi upload phần \${i + 1}\`);
+
+                        const pct = Math.round(((i + 1) / totalChunks) * 100);
+                        progBar.style.width = pct + '%';
+                        progBar.textContent = pct + '%';
+                    }
+
+                    await fetch('/api/admin/files/complete', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json', 'X-Admin-Key': adminKey },
+                        body: JSON.stringify({ file_id: id })
+                    });
+
+                    if (fileEditModalInstance) fileEditModalInstance.hide();
+                    loadFiles();
+                    alert('✅ Đã thay thế tệp mới và cập nhật phiên bản thành công!');
+                } catch (e) {
+                    alert('❌ Lỗi thay thế tệp: ' + e.message);
+                } finally {
+                    btn.disabled = false;
+                }
+                return;
+            }
+
+            const data = { id, title, version, category, external_url, description };
             const res = await fetch('/api/admin/files/save-link', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json', 'X-Admin-Key': adminKey },
