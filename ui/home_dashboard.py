@@ -9,8 +9,10 @@ from core.license_manager import get_cached_license, get_machine_id, parse_expir
 
 
 WEBSITE_URL = "https://link.truyennha.id.vn/tai-va-huong-dan"
-ZALO_NUMBER = "0963913615"
-ZALO_URL = f"https://zalo.me/{ZALO_NUMBER}"
+ZALO_NUMBER_1 = "0963913615"
+ZALO_URL_1 = f"https://zalo.me/{ZALO_NUMBER_1}"
+ZALO_NUMBER_2 = "0373253745"
+ZALO_URL_2 = f"https://zalo.me/{ZALO_NUMBER_2}"
 
 
 class HomeDashboardTab(QWidget):
@@ -184,15 +186,15 @@ class HomeDashboardTab(QWidget):
         sup_info = QVBoxLayout()
         sup_info.setSpacing(6)
 
-        lbl_zalo = QLabel(f"💬 Zalo Quản Trị Viên: {ZALO_NUMBER}")
+        lbl_zalo = QLabel(f"💬 Zalo Quản Trị Viên: {ZALO_NUMBER_1}  •  {ZALO_NUMBER_2}")
         lbl_zalo.setTextInteractionFlags(Qt.TextSelectableByMouse)
         lbl_zalo.setStyleSheet("color: #34d399; font-size: 15px; font-weight: bold; border: none;")
         sup_info.addWidget(lbl_zalo)
 
         lbl_bug = QLabel(
-            "• Báo lỗi phần mềm: Vui lòng chụp ảnh màn hình lỗi kèm Mã Máy (Machine ID) gửi qua Zalo Admin để được xử lý nhanh nhất.\n"
-            "• Gia hạn / Nâng cấp bản quyền: Nhắn Mã Máy qua Zalo 0963913615 để kích hoạt gói 149k/tháng hoặc vĩnh viễn.\n"
-            "• Dịch vụ riêng: Nhận code & phát triển tools tự động hóa Facebook, Threads, TikTok, Shopee theo yêu cầu."
+            f"• Báo lỗi phần mềm: Vui lòng chụp ảnh màn hình lỗi kèm Mã Máy (Machine ID) gửi qua Zalo Admin để được xử lý nhanh nhất.\n"
+            f"• Gia hạn / Nâng cấp bản quyền: Quét QR tự động trong mục 'Quản Lý / Gia Hạn Key' hoặc nhắn Mã Máy qua Zalo {ZALO_NUMBER_1} / {ZALO_NUMBER_2}.\n"
+            f"• Dịch vụ riêng: Nhận code & phát triển tools tự động hóa Facebook, Threads, TikTok, Shopee theo yêu cầu."
         )
         lbl_bug.setWordWrap(True)
         lbl_bug.setStyleSheet("color: #cbd5e1; font-size: 12.5px; line-height: 1.5; border: none;")
@@ -202,18 +204,30 @@ class HomeDashboardTab(QWidget):
         sup_btns = QVBoxLayout()
         sup_btns.setSpacing(8)
 
-        btn_zalo = QPushButton("💬 Nhắn Zalo Admin")
-        btn_zalo.setCursor(Qt.PointingHandCursor)
-        btn_zalo.setFixedSize(190, 38)
-        btn_zalo.setStyleSheet(self._btn_style("#059669", "#047857", "#ffffff"))
-        btn_zalo.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(ZALO_URL)))
-        sup_btns.addWidget(btn_zalo)
+        btn_zalo1 = QPushButton(f"💬 Zalo Admin 1 ({ZALO_NUMBER_1})")
+        btn_zalo1.setCursor(Qt.PointingHandCursor)
+        btn_zalo1.setFixedSize(210, 34)
+        btn_zalo1.setStyleSheet(self._btn_style("#059669", "#047857", "#ffffff"))
+        btn_zalo1.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(ZALO_URL_1)))
+        sup_btns.addWidget(btn_zalo1)
 
-        btn_copy_zalo = QPushButton(f"📋 Copy SĐT: {ZALO_NUMBER}")
+        btn_zalo2 = QPushButton(f"💬 Zalo Admin 2 ({ZALO_NUMBER_2})")
+        btn_zalo2.setCursor(Qt.PointingHandCursor)
+        btn_zalo2.setFixedSize(210, 34)
+        btn_zalo2.setStyleSheet(self._btn_style("#0284c7", "#0369a1", "#ffffff"))
+        btn_zalo2.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(ZALO_URL_2)))
+        sup_btns.addWidget(btn_zalo2)
+
+        btn_copy_zalo = QPushButton("📋 Copy Cả 2 SĐT Admin")
         btn_copy_zalo.setCursor(Qt.PointingHandCursor)
-        btn_copy_zalo.setFixedSize(190, 36)
+        btn_copy_zalo.setFixedSize(210, 32)
         btn_copy_zalo.setStyleSheet(self._btn_style("#334155", "#475569", "#f8fafc"))
-        btn_copy_zalo.clicked.connect(lambda: self._copy_and_notify(ZALO_NUMBER, f"Đã copy số Zalo Admin: {ZALO_NUMBER}"))
+        btn_copy_zalo.clicked.connect(
+            lambda: self._copy_and_notify(
+                f"{ZALO_NUMBER_1} / {ZALO_NUMBER_2}",
+                f"Đã copy SĐT Zalo Admin:\n• Admin 1: {ZALO_NUMBER_1}\n• Admin 2: {ZALO_NUMBER_2}"
+            )
+        )
         sup_btns.addWidget(btn_copy_zalo)
 
         sup_btns.addStretch()

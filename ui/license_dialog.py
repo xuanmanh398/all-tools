@@ -1,10 +1,11 @@
 import os
+import requests
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
-    QPushButton, QFrame, QMessageBox, QApplication
+    QPushButton, QFrame, QMessageBox, QApplication, QComboBox
 )
 from PySide6.QtCore import Qt, QThread, Signal, QTimer
-from PySide6.QtGui import QFont, QClipboard, QIcon
+from PySide6.QtGui import QFont, QClipboard, QIcon, QPixmap
 from core.license_manager import (
     get_machine_id, verify_license_online, auto_register_machine,
     save_cached_license, get_cached_license, DEFAULT_SHEET_URL,
@@ -277,7 +278,23 @@ class LicenseDialog(QDialog):
         # Action Buttons ở Bottom
         main_layout.addStretch()
         bottom_row = QHBoxLayout()
-        bottom_row.setSpacing(12)
+        bottom_row.setSpacing(10)
+
+        self.btn_sepay = QPushButton("💳 Quét QR Gia Hạn (SePay)")
+        self.btn_sepay.setCursor(Qt.PointingHandCursor)
+        self.btn_sepay.setStyleSheet("""
+            QPushButton {
+                background-color: #059669;
+                color: #ffffff;
+                font-weight: bold;
+                border-radius: 6px;
+                padding: 8px 14px;
+            }
+            QPushButton:hover { background-color: #047857; }
+        """)
+        self.btn_sepay.clicked.connect(self.open_sepay_dialog)
+        bottom_row.addWidget(self.btn_sepay)
+
         bottom_row.addStretch()
 
         if self.is_blocking:
@@ -297,6 +314,12 @@ class LicenseDialog(QDialog):
             bottom_row.addWidget(self.btn_close)
 
         main_layout.addLayout(bottom_row)
+
+    def open_sepay_dialog(self):
+        dlg = SePayPaymentDialog(self.db, self.machine_id, parent=self)
+        if dlg.exec() == QDialog.Accepted:
+            self.load_current_status()
+            self.start_auto_register(silent=True)
 
     def copy_hwid(self):
         clipboard = QApplication.clipboard()
@@ -540,3 +563,264 @@ class LicenseDialog(QDialog):
             return
 
         super().accept()
+
+
+class SePayCreateOrderThread(QThread):
+    finished_signal = Signal(bool, dict, bytes, str)
+
+    def __init__(self, worker_url: str, machine_id: str, package_id: str):
+        super().__init__()
+        self.worker_url = worker_url.rstrip("/")
+        self.machine_id = machine_id
+        self.package_id = package_id
+
+    def run(self):
+        try:
+            res = requests.post(
+                f"{self.worker_url}/api/payment/create-order",
+                json={"machine_id": self.machine_id, "package_id": self.package_id},
+                timeout=15
+            )
+            data = res.json()
+            if not res.ok or not data.get("success"):
+                self.finished_signal.emit(False, data, b"", data.get("error", "Không thể tạo đơn thanh toán!"))
+                return
+
+            qr_bytes = b""
+            qr_url = data.get("qr_url", "")
+            if qr_url:
+                try:
+                    qr_res = requests.get(qr_url, timeout=15)
+                    if qr_res.ok:
+                        qr_bytes = qr_res.content
+                except Exception:
+                    pass
+
+            self.finished_signal.emit(True, data, qr_bytes, "")
+        except Exception as e:
+            self.finished_signal.emit(False, {}, b"", f"Lỗi kết nối máy chủ: {str(e)}")
+
+
+class SePayPollThread(QThread):
+    status_signal = Signal(bool, dict)
+
+    def __init__(self, worker_url: str, order_code: str):
+        super().__init__()
+        self.worker_url = worker_url.rstrip("/")
+        self.order_code = order_code
+
+    def run(self):
+        try:
+            res = requests.get(
+                f"{self.worker_url}/api/payment/status",
+                params={"order_code": self.order_code},
+                timeout=10
+            )
+            if res.ok:
+                data = res.json()
+                self.status_signal.emit(True, data)
+                return
+        except Exception:
+            pass
+        self.status_signal.emit(False, {})
+
+
+class SePayPaymentDialog(QDialog):
+    def __init__(self, db, machine_id: str, parent=None):
+        super().__init__(parent)
+        self.db = db
+        self.machine_id = machine_id
+        self.worker_url = DEFAULT_D1_WORKER_URL
+        self.current_order_code = None
+        self.create_thread = None
+        self.poll_thread = None
+
+        self.poll_timer = QTimer(self)
+        self.poll_timer.setInterval(3000)
+        self.poll_timer.timeout.connect(self.check_payment_status)
+
+        self.setWindowTitle("💳 Nạp & Gia Hạn Bản Quyền Tự Động (SePay)")
+        self.setFixedSize(480, 620)
+        self.setStyleSheet(DARK_DIALOG_QSS)
+        self.init_ui()
+        self.load_packages()
+
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(12)
+
+        title = QLabel("💳 QUÉT QR TỰ ĐỘNG GIA HẠN (SEPAY)")
+        title.setAlignment(Qt.AlignCenter)
+        title.setStyleSheet("font-size: 16px; font-weight: bold; color: #34d399;")
+        layout.addWidget(title)
+
+        sub = QLabel("Chọn gói và quét mã VietQR. Hệ thống tự động cộng ngày sau 3-5 giây khi chuyển khoản đúng nội dung.")
+        sub.setWordWrap(True)
+        sub.setAlignment(Qt.AlignCenter)
+        sub.setStyleSheet("font-size: 12px; color: #a6adc8;")
+        layout.addWidget(sub)
+
+        # Package selector
+        pkg_card = QFrame()
+        pkg_card.setProperty("class", "card")
+        pkg_layout = QHBoxLayout(pkg_card)
+        pkg_layout.setContentsMargins(12, 10, 12, 10)
+        pkg_layout.setSpacing(10)
+
+        self.cmb_pkg = QComboBox()
+        self.cmb_pkg.setStyleSheet("background-color: #11111b; border: 1px solid #45475a; border-radius: 6px; padding: 6px 10px; color: #cdd6f4;")
+        self.cmb_pkg.addItem("Gói 1 Tháng (30 ngày) - 149.000đ", "1m")
+        self.cmb_pkg.addItem("Gói 3 Tháng (90 ngày) - 399.000đ", "3m")
+        self.cmb_pkg.addItem("Gói 1 Năm (365 ngày) - 1.290.000đ", "1y")
+        pkg_layout.addWidget(self.cmb_pkg, 1)
+
+        self.btn_gen_qr = QPushButton("📲 Tạo Mã QR")
+        self.btn_gen_qr.setObjectName("btnPrimary")
+        self.btn_gen_qr.setCursor(Qt.PointingHandCursor)
+        self.btn_gen_qr.clicked.connect(self.create_order)
+        pkg_layout.addWidget(self.btn_gen_qr)
+        layout.addWidget(pkg_card)
+
+        # QR Box
+        qr_card = QFrame()
+        qr_card.setProperty("class", "card")
+        qr_layout = QVBoxLayout(qr_card)
+        qr_layout.setContentsMargins(14, 14, 14, 14)
+        qr_layout.setSpacing(8)
+        qr_layout.setAlignment(Qt.AlignCenter)
+
+        self.lbl_qr = QLabel("Bấm 'Tạo Mã QR' để hiển thị mã chuyển khoản")
+        self.lbl_qr.setFixedSize(230, 230)
+        self.lbl_qr.setAlignment(Qt.AlignCenter)
+        self.lbl_qr.setWordWrap(True)
+        self.lbl_qr.setStyleSheet("background-color: #11111b; border: 1px dashed #45475a; border-radius: 10px; color: #94a3b8; padding: 12px;")
+        qr_layout.addWidget(self.lbl_qr, 0, Qt.AlignCenter)
+
+        self.lbl_bank_info = QLabel("Ngân hàng: --\nSố tài khoản: --\nSố tiền: --")
+        self.lbl_bank_info.setAlignment(Qt.AlignCenter)
+        self.lbl_bank_info.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.lbl_bank_info.setStyleSheet("font-size: 12.5px; color: #cdd6f4; border: none;")
+        qr_layout.addWidget(self.lbl_bank_info)
+
+        des_row = QHBoxLayout()
+        self.lbl_order_code = QLabel("Nội dung CK: --")
+        self.lbl_order_code.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.lbl_order_code.setStyleSheet("font-size: 13px; font-weight: bold; color: #f9e2af; border: none;")
+        des_row.addWidget(self.lbl_order_code)
+
+        self.btn_copy_des = QPushButton("📋 Copy Nội Dung")
+        self.btn_copy_des.setEnabled(False)
+        self.btn_copy_des.setCursor(Qt.PointingHandCursor)
+        self.btn_copy_des.clicked.connect(self.copy_order_code)
+        des_row.addWidget(self.btn_copy_des)
+        qr_layout.addLayout(des_row)
+
+        self.lbl_poll_status = QLabel("⏳ Trạng thái: Chờ tạo đơn")
+        self.lbl_poll_status.setAlignment(Qt.AlignCenter)
+        self.lbl_poll_status.setStyleSheet("font-size: 12.5px; font-weight: bold; color: #fab387; border: none;")
+        qr_layout.addWidget(self.lbl_poll_status)
+
+        layout.addWidget(qr_card, 1)
+
+        btn_close = QPushButton("Đóng")
+        btn_close.clicked.connect(self.reject)
+        layout.addWidget(btn_close, 0, Qt.AlignRight)
+
+    def load_packages(self):
+        try:
+            r = requests.get(f"{self.worker_url}/api/payment/packages", timeout=5)
+            if r.ok:
+                j = r.json()
+                pkgs = j.get("packages") or []
+                if pkgs:
+                    self.cmb_pkg.clear()
+                    for p in pkgs:
+                        amt_str = f"{int(p.get('amount', 0)):,}".replace(",", ".")
+                        self.cmb_pkg.addItem(f"{p.get('label')} - {amt_str}đ", p.get("id"))
+        except Exception:
+            pass
+
+    def create_order(self):
+        self.poll_timer.stop()
+        self.btn_gen_qr.setEnabled(False)
+        self.lbl_poll_status.setText("⏳ Đang tạo mã QR thanh toán...")
+        self.lbl_poll_status.setStyleSheet("font-size: 12.5px; font-weight: bold; color: #fab387; border: none;")
+        pkg_id = self.cmb_pkg.currentData() or "1m"
+        self.create_thread = SePayCreateOrderThread(self.worker_url, self.machine_id, pkg_id)
+        self.create_thread.finished_signal.connect(self.on_order_created)
+        self.create_thread.start()
+
+    def on_order_created(self, ok: bool, data: dict, qr_bytes: bytes, err: str):
+        self.btn_gen_qr.setEnabled(True)
+        if not ok:
+            self.lbl_poll_status.setText(f"❌ {err}")
+            self.lbl_poll_status.setStyleSheet("font-size: 12px; font-weight: bold; color: #f38ba8; border: none;")
+            QMessageBox.warning(self, "Thông báo", err)
+            return
+
+        self.current_order_code = data.get("order_code")
+        amt = int(data.get("amount", 0))
+        amt_str = f"{amt:,}".replace(",", ".")
+        self.lbl_bank_info.setText(
+            f"Ngân hàng: {data.get('bank_code', '')}  •  STK: {data.get('bank_account', '')}\n"
+            f"Chủ TK: {data.get('bank_owner', '--')}\n"
+            f"Số tiền: {amt_str}đ  ({data.get('package_label', '')})"
+        )
+        self.lbl_order_code.setText(f"Nội dung CK: {self.current_order_code}")
+        self.btn_copy_des.setEnabled(True)
+
+        if qr_bytes:
+            pix = QPixmap()
+            if pix.loadFromData(qr_bytes):
+                self.lbl_qr.setStyleSheet("background-color: #ffffff; border-radius: 10px; padding: 6px;")
+                self.lbl_qr.setPixmap(pix.scaled(215, 215, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            else:
+                self.lbl_qr.setText("Không tải được ảnh QR.\nVui lòng chuyển khoản theo thông tin bên dưới.")
+        else:
+            self.lbl_qr.setText("Vui lòng chuyển khoản đúng thông tin bên dưới.")
+
+        self.lbl_poll_status.setText("🔄 Đang chờ thanh toán tự động (kiểm tra mỗi 3 giây)...")
+        self.lbl_poll_status.setStyleSheet("font-size: 12.5px; font-weight: bold; color: #89b4fa; border: none;")
+        self.poll_timer.start()
+
+    def copy_order_code(self):
+        if self.current_order_code:
+            QApplication.clipboard().setText(self.current_order_code)
+            self.btn_copy_des.setText("✅ Đã Copy!")
+            QTimer.singleShot(2000, lambda: self.btn_copy_des.setText("📋 Copy Nội Dung"))
+
+    def check_payment_status(self):
+        if not self.current_order_code:
+            return
+        if self.poll_thread and self.poll_thread.isRunning():
+            return
+        self.poll_thread = SePayPollThread(self.worker_url, self.current_order_code)
+        self.poll_thread.status_signal.connect(self.on_poll_result)
+        self.poll_thread.start()
+
+    def on_poll_result(self, ok: bool, data: dict):
+        if not ok:
+            return
+        if data.get("status") == "PAID":
+            self.poll_timer.stop()
+            self.lbl_poll_status.setText("🟢 Thanh toán thành công! Đã tự động gia hạn bản quyền!")
+            self.lbl_poll_status.setStyleSheet("font-size: 12.5px; font-weight: bold; color: #a6e3a1; border: none;")
+
+            lic = data.get("license") or {}
+            if lic:
+                lic["is_valid"] = True
+                save_cached_license(self.db, lic)
+
+            QMessageBox.information(
+                self,
+                "Gia Hạn Thành Công",
+                f"🎉 Đã nhận thanh toán cho đơn {self.current_order_code}!\n"
+                f"Bản quyền của bạn đã được tự động gia hạn (+{data.get('days_to_add', 30)} ngày).\n"
+                f"Hạn mới: {lic.get('expiry_display', '')}"
+            )
+            self.accept()
+
+    def closeEvent(self, event):
+        self.poll_timer.stop()
+        super().closeEvent(event)

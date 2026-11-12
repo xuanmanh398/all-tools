@@ -98,6 +98,26 @@ export default {
                 return await handleAdminGuidesDelete(request, env);
             }
 
+            // 5.5 API SEPAY & NẠP TỰ ĐỘNG BẢN QUYỀN
+            if (path === "/api/admin/sepay/settings") {
+                return await handleAdminSepaySettings(request, env);
+            }
+            if (path === "/api/admin/sepay/orders") {
+                return await handleAdminSepayOrders(request, env);
+            }
+            if (path === "/api/payment/packages") {
+                return await handlePaymentPackages(env);
+            }
+            if (path === "/api/payment/create-order" && request.method === "POST") {
+                return await handlePaymentCreateOrder(request, env);
+            }
+            if (path === "/api/payment/status") {
+                return await handlePaymentStatus(request, env);
+            }
+            if (path === "/api/sepay/webhook" && request.method === "POST") {
+                return await handleSepayWebhook(request, env);
+            }
+
             // 6. API CÔNG KHAI & TẢI FILE STREAMING
             if (path === "/api/public/resources") {
                 return await handlePublicResources(env);
@@ -163,6 +183,29 @@ async function ensureExtraTables(env) {
             sort_order INTEGER DEFAULT 0,
             is_active INTEGER DEFAULT 1,
             updated_at DATETIME DEFAULT (datetime('now', '+7 hours'))
+        )
+    `).run();
+
+    await env.DB.prepare(`
+        CREATE TABLE IF NOT EXISTS app_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT DEFAULT ''
+        )
+    `).run();
+
+    await env.DB.prepare(`
+        CREATE TABLE IF NOT EXISTS payment_orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_code TEXT UNIQUE NOT NULL,
+            machine_id TEXT NOT NULL,
+            license_key TEXT DEFAULT '',
+            package_id TEXT DEFAULT '1m',
+            amount INTEGER NOT NULL,
+            days_to_add INTEGER NOT NULL,
+            status TEXT DEFAULT 'PENDING',
+            sepay_tx_id TEXT DEFAULT '',
+            created_at DATETIME DEFAULT (datetime('now', '+7 hours')),
+            paid_at DATETIME DEFAULT NULL
         )
     `).run();
 
@@ -1049,30 +1092,52 @@ async function renderDownloadAndGuidePage(env, url) {
 
         <section id="lien-he-zalo" class="mb-5">
             <div class="card p-4" style="background: linear-gradient(135deg, rgba(6, 78, 59, 0.35) 0%, rgba(17, 24, 39, 0.96) 100%); border: 1px solid rgba(16, 185, 129, 0.45);">
-                <div class="row align-items-center g-4">
-                    <div class="col-md-8">
-                        <div class="d-flex align-items-center gap-2 mb-2">
+                <div class="d-flex flex-wrap align-items-center justify-content-between gap-2 mb-3">
+                    <div>
+                        <div class="d-flex align-items-center gap-2 mb-1">
                             <span class="badge bg-success px-3 py-2">💬 HỖ TRỢ & CẤP KEY BẢN QUYỀN</span>
                             <span class="badge bg-dark border border-success text-success px-3 py-2">Chỉ 149k/tháng</span>
                         </div>
-                        <h4 class="fw-bold text-white mb-2">Zalo Quản Trị Viên: <span class="text-info">0963913615</span></h4>
-                        <p class="text-light opacity-75 mb-3">
-                            Quét mã QR hoặc bấm nút bên dưới để nhắn Zalo trực tiếp cho Admin kích hoạt bản quyền, gia hạn gói <strong>149k/tháng</strong> hoặc đặt làm <strong>tools tự động theo yêu cầu</strong>.
-                        </p>
-                        <div class="d-flex flex-wrap gap-2">
-                            <a href="https://zalo.me/0963913615" target="_blank" rel="noopener" class="btn btn-success fw-bold px-4 py-2">
-                                💬 Nhắn Zalo Ngay (0963913615)
-                            </a>
-                            <button type="button" class="btn btn-outline-light px-3 py-2" onclick="navigator.clipboard.writeText('0963913615').then(() => alert('Đã copy số Zalo: 0963913615'))">
-                                📋 Copy SĐT: 0963913615
-                            </button>
+                        <h4 class="fw-bold text-white mb-0">Liên Hệ Zalo Quản Trị Viên</h4>
+                    </div>
+                    <div class="text-light opacity-75 small">
+                        Quét mã QR hoặc bấm nút bên dưới để nhắn Zalo kích hoạt bản quyền / đặt làm tools theo yêu cầu.
+                    </div>
+                </div>
+                <div class="row g-4">
+                    <div class="col-md-6">
+                        <div class="p-3 rounded-3 h-100 text-center" style="background: rgba(15, 23, 42, 0.72); border: 1px solid rgba(52, 211, 153, 0.3);">
+                            <div class="badge bg-primary mb-2 px-3 py-1">Admin 1 • Hỗ Trợ Chính</div>
+                            <h5 class="fw-bold text-info mb-3">Zalo: 0963913615</h5>
+                            <div class="d-inline-block bg-white p-3 rounded-3 shadow mb-3">
+                                <div id="zaloQrCode1" style="width:160px;height:160px;display:flex;align-items:center;justify-content:center;"></div>
+                            </div>
+                            <div class="d-flex justify-content-center flex-wrap gap-2">
+                                <a href="https://zalo.me/0963913615" target="_blank" rel="noopener" class="btn btn-success btn-sm fw-bold px-3 py-2">
+                                    💬 Nhắn Zalo (0963913615)
+                                </a>
+                                <button type="button" class="btn btn-outline-light btn-sm px-3 py-2" onclick="navigator.clipboard.writeText('0963913615').then(() => alert('Đã copy số Zalo: 0963913615'))">
+                                    📋 Copy SĐT
+                                </button>
+                            </div>
                         </div>
                     </div>
-                    <div class="col-md-4 text-center">
-                        <div class="d-inline-block bg-white p-3 rounded-3 shadow">
-                            <div id="zaloQrCode" style="width:160px;height:160px;display:flex;align-items:center;justify-content:center;"></div>
+                    <div class="col-md-6">
+                        <div class="p-3 rounded-3 h-100 text-center" style="background: rgba(15, 23, 42, 0.72); border: 1px solid rgba(52, 211, 153, 0.3);">
+                            <div class="badge bg-info text-dark mb-2 px-3 py-1">Admin 2 • Kỹ Thuật & Cấp Key</div>
+                            <h5 class="fw-bold text-info mb-3">Zalo: 0373253745</h5>
+                            <div class="d-inline-block bg-white p-3 rounded-3 shadow mb-3">
+                                <div id="zaloQrCode2" style="width:160px;height:160px;display:flex;align-items:center;justify-content:center;"></div>
+                            </div>
+                            <div class="d-flex justify-content-center flex-wrap gap-2">
+                                <a href="https://zalo.me/0373253745" target="_blank" rel="noopener" class="btn btn-success btn-sm fw-bold px-3 py-2">
+                                    💬 Nhắn Zalo (0373253745)
+                                </a>
+                                <button type="button" class="btn btn-outline-light btn-sm px-3 py-2" onclick="navigator.clipboard.writeText('0373253745').then(() => alert('Đã copy số Zalo: 0373253745'))">
+                                    📋 Copy SĐT
+                                </button>
+                            </div>
                         </div>
-                        <div class="text-secondary small mt-2">Quét bằng Zalo để chat với Admin</div>
                     </div>
                 </div>
             </div>
@@ -1089,27 +1154,32 @@ async function renderDownloadAndGuidePage(env, url) {
         </section>
 
         <footer class="text-center text-secondary small pt-4 border-top border-secondary border-opacity-25">
-            © 2026 Tools Marketing Platform • Zalo Admin: 0963913615 • Hệ thống phân phối bản quyền & tài liệu chính thức
+            © 2026 Tools Marketing Platform • Zalo Admin: 0963913615 &amp; 0373253745 • Hệ thống phân phối bản quyền & tài liệu chính thức
         </footer>
     </main>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
     <script>
         (function() {
-            const box = document.getElementById('zaloQrCode');
-            if (!box) return;
-            const zaloUrl = 'https://zalo.me/0963913615';
-            if (typeof QRCode !== 'undefined') {
-                new QRCode(box, {
-                    text: zaloUrl,
-                    width: 160,
-                    height: 160,
-                    colorDark: '#0f172a',
-                    colorLight: '#ffffff',
-                    correctLevel: QRCode.CorrectLevel.M
-                });
-            } else {
-                box.innerHTML = '<img src="https://api.qrserver.com/v1/create-qr-code/?size=160x160&data=' + encodeURIComponent(zaloUrl) + '" alt="QR Zalo 0963913615" width="160" height="160" style="display:block;">';
-            }
+            const items = [
+                { id: 'zaloQrCode1', phone: '0963913615', url: 'https://zalo.me/0963913615' },
+                { id: 'zaloQrCode2', phone: '0373253745', url: 'https://zalo.me/0373253745' }
+            ];
+            items.forEach(function(item) {
+                const box = document.getElementById(item.id);
+                if (!box) return;
+                if (typeof QRCode !== 'undefined') {
+                    new QRCode(box, {
+                        text: item.url,
+                        width: 160,
+                        height: 160,
+                        colorDark: '#0f172a',
+                        colorLight: '#ffffff',
+                        correctLevel: QRCode.CorrectLevel.M
+                    });
+                } else {
+                    box.innerHTML = '<img src="https://api.qrserver.com/v1/create-qr-code/?size=160x160&data=' + encodeURIComponent(item.url) + '" alt="QR Zalo ' + item.phone + '" width="160" height="160" style="display:block;">';
+                }
+            });
         })();
     </script>
 </body>
@@ -1207,6 +1277,11 @@ function renderAdminWebPage(env) {
             <li class="nav-item">
                 <button class="nav-link" id="tab-guides-btn" data-bs-toggle="tab" data-bs-target="#tab-guides" type="button" onclick="loadGuides()">
                     📖 Nội Dung Hướng Dẫn
+                </button>
+            </li>
+            <li class="nav-item">
+                <button class="nav-link" id="tab-sepay-btn" data-bs-toggle="tab" data-bs-target="#tab-sepay" type="button" onclick="loadSepayData()">
+                    💳 Nạp Tự Động (SePay)
                 </button>
             </li>
         </ul>
@@ -1371,6 +1446,90 @@ function renderAdminWebPage(env) {
                             </thead>
                             <tbody id="guidesTableBody">
                                 <tr><td colspan="5" class="text-center py-4">Bấm tab để tải hướng dẫn...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <!-- TAB 4: CẤU HÌNH SEPAY & ĐƠN NẠP TỰ ĐỘNG -->
+            <div class="tab-pane fade" id="tab-sepay">
+                <div class="row g-4 mb-4">
+                    <div class="col-lg-6">
+                        <div class="card p-4 h-100">
+                            <h5 class="text-white fw-bold mb-3">🏦 Cấu Hình Tài Khoản Nhận Tiền (SePay VietQR)</h5>
+                            <div class="row g-3">
+                                <div class="col-md-6">
+                                    <label class="form-label small">Mã Ngân Hàng (VD: MB, VCB, ACB, TCB):</label>
+                                    <input type="text" id="spBankCode" class="form-control" placeholder="VD: MB">
+                                </div>
+                                <div class="col-md-6">
+                                    <label class="form-label small">Số Tài Khoản Ngân Hàng:</label>
+                                    <input type="text" id="spBankAccount" class="form-control" placeholder="VD: 0963913615">
+                                </div>
+                                <div class="col-12">
+                                    <label class="form-label small">Tên Chủ Tài Khoản:</label>
+                                    <input type="text" id="spBankOwner" class="form-control" placeholder="VD: NGUYEN VAN A">
+                                </div>
+                                <div class="col-12">
+                                    <label class="form-label small">SePay Webhook API Key (để trống nếu không dùng Apikey):</label>
+                                    <input type="text" id="spApiKey" class="form-control" placeholder="Nhập API Key cấu hình trên SePay...">
+                                </div>
+                                <div class="col-md-4">
+                                    <label class="form-label small">Giá 1 Tháng (30 ngày):</label>
+                                    <input type="number" id="spPrice1m" class="form-control" value="149000">
+                                </div>
+                                <div class="col-md-4">
+                                    <label class="form-label small">Giá 3 Tháng (90 ngày):</label>
+                                    <input type="number" id="spPrice3m" class="form-control" value="399000">
+                                </div>
+                                <div class="col-md-4">
+                                    <label class="form-label small">Giá 1 Năm (365 ngày):</label>
+                                    <input type="number" id="spPrice1y" class="form-control" value="1290000">
+                                </div>
+                                <div class="col-12">
+                                    <button class="btn btn-primary w-100 fw-bold" onclick="saveSepaySettings()">💾 Lưu Cấu Hình SePay</button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="col-lg-6">
+                        <div class="card p-4 h-100">
+                            <h5 class="text-white fw-bold mb-3">🔗 Hướng Dẫn Kết Nối Webhook SePay</h5>
+                            <p class="text-secondary small">Dán đường dẫn Webhook dưới đây vào mục <strong>Tích hợp Webhook</strong> trên trang quản trị SePay để hệ thống tự động gia hạn bản quyền ngay khi khách chuyển khoản:</p>
+                            <div class="input-group mb-3">
+                                <input type="text" id="spWebhookUrl" class="form-control font-monospace text-info" readonly>
+                                <button class="btn btn-outline-info" onclick="navigator.clipboard.writeText(document.getElementById('spWebhookUrl').value).then(() => alert('Đã copy Webhook URL!'))">📋 Copy</button>
+                            </div>
+                            <ul class="small text-secondary mb-0">
+                                <li>Kiểu xác thực: <strong>API Key</strong> (nếu có nhập API Key ở bên trái) hoặc Không cần.</li>
+                                <li>Sự kiện bắn webhook: <strong>Tiền vào (In)</strong>.</li>
+                                <li>Khi khách quét mã QR trong phần mềm, hệ thống tạo mã đơn <code>CWAIxxxxxx</code>. Khi tiền vào khớp mã đơn, bản quyền tự động cộng ngày ngay lập tức!</li>
+                            </ul>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card shadow-sm">
+                    <div class="card-header border-secondary d-flex justify-content-between align-items-center">
+                        <h6 class="mb-0 text-white fw-bold">📜 Lịch Sử Đơn Nạp Tự Động (50 đơn gần nhất)</h6>
+                        <button class="btn btn-sm btn-outline-light" onclick="loadSepayData()">🔄 Tải Lại</button>
+                    </div>
+                    <div class="table-responsive">
+                        <table class="table table-hover align-middle mb-0">
+                            <thead class="table-dark">
+                                <tr>
+                                    <th>Mã Đơn</th>
+                                    <th>Mã Máy</th>
+                                    <th>Số Tiền</th>
+                                    <th>Số Ngày</th>
+                                    <th>Trạng Thái</th>
+                                    <th>Tạo Lúc</th>
+                                    <th>Thanh Toán Lúc</th>
+                                </tr>
+                            </thead>
+                            <tbody id="sepayOrdersBody">
+                                <tr><td colspan="7" class="text-center py-4">Bấm tab để tải đơn nạp...</td></tr>
                             </tbody>
                         </table>
                     </div>
@@ -1562,7 +1721,76 @@ function renderAdminWebPage(env) {
         }
 
         function reloadCurrentTab() {
-            loadData();
+            // ==================== SEPAY AUTO RENEWAL ====================
+        async function loadSepayData() {
+            const whEl = document.getElementById('spWebhookUrl');
+            if (whEl) whEl.value = window.location.origin + '/api/sepay/webhook';
+            try {
+                const sRes = await fetch('/api/admin/sepay/settings', { headers: { 'X-Admin-Key': adminKey } });
+                if (sRes.ok) {
+                    const sj = await sRes.json();
+                    const s = sj.data || {};
+                    document.getElementById('spBankCode').value = s.bank_code || '';
+                    document.getElementById('spBankAccount').value = s.bank_account || '';
+                    document.getElementById('spBankOwner').value = s.bank_owner || '';
+                    document.getElementById('spApiKey').value = s.sepay_api_key || '';
+                    document.getElementById('spPrice1m').value = s.price_1m || '149000';
+                    document.getElementById('spPrice3m').value = s.price_3m || '399000';
+                    document.getElementById('spPrice1y').value = s.price_1y || '1290000';
+                }
+            } catch (e) {}
+
+            const tbody = document.getElementById('sepayOrdersBody');
+            try {
+                const oRes = await fetch('/api/admin/sepay/orders', { headers: { 'X-Admin-Key': adminKey } });
+                if (oRes.status === 401) {
+                    tbody.innerHTML = '<tr><td colspan="7" class="text-center text-danger py-4">❌ Sai mật khẩu Admin!</td></tr>';
+                    return;
+                }
+                const oj = await oRes.json();
+                const list = oj.data || [];
+                if (list.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="7" class="text-center py-4 text-secondary">Chưa có đơn nạp tự động nào.</td></tr>';
+                    return;
+                }
+                tbody.innerHTML = list.map(o => \`<tr>
+                    <td><code class="text-info fw-bold">\${escHtml(o.order_code)}</code></td>
+                    <td><code class="text-secondary">\${escHtml(o.machine_id)}</code></td>
+                    <td class="fw-bold text-warning">\${Number(o.amount || 0).toLocaleString('vi-VN')}đ</td>
+                    <td>+\${o.days_to_add} ngày</td>
+                    <td>\${o.status === 'PAID' ? '<span class="badge bg-success">PAID</span>' : '<span class="badge bg-warning text-dark">PENDING</span>'}</td>
+                    <td class="small text-secondary">\${escHtml(o.created_at || '')}</td>
+                    <td class="small text-success">\${escHtml(o.paid_at || '--')}</td>
+                </tr>\`).join('');
+            } catch (e) {
+                tbody.innerHTML = '<tr><td colspan="7" class="text-center text-danger py-4">Lỗi: ' + e.message + '</td></tr>';
+            }
+        }
+
+        async function saveSepaySettings() {
+            const data = {
+                bank_code: document.getElementById('spBankCode').value.trim().toUpperCase(),
+                bank_account: document.getElementById('spBankAccount').value.trim(),
+                bank_owner: document.getElementById('spBankOwner').value.trim().toUpperCase(),
+                sepay_api_key: document.getElementById('spApiKey').value.trim(),
+                price_1m: document.getElementById('spPrice1m').value.trim() || '149000',
+                price_3m: document.getElementById('spPrice3m').value.trim() || '399000',
+                price_1y: document.getElementById('spPrice1y').value.trim() || '1290000'
+            };
+            const res = await fetch('/api/admin/sepay/settings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'X-Admin-Key': adminKey },
+                body: JSON.stringify(data)
+            });
+            const j = await res.json();
+            if (j.success) {
+                alert('✅ Đã lưu cấu hình SePay thành công!');
+            } else {
+                alert('❌ ' + (j.error || 'Lỗi lưu cấu hình!'));
+            }
+        }
+
+        loadData();
             loadFiles();
             loadGuides();
         }
@@ -1708,7 +1936,76 @@ function renderAdminWebPage(env) {
             const j = await res.json();
             if (j.success) {
                 if (modalInstance) modalInstance.hide();
-                loadData();
+                // ==================== SEPAY AUTO RENEWAL ====================
+        async function loadSepayData() {
+            const whEl = document.getElementById('spWebhookUrl');
+            if (whEl) whEl.value = window.location.origin + '/api/sepay/webhook';
+            try {
+                const sRes = await fetch('/api/admin/sepay/settings', { headers: { 'X-Admin-Key': adminKey } });
+                if (sRes.ok) {
+                    const sj = await sRes.json();
+                    const s = sj.data || {};
+                    document.getElementById('spBankCode').value = s.bank_code || '';
+                    document.getElementById('spBankAccount').value = s.bank_account || '';
+                    document.getElementById('spBankOwner').value = s.bank_owner || '';
+                    document.getElementById('spApiKey').value = s.sepay_api_key || '';
+                    document.getElementById('spPrice1m').value = s.price_1m || '149000';
+                    document.getElementById('spPrice3m').value = s.price_3m || '399000';
+                    document.getElementById('spPrice1y').value = s.price_1y || '1290000';
+                }
+            } catch (e) {}
+
+            const tbody = document.getElementById('sepayOrdersBody');
+            try {
+                const oRes = await fetch('/api/admin/sepay/orders', { headers: { 'X-Admin-Key': adminKey } });
+                if (oRes.status === 401) {
+                    tbody.innerHTML = '<tr><td colspan="7" class="text-center text-danger py-4">❌ Sai mật khẩu Admin!</td></tr>';
+                    return;
+                }
+                const oj = await oRes.json();
+                const list = oj.data || [];
+                if (list.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="7" class="text-center py-4 text-secondary">Chưa có đơn nạp tự động nào.</td></tr>';
+                    return;
+                }
+                tbody.innerHTML = list.map(o => \`<tr>
+                    <td><code class="text-info fw-bold">\${escHtml(o.order_code)}</code></td>
+                    <td><code class="text-secondary">\${escHtml(o.machine_id)}</code></td>
+                    <td class="fw-bold text-warning">\${Number(o.amount || 0).toLocaleString('vi-VN')}đ</td>
+                    <td>+\${o.days_to_add} ngày</td>
+                    <td>\${o.status === 'PAID' ? '<span class="badge bg-success">PAID</span>' : '<span class="badge bg-warning text-dark">PENDING</span>'}</td>
+                    <td class="small text-secondary">\${escHtml(o.created_at || '')}</td>
+                    <td class="small text-success">\${escHtml(o.paid_at || '--')}</td>
+                </tr>\`).join('');
+            } catch (e) {
+                tbody.innerHTML = '<tr><td colspan="7" class="text-center text-danger py-4">Lỗi: ' + e.message + '</td></tr>';
+            }
+        }
+
+        async function saveSepaySettings() {
+            const data = {
+                bank_code: document.getElementById('spBankCode').value.trim().toUpperCase(),
+                bank_account: document.getElementById('spBankAccount').value.trim(),
+                bank_owner: document.getElementById('spBankOwner').value.trim().toUpperCase(),
+                sepay_api_key: document.getElementById('spApiKey').value.trim(),
+                price_1m: document.getElementById('spPrice1m').value.trim() || '149000',
+                price_3m: document.getElementById('spPrice3m').value.trim() || '399000',
+                price_1y: document.getElementById('spPrice1y').value.trim() || '1290000'
+            };
+            const res = await fetch('/api/admin/sepay/settings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'X-Admin-Key': adminKey },
+                body: JSON.stringify(data)
+            });
+            const j = await res.json();
+            if (j.success) {
+                alert('✅ Đã lưu cấu hình SePay thành công!');
+            } else {
+                alert('❌ ' + (j.error || 'Lỗi lưu cấu hình!'));
+            }
+        }
+
+        loadData();
             } else {
                 alert(j.error || 'Lỗi khi lưu');
             }
@@ -1721,7 +2018,76 @@ function renderAdminWebPage(env) {
                 headers: { 'Content-Type': 'application/json', 'X-Admin-Key': adminKey },
                 body: JSON.stringify({ id })
             });
-            loadData();
+            // ==================== SEPAY AUTO RENEWAL ====================
+        async function loadSepayData() {
+            const whEl = document.getElementById('spWebhookUrl');
+            if (whEl) whEl.value = window.location.origin + '/api/sepay/webhook';
+            try {
+                const sRes = await fetch('/api/admin/sepay/settings', { headers: { 'X-Admin-Key': adminKey } });
+                if (sRes.ok) {
+                    const sj = await sRes.json();
+                    const s = sj.data || {};
+                    document.getElementById('spBankCode').value = s.bank_code || '';
+                    document.getElementById('spBankAccount').value = s.bank_account || '';
+                    document.getElementById('spBankOwner').value = s.bank_owner || '';
+                    document.getElementById('spApiKey').value = s.sepay_api_key || '';
+                    document.getElementById('spPrice1m').value = s.price_1m || '149000';
+                    document.getElementById('spPrice3m').value = s.price_3m || '399000';
+                    document.getElementById('spPrice1y').value = s.price_1y || '1290000';
+                }
+            } catch (e) {}
+
+            const tbody = document.getElementById('sepayOrdersBody');
+            try {
+                const oRes = await fetch('/api/admin/sepay/orders', { headers: { 'X-Admin-Key': adminKey } });
+                if (oRes.status === 401) {
+                    tbody.innerHTML = '<tr><td colspan="7" class="text-center text-danger py-4">❌ Sai mật khẩu Admin!</td></tr>';
+                    return;
+                }
+                const oj = await oRes.json();
+                const list = oj.data || [];
+                if (list.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="7" class="text-center py-4 text-secondary">Chưa có đơn nạp tự động nào.</td></tr>';
+                    return;
+                }
+                tbody.innerHTML = list.map(o => \`<tr>
+                    <td><code class="text-info fw-bold">\${escHtml(o.order_code)}</code></td>
+                    <td><code class="text-secondary">\${escHtml(o.machine_id)}</code></td>
+                    <td class="fw-bold text-warning">\${Number(o.amount || 0).toLocaleString('vi-VN')}đ</td>
+                    <td>+\${o.days_to_add} ngày</td>
+                    <td>\${o.status === 'PAID' ? '<span class="badge bg-success">PAID</span>' : '<span class="badge bg-warning text-dark">PENDING</span>'}</td>
+                    <td class="small text-secondary">\${escHtml(o.created_at || '')}</td>
+                    <td class="small text-success">\${escHtml(o.paid_at || '--')}</td>
+                </tr>\`).join('');
+            } catch (e) {
+                tbody.innerHTML = '<tr><td colspan="7" class="text-center text-danger py-4">Lỗi: ' + e.message + '</td></tr>';
+            }
+        }
+
+        async function saveSepaySettings() {
+            const data = {
+                bank_code: document.getElementById('spBankCode').value.trim().toUpperCase(),
+                bank_account: document.getElementById('spBankAccount').value.trim(),
+                bank_owner: document.getElementById('spBankOwner').value.trim().toUpperCase(),
+                sepay_api_key: document.getElementById('spApiKey').value.trim(),
+                price_1m: document.getElementById('spPrice1m').value.trim() || '149000',
+                price_3m: document.getElementById('spPrice3m').value.trim() || '399000',
+                price_1y: document.getElementById('spPrice1y').value.trim() || '1290000'
+            };
+            const res = await fetch('/api/admin/sepay/settings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'X-Admin-Key': adminKey },
+                body: JSON.stringify(data)
+            });
+            const j = await res.json();
+            if (j.success) {
+                alert('✅ Đã lưu cấu hình SePay thành công!');
+            } else {
+                alert('❌ ' + (j.error || 'Lỗi lưu cấu hình!'));
+            }
+        }
+
+        loadData();
         }
 
         async function deleteItem(id) {
@@ -1731,7 +2097,76 @@ function renderAdminWebPage(env) {
                 headers: { 'Content-Type': 'application/json', 'X-Admin-Key': adminKey },
                 body: JSON.stringify({ id })
             });
-            loadData();
+            // ==================== SEPAY AUTO RENEWAL ====================
+        async function loadSepayData() {
+            const whEl = document.getElementById('spWebhookUrl');
+            if (whEl) whEl.value = window.location.origin + '/api/sepay/webhook';
+            try {
+                const sRes = await fetch('/api/admin/sepay/settings', { headers: { 'X-Admin-Key': adminKey } });
+                if (sRes.ok) {
+                    const sj = await sRes.json();
+                    const s = sj.data || {};
+                    document.getElementById('spBankCode').value = s.bank_code || '';
+                    document.getElementById('spBankAccount').value = s.bank_account || '';
+                    document.getElementById('spBankOwner').value = s.bank_owner || '';
+                    document.getElementById('spApiKey').value = s.sepay_api_key || '';
+                    document.getElementById('spPrice1m').value = s.price_1m || '149000';
+                    document.getElementById('spPrice3m').value = s.price_3m || '399000';
+                    document.getElementById('spPrice1y').value = s.price_1y || '1290000';
+                }
+            } catch (e) {}
+
+            const tbody = document.getElementById('sepayOrdersBody');
+            try {
+                const oRes = await fetch('/api/admin/sepay/orders', { headers: { 'X-Admin-Key': adminKey } });
+                if (oRes.status === 401) {
+                    tbody.innerHTML = '<tr><td colspan="7" class="text-center text-danger py-4">❌ Sai mật khẩu Admin!</td></tr>';
+                    return;
+                }
+                const oj = await oRes.json();
+                const list = oj.data || [];
+                if (list.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="7" class="text-center py-4 text-secondary">Chưa có đơn nạp tự động nào.</td></tr>';
+                    return;
+                }
+                tbody.innerHTML = list.map(o => \`<tr>
+                    <td><code class="text-info fw-bold">\${escHtml(o.order_code)}</code></td>
+                    <td><code class="text-secondary">\${escHtml(o.machine_id)}</code></td>
+                    <td class="fw-bold text-warning">\${Number(o.amount || 0).toLocaleString('vi-VN')}đ</td>
+                    <td>+\${o.days_to_add} ngày</td>
+                    <td>\${o.status === 'PAID' ? '<span class="badge bg-success">PAID</span>' : '<span class="badge bg-warning text-dark">PENDING</span>'}</td>
+                    <td class="small text-secondary">\${escHtml(o.created_at || '')}</td>
+                    <td class="small text-success">\${escHtml(o.paid_at || '--')}</td>
+                </tr>\`).join('');
+            } catch (e) {
+                tbody.innerHTML = '<tr><td colspan="7" class="text-center text-danger py-4">Lỗi: ' + e.message + '</td></tr>';
+            }
+        }
+
+        async function saveSepaySettings() {
+            const data = {
+                bank_code: document.getElementById('spBankCode').value.trim().toUpperCase(),
+                bank_account: document.getElementById('spBankAccount').value.trim(),
+                bank_owner: document.getElementById('spBankOwner').value.trim().toUpperCase(),
+                sepay_api_key: document.getElementById('spApiKey').value.trim(),
+                price_1m: document.getElementById('spPrice1m').value.trim() || '149000',
+                price_3m: document.getElementById('spPrice3m').value.trim() || '399000',
+                price_1y: document.getElementById('spPrice1y').value.trim() || '1290000'
+            };
+            const res = await fetch('/api/admin/sepay/settings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'X-Admin-Key': adminKey },
+                body: JSON.stringify(data)
+            });
+            const j = await res.json();
+            if (j.success) {
+                alert('✅ Đã lưu cấu hình SePay thành công!');
+            } else {
+                alert('❌ ' + (j.error || 'Lỗi lưu cấu hình!'));
+            }
+        }
+
+        loadData();
         }
 
         function generateRandomKey() {
@@ -2169,6 +2604,75 @@ function renderAdminWebPage(env) {
             loadGuides();
         }
 
+        // ==================== SEPAY AUTO RENEWAL ====================
+        async function loadSepayData() {
+            const whEl = document.getElementById('spWebhookUrl');
+            if (whEl) whEl.value = window.location.origin + '/api/sepay/webhook';
+            try {
+                const sRes = await fetch('/api/admin/sepay/settings', { headers: { 'X-Admin-Key': adminKey } });
+                if (sRes.ok) {
+                    const sj = await sRes.json();
+                    const s = sj.data || {};
+                    document.getElementById('spBankCode').value = s.bank_code || '';
+                    document.getElementById('spBankAccount').value = s.bank_account || '';
+                    document.getElementById('spBankOwner').value = s.bank_owner || '';
+                    document.getElementById('spApiKey').value = s.sepay_api_key || '';
+                    document.getElementById('spPrice1m').value = s.price_1m || '149000';
+                    document.getElementById('spPrice3m').value = s.price_3m || '399000';
+                    document.getElementById('spPrice1y').value = s.price_1y || '1290000';
+                }
+            } catch (e) {}
+
+            const tbody = document.getElementById('sepayOrdersBody');
+            try {
+                const oRes = await fetch('/api/admin/sepay/orders', { headers: { 'X-Admin-Key': adminKey } });
+                if (oRes.status === 401) {
+                    tbody.innerHTML = '<tr><td colspan="7" class="text-center text-danger py-4">❌ Sai mật khẩu Admin!</td></tr>';
+                    return;
+                }
+                const oj = await oRes.json();
+                const list = oj.data || [];
+                if (list.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="7" class="text-center py-4 text-secondary">Chưa có đơn nạp tự động nào.</td></tr>';
+                    return;
+                }
+                tbody.innerHTML = list.map(o => \`<tr>
+                    <td><code class="text-info fw-bold">\${escHtml(o.order_code)}</code></td>
+                    <td><code class="text-secondary">\${escHtml(o.machine_id)}</code></td>
+                    <td class="fw-bold text-warning">\${Number(o.amount || 0).toLocaleString('vi-VN')}đ</td>
+                    <td>+\${o.days_to_add} ngày</td>
+                    <td>\${o.status === 'PAID' ? '<span class="badge bg-success">PAID</span>' : '<span class="badge bg-warning text-dark">PENDING</span>'}</td>
+                    <td class="small text-secondary">\${escHtml(o.created_at || '')}</td>
+                    <td class="small text-success">\${escHtml(o.paid_at || '--')}</td>
+                </tr>\`).join('');
+            } catch (e) {
+                tbody.innerHTML = '<tr><td colspan="7" class="text-center text-danger py-4">Lỗi: ' + e.message + '</td></tr>';
+            }
+        }
+
+        async function saveSepaySettings() {
+            const data = {
+                bank_code: document.getElementById('spBankCode').value.trim().toUpperCase(),
+                bank_account: document.getElementById('spBankAccount').value.trim(),
+                bank_owner: document.getElementById('spBankOwner').value.trim().toUpperCase(),
+                sepay_api_key: document.getElementById('spApiKey').value.trim(),
+                price_1m: document.getElementById('spPrice1m').value.trim() || '149000',
+                price_3m: document.getElementById('spPrice3m').value.trim() || '399000',
+                price_1y: document.getElementById('spPrice1y').value.trim() || '1290000'
+            };
+            const res = await fetch('/api/admin/sepay/settings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'X-Admin-Key': adminKey },
+                body: JSON.stringify(data)
+            });
+            const j = await res.json();
+            if (j.success) {
+                alert('✅ Đã lưu cấu hình SePay thành công!');
+            } else {
+                alert('❌ ' + (j.error || 'Lỗi lưu cấu hình!'));
+            }
+        }
+
         loadData();
     </script>
 </body>
@@ -2337,4 +2841,221 @@ async function handleRedirectShortLink(code, env, request) {
             "Cache-Control": "no-cache, no-store, must-revalidate"
         }
     });
+}
+
+// =============================================================
+// SEPAY AUTO-RENEWAL & PAYMENT HANDLERS
+// =============================================================
+async function getSepaySettingsMap(env) {
+    await ensureExtraTables(env);
+    const { results } = await env.DB.prepare("SELECT key, value FROM app_settings").all();
+    const map = {
+        bank_code: "",
+        bank_account: "",
+        bank_owner: "",
+        sepay_api_key: "",
+        price_1m: "149000",
+        price_3m: "399000",
+        price_1y: "1290000"
+    };
+    for (const r of (results || [])) {
+        if (r.key) map[r.key] = r.value || "";
+    }
+    return map;
+}
+
+async function handleAdminSepaySettings(request, env) {
+    if (!checkAdminAuth(request, env)) return jsonResponse({ error: "Unauthorized" }, 401);
+    if (request.method === "GET") {
+        const data = await getSepaySettingsMap(env);
+        return jsonResponse({ success: true, data });
+    }
+    if (request.method === "POST") {
+        await ensureExtraTables(env);
+        const body = await request.json().catch(() => ({}));
+        const keys = ["bank_code", "bank_account", "bank_owner", "sepay_api_key", "price_1m", "price_3m", "price_1y"];
+        for (const k of keys) {
+            if (body[k] !== undefined) {
+                await env.DB.prepare(
+                    "INSERT INTO app_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+                ).bind(k, String(body[k] || "").trim()).run();
+            }
+        }
+        return jsonResponse({ success: true, message: "Đã lưu cấu hình SePay!" });
+    }
+    return jsonResponse({ error: "Method not allowed" }, 405);
+}
+
+async function handleAdminSepayOrders(request, env) {
+    if (!checkAdminAuth(request, env)) return jsonResponse({ error: "Unauthorized" }, 401);
+    await ensureExtraTables(env);
+    const { results } = await env.DB.prepare("SELECT * FROM payment_orders ORDER BY id DESC LIMIT 50").all();
+    return jsonResponse({ success: true, data: results || [] });
+}
+
+async function handlePaymentPackages(env) {
+    const s = await getSepaySettingsMap(env);
+    return jsonResponse({
+        success: true,
+        configured: Boolean(s.bank_code && s.bank_account),
+        packages: [
+            { id: "1m", label: "Gói 1 Tháng (30 ngày)", days: 30, amount: Number(s.price_1m || 149000) },
+            { id: "3m", label: "Gói 3 Tháng (90 ngày)", days: 90, amount: Number(s.price_3m || 399000) },
+            { id: "1y", label: "Gói 1 Năm (365 ngày)", days: 365, amount: Number(s.price_1y || 1290000) }
+        ]
+    });
+}
+
+async function handlePaymentCreateOrder(request, env) {
+    const body = await request.json().catch(() => ({}));
+    const machineId = String(body.machine_id || "").trim();
+    const packageId = String(body.package_id || "1m").trim();
+    if (!machineId) return jsonResponse({ success: false, error: "Thiếu machine_id!" }, 400);
+
+    const s = await getSepaySettingsMap(env);
+    if (!s.bank_code || !s.bank_account) {
+        return jsonResponse({
+            success: false,
+            error: "Admin chưa cấu hình tài khoản ngân hàng SePay trên Web Admin. Vui lòng liên hệ Zalo Admin để kích hoạt!"
+        }, 400);
+    }
+
+    const pkgMap = {
+        "1m": { label: "Gói 1 Tháng (30 ngày)", days: 30, amount: Number(s.price_1m || 149000) },
+        "3m": { label: "Gói 3 Tháng (90 ngày)", days: 90, amount: Number(s.price_3m || 399000) },
+        "1y": { label: "Gói 1 Năm (365 ngày)", days: 365, amount: Number(s.price_1y || 1290000) }
+    };
+    const pkg = pkgMap[packageId] || pkgMap["1m"];
+
+    const digits = "0123456789ABCDEFGHJKLMNPQRSTUVWXYZ";
+    let randCode = "";
+    for (let i = 0; i < 6; i++) randCode += digits.charAt(Math.floor(Math.random() * digits.length));
+    const orderCode = `CWAI${randCode}`;
+
+    const licRes = await env.DB.prepare("SELECT license_key FROM licenses WHERE machine_id = ? LIMIT 1").bind(machineId).all();
+    const existingKey = (licRes.results && licRes.results[0]) ? licRes.results[0].license_key : "";
+
+    await env.DB.prepare(`
+        INSERT INTO payment_orders (order_code, machine_id, license_key, package_id, amount, days_to_add, status, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, 'PENDING', datetime('now', '+7 hours'))
+    `).bind(orderCode, machineId, existingKey, packageId, pkg.amount, pkg.days).run();
+
+    const qrUrl = `https://qr.sepay.vn/img?acc=${encodeURIComponent(s.bank_account)}&bank=${encodeURIComponent(s.bank_code)}&amount=${pkg.amount}&des=${encodeURIComponent(orderCode)}`;
+
+    return jsonResponse({
+        success: true,
+        order_code: orderCode,
+        amount: pkg.amount,
+        days_to_add: pkg.days,
+        package_label: pkg.label,
+        bank_code: s.bank_code,
+        bank_account: s.bank_account,
+        bank_owner: s.bank_owner,
+        qr_url: qrUrl
+    });
+}
+
+async function handlePaymentStatus(request, env) {
+    await ensureExtraTables(env);
+    const url = new URL(request.url);
+    const orderCode = String(url.searchParams.get("order_code") || "").trim().toUpperCase();
+    if (!orderCode) return jsonResponse({ success: false, error: "Thiếu order_code!" }, 400);
+
+    const { results } = await env.DB.prepare("SELECT * FROM payment_orders WHERE order_code = ? LIMIT 1").bind(orderCode).all();
+    if (!results || results.length === 0) {
+        return jsonResponse({ success: false, error: "Không tìm thấy đơn hàng!" }, 404);
+    }
+    const order = results[0];
+    let licenseInfo = null;
+    if (order.status === "PAID") {
+        const licRes = await env.DB.prepare("SELECT * FROM licenses WHERE machine_id = ? LIMIT 1").bind(order.machine_id).all();
+        if (licRes.results && licRes.results[0]) {
+            const row = licRes.results[0];
+            licenseInfo = {
+                valid: true,
+                status: row.status,
+                license_key: row.license_key,
+                machine_id: row.machine_id,
+                expiry_raw: row.expiry_date,
+                expiry_display: formatDMY(row.expiry_date),
+                customer_name: row.customer_name || ""
+            };
+        }
+    }
+    return jsonResponse({
+        success: true,
+        order_code: order.order_code,
+        status: order.status,
+        amount: order.amount,
+        days_to_add: order.days_to_add,
+        paid_at: order.paid_at,
+        license: licenseInfo
+    });
+}
+
+async function handleSepayWebhook(request, env) {
+    const s = await getSepaySettingsMap(env);
+    if (s.sepay_api_key) {
+        const auth = request.headers.get("Authorization") || "";
+        const token = auth.replace(/^(Apikey|Bearer)\s+/i, "").trim();
+        if (token !== s.sepay_api_key) {
+            return jsonResponse({ success: false, error: "Invalid SePay API Key" }, 401);
+        }
+    }
+
+    const body = await request.json().catch(() => ({}));
+    if (body.transferType && String(body.transferType).toLowerCase() !== "in") {
+        return jsonResponse({ success: true, message: "Ignored outgoing transfer" });
+    }
+
+    const content = `${body.code || ""} ${body.content || ""} ${body.description || ""}`.toUpperCase();
+    const amount = Number(body.transferAmount || 0);
+    const txId = String(body.id || body.referenceCode || "");
+
+    const { results } = await env.DB.prepare("SELECT * FROM payment_orders WHERE status = 'PENDING' ORDER BY id DESC LIMIT 100").all();
+    const pendingOrders = results || [];
+    const matched = pendingOrders.find(o => content.includes(String(o.order_code || "").toUpperCase()) && amount >= Number(o.amount || 0));
+
+    if (!matched) {
+        return jsonResponse({ success: true, message: "No matching pending order" });
+    }
+
+    await env.DB.prepare(
+        "UPDATE payment_orders SET status = 'PAID', sepay_tx_id = ?, paid_at = datetime('now', '+7 hours') WHERE id = ?"
+    ).bind(txId, matched.id).run();
+
+    // Gia hạn hoặc kích hoạt bản quyền cho machine_id
+    const todayIso = getVietnamDateString();
+    const licRes = await env.DB.prepare("SELECT * FROM licenses WHERE machine_id = ? LIMIT 1").bind(matched.machine_id).all();
+    if (licRes.results && licRes.results.length > 0) {
+        const row = licRes.results[0];
+        const curExp = String(row.expiry_date || "").trim().toUpperCase();
+        if (curExp === "LIFETIME") {
+            await env.DB.prepare("UPDATE licenses SET status = 'ACTIVE', note = ? WHERE id = ?")
+                .bind(`Gia hạn SePay ${matched.order_code}`, row.id).run();
+        } else {
+            const baseDateStr = (curExp >= todayIso && /^\d{4}-\d{2}-\d{2}$/.test(curExp)) ? curExp : todayIso;
+            const baseMs = Date.parse(baseDateStr + "T00:00:00Z");
+            const newExpiry = new Date(baseMs + Number(matched.days_to_add) * 86400 * 1000).toISOString().slice(0, 10);
+            await env.DB.prepare(
+                "UPDATE licenses SET expiry_date = ?, status = 'ACTIVE', last_verified_at = datetime('now', '+7 hours'), note = ? WHERE id = ?"
+            ).bind(newExpiry, `Gia hạn SePay ${matched.order_code} (+${matched.days_to_add} ngày)`, row.id).run();
+        }
+    } else {
+        const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+        const randPart = () => {
+            let str = "";
+            for (let i = 0; i < 4; i++) str += chars.charAt(Math.floor(Math.random() * chars.length));
+            return str;
+        };
+        const newKey = `CWAI-${randPart()}-${randPart()}-${randPart()}`;
+        const baseMs = Date.parse(todayIso + "T00:00:00Z");
+        const newExpiry = new Date(baseMs + Number(matched.days_to_add) * 86400 * 1000).toISOString().slice(0, 10);
+        await env.DB.prepare(`
+            INSERT INTO licenses (license_key, machine_id, customer_name, expiry_date, status, last_verified_at, note)
+            VALUES (?, ?, 'Khách nạp SePay', ?, 'ACTIVE', datetime('now', '+7 hours'), ?)
+        `).bind(newKey, matched.machine_id, newExpiry, `Nạp SePay ${matched.order_code} (+${matched.days_to_add} ngày)`).run();
+    }
+
+    return jsonResponse({ success: true, message: `Đã gia hạn tự động cho đơn ${matched.order_code}` });
 }
