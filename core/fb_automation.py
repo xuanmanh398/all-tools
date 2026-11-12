@@ -1587,11 +1587,12 @@ class FBAutomationEngine:
 
                 page.on("filechooser", _intercept_file_chooser)
                 try:
-                    # Hàm kiểm tra nghiêm ngặt xem media đã thực sự hiển thị trong hộp thoại chưa
+                    # Hàm tìm dialog soạn bài viết đang mở (tránh nhầm dialog ẩn khác trên Facebook)
                     async def is_real_media_mounted() -> bool:
                         try:
                             return await page.evaluate("""() => {
-                                const dlg = document.querySelector("div[role='dialog']");
+                                const dialogs = Array.from(document.querySelectorAll("div[role='dialog']"));
+                                const dlg = dialogs.reverse().find(d => d.querySelector("div[role='textbox'][contenteditable='true'], div[contenteditable='true']")) || document.querySelector("div[role='dialog']");
                                 if (!dlg) return false;
 
                                 // 1. Thẻ video HTML5
@@ -1660,7 +1661,8 @@ class FBAutomationEngine:
                         if not photo_btn:
                             # Tìm nút đầu tiên trong thanh "Thêm vào bài viết của bạn"
                             photo_btn_handle = await page.evaluate_handle("""() => {
-                                const dlg = document.querySelector("div[role='dialog']");
+                                const dialogs = Array.from(document.querySelectorAll("div[role='dialog']"));
+                                const dlg = dialogs.reverse().find(d => d.querySelector("div[role='textbox'][contenteditable='true'], div[contenteditable='true']")) || document.querySelector("div[role='dialog']");
                                 if (!dlg) return null;
                                 const allElems = Array.from(dlg.querySelectorAll("span, div, p"));
                                 const labelElem = allElems.find(el => {
@@ -1703,15 +1705,19 @@ class FBAutomationEngine:
                                 }""", photo_btn)
                                 await asyncio.sleep(1.5)
 
-                    # Nếu filechooser đã tự bắt được ở Bước 1, chờ tối đa 6s để media hiển thị (tránh nạp trùng)
+                    # Đảm bảo chỉ nạp tệp ĐÚNG 1 LẦN duy nhất (tránh chọn trùng nhiều lần)
+                    _media_submitted = False
+
+                    # Nếu filechooser đã tự bắt được ở Bước 1, chờ tối đa 20s để media hiển thị (tuyệt đối không nạp lại)
                     if _fc_state["handled"]:
-                        for _ in range(12):
+                        _media_submitted = True
+                        for _ in range(40):
                             await asyncio.sleep(0.5)
                             if await is_real_media_mounted():
                                 break
 
-                    # BƯỚC 2: Nạp tệp ĐÚNG 1 LẦN qua thẻ input[type='file'] chính trong dialog (tuyệt đối không lặp gây chọn nhiều lần)
-                    if not (await is_real_media_mounted()):
+                    # BƯỚC 2: Chỉ nạp qua input[type='file'] nếu filechooser chưa nạp ở Bước 1
+                    if not _media_submitted and not (await is_real_media_mounted()):
                         for _ in range(6):
                             if await page.query_selector("div[role='dialog'] input[type='file']"):
                                 break
@@ -1725,29 +1731,31 @@ class FBAutomationEngine:
                         if target_input:
                             try:
                                 await target_input.set_input_files(valid_files)
-                                # Chờ tối đa 6s để Facebook render preview đầy đủ
-                                for _ in range(12):
+                                _media_submitted = True
+                                # Chờ tối đa 20s để Facebook render preview đầy đủ (không nạp lại vào input khác)
+                                for _ in range(40):
                                     await asyncio.sleep(0.5)
                                     if await is_real_media_mounted():
                                         break
                             except Exception:
                                 pass
 
-                        # Nếu input cuối chưa ăn sau 6s và dialog có input khác, thử input còn lại đúng 1 lần
-                        if not (await is_real_media_mounted()) and len(all_inputs) > 1:
+                        # Chỉ thử input khác nếu target_input bị lỗi ngoại lệ chưa nạp được
+                        if not _media_submitted and not (await is_real_media_mounted()) and len(all_inputs) > 1:
                             fallback_input = all_inputs[0] if all_inputs[0] != target_input else None
                             if fallback_input:
                                 try:
                                     await fallback_input.set_input_files(valid_files)
-                                    for _ in range(10):
+                                    _media_submitted = True
+                                    for _ in range(30):
                                         await asyncio.sleep(0.5)
                                         if await is_real_media_mounted():
                                             break
                                 except Exception:
                                     pass
 
-                    # Cách 2b: Chỉ dùng paste Clipboard nếu sau bước trên vẫn hoàn toàn chưa có ảnh nào
-                    if not has_video and not (await is_real_media_mounted()):
+                    # Cách 2b: Chỉ dùng paste Clipboard nếu chưa nạp được qua filechooser hay input[type='file']
+                    if not _media_submitted and not has_video and not (await is_real_media_mounted()):
                         for media_path in valid_files:
                             ext = os.path.splitext(media_path)[1].lower()
                             if ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp']:
@@ -1801,27 +1809,30 @@ class FBAutomationEngine:
                         pass
                     return False
 
-            # Cuộn ô nhập văn bản vào giữa khung hình, focus và nhập nội dung bài viết
+            # Cuộn ô nhập văn bản vào giữa khung hình, click đúng vùng nhập liệu và nhập nội dung bài viết
             if final_text and final_text.strip():
-                try:
-                    await page.evaluate("""() => {
-                        const dlg = document.querySelector("div[role='dialog']");
-                        if (!dlg) return;
-                        const ed = dlg.querySelector("div[role='textbox'][contenteditable='true']") || dlg.querySelector("div[contenteditable='true']");
-                        if (ed) {
+                async def _focus_composer_editor():
+                    try:
+                        box = await page.evaluate("""() => {
+                            const dialogs = Array.from(document.querySelectorAll("div[role='dialog']"));
+                            const dlg = dialogs.reverse().find(d => d.querySelector("div[role='textbox'][contenteditable='true'], div[contenteditable='true']")) || document.querySelector("div[role='dialog']");
+                            if (!dlg) return null;
+                            const ed = dlg.querySelector("div[role='textbox'][contenteditable='true']") || dlg.querySelector("div[contenteditable='true']");
+                            if (!ed) return null;
                             ed.scrollIntoView({ behavior: 'instant', block: 'center' });
                             ed.focus();
-                            ed.click();
-                        }
-                    }""")
-                    await asyncio.sleep(0.6)
-                    editor_target = await page.query_selector("div[role='dialog'] div[role='textbox'][contenteditable='true'], div[role='dialog'] div[contenteditable='true']") or editor_elem
-                    if editor_target:
-                        await editor_target.click(timeout=2500)
-                        await editor_target.focus()
-                except Exception:
-                    pass
-                await asyncio.sleep(0.5)
+                            const r = ed.getBoundingClientRect();
+                            return { x: r.left, y: r.top, width: r.width, height: r.height };
+                        }""")
+                        if box and box.get("width", 0) > 10 and box.get("height", 0) > 10:
+                            cx = box["x"] + min(40, box["width"] / 2)
+                            cy = box["y"] + min(18, box["height"] / 2)
+                            await page.mouse.click(cx, cy)
+                            await asyncio.sleep(0.4)
+                    except Exception:
+                        pass
+
+                await _focus_composer_editor()
 
                 # Nhập văn bản bài viết
                 try:
@@ -1831,27 +1842,27 @@ class FBAutomationEngine:
                         await page.keyboard.write(char)
                         await asyncio.sleep(anti_spam.get_typing_delay())
 
-                await asyncio.sleep(1.2)
+                await asyncio.sleep(1.0)
 
-                # Kiểm tra lại xem chữ đã vào ô soạn thảo chưa; nếu chưa vào thì dán qua Clipboard text
+                # Kiểm tra lại xem chữ đã vào ô soạn thảo chưa; nếu chưa vào thì focus lại & dùng execCommand('insertText')
                 try:
                     has_typed = await page.evaluate("""() => {
-                        const dlg = document.querySelector("div[role='dialog']");
+                        const dialogs = Array.from(document.querySelectorAll("div[role='dialog']"));
+                        const dlg = dialogs.reverse().find(d => d.querySelector("div[role='textbox'][contenteditable='true'], div[contenteditable='true']")) || document.querySelector("div[role='dialog']");
                         if (!dlg) return false;
                         const ed = dlg.querySelector("div[role='textbox'][contenteditable='true']") || dlg.querySelector("div[contenteditable='true']");
                         return Boolean(ed && (ed.innerText || ed.textContent || '').trim().length > 0);
                     }""")
                     if not has_typed:
+                        await _focus_composer_editor()
                         await page.evaluate("""(txt) => {
-                            const dlg = document.querySelector("div[role='dialog']");
+                            const dialogs = Array.from(document.querySelectorAll("div[role='dialog']"));
+                            const dlg = dialogs.reverse().find(d => d.querySelector("div[role='textbox'][contenteditable='true'], div[contenteditable='true']")) || document.querySelector("div[role='dialog']");
                             if (!dlg) return;
                             const ed = dlg.querySelector("div[role='textbox'][contenteditable='true']") || dlg.querySelector("div[contenteditable='true']");
                             if (ed) {
-                                ed.scrollIntoView({ behavior: 'instant', block: 'center' });
                                 ed.focus();
-                                const dt = new DataTransfer();
-                                dt.setData('text/plain', txt);
-                                ed.dispatchEvent(new ClipboardEvent('paste', { bubbles: true, cancelable: true, clipboardData: dt }));
+                                document.execCommand('insertText', false, txt);
                             }
                         }""", final_text)
                         await asyncio.sleep(1.0)
