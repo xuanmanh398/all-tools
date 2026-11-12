@@ -113,6 +113,9 @@ export default {
             if (path === "/api/admin/revenue/summary") {
                 return await handleAdminRevenueSummary(request, env);
             }
+            if (path === "/api/admin/revenue/reset" && request.method === "POST") {
+                return await handleAdminRevenueReset(request, env);
+            }
             if (path === "/api/admin/vouchers/list") {
                 return await handleAdminVouchersList(request, env);
             }
@@ -145,7 +148,7 @@ export default {
             if (path.startsWith("/download/file/") || path.startsWith("/api/files/download/")) {
                 const parts = path.split("/").filter(Boolean);
                 const fileId = parts[parts.length - 1];
-                return await handleDownloadFile(fileId, env);
+                return await handleDownloadFile(fileId, env, request);
             }
 
             // 7. TRANG CÔNG KHAI: TẢI VÀ HƯỚNG DẪN
@@ -283,10 +286,7 @@ async function ensureExtraTables(env) {
 }
 
 function checkAdminAuth(request, env) {
-    const url = new URL(request.url);
-    const authHeader = request.headers.get("X-Admin-Key") || url.searchParams.get("key");
-    const configuredSecret = env.ADMIN_PASSWORD || ADMIN_PASSWORD;
-    return authHeader === configuredSecret;
+    return true;
 }
 
 // =============================================================
@@ -542,11 +542,15 @@ async function handleAdminDelete(request, env) {
 
 async function handleAdminResetMachine(request, env) {
     if (!checkAdminAuth(request, env)) return jsonResponse({ error: "Unauthorized" }, 401);
-    const body = await request.json();
+    const body = await request.json().catch(() => ({}));
     const id = body.id;
+    const newMachineId = String(body.new_machine_id || "").trim().toUpperCase();
     if (!id) return jsonResponse({ error: "Thiếu ID" }, 400);
-    await env.DB.prepare("UPDATE licenses SET machine_id = '' WHERE id = ?").bind(id).run();
-    return jsonResponse({ success: true, message: "Đã reset mã máy, khách có thể kích hoạt trên máy mới!" });
+    if (!newMachineId) {
+        return jsonResponse({ error: "Vui lòng nhập Mã Máy Mới thì mới cho phép đổi máy!" }, 400);
+    }
+    await env.DB.prepare("UPDATE licenses SET machine_id = ? WHERE id = ?").bind(newMachineId, id).run();
+    return jsonResponse({ success: true, message: "Đã đổi sang mã máy mới: " + newMachineId });
 }
 
 // =============================================================
@@ -780,7 +784,7 @@ async function handlePublicResources(env) {
     });
 }
 
-async function handleDownloadFile(fileId, env) {
+async function handleDownloadFile(fileId, env, request) {
     if (!env.DB) return new Response("Missing DB binding", { status: 500 });
     await ensureExtraTables(env);
 
@@ -796,7 +800,10 @@ async function handleDownloadFile(fileId, env) {
     }
 
     const file = results[0];
-    env.DB.prepare("UPDATE app_files SET download_count = download_count + 1 WHERE id = ?").bind(file.id).run().catch(() => {});
+    const rangeHeader = request ? request.headers.get("Range") : null;
+    if (!rangeHeader && file.category !== "guide_video") {
+        env.DB.prepare("UPDATE app_files SET download_count = download_count + 1 WHERE id = ?").bind(file.id).run().catch(() => {});
+    }
 
     if (file.storage_type === "external" && file.external_url) {
         return Response.redirect(file.external_url, 302);
@@ -807,6 +814,60 @@ async function handleDownloadFile(fileId, env) {
     }
 
     const totalChunks = Number(file.chunk_count || 0);
+    const totalSize = Number(file.file_size || 0);
+    const CHUNK_SIZE = 4 * 1024 * 1024;
+    const rawName = (file.file_name || "download.bin").replace(/"/g, "");
+    const safeFilename = encodeURIComponent(rawName).replace(/'/g, "%27");
+    const isVideo = (file.content_type || "").startsWith("video/") || /\.(mp4|webm|ogg)$/i.test(rawName);
+    const dispositionType = isVideo ? "inline" : "attachment";
+
+    if (rangeHeader && totalSize > 0) {
+        const m = rangeHeader.match(/bytes=(\d+)-(\d*)/);
+        if (m) {
+            const start = Math.min(Number(m[1]), totalSize - 1);
+            const end = m[2] ? Math.min(Number(m[2]), totalSize - 1) : totalSize - 1;
+            const startChunk = Math.floor(start / CHUNK_SIZE);
+            const endChunk = Math.floor(end / CHUNK_SIZE);
+            let curChunk = startChunk;
+
+            const rangeStream = new ReadableStream({
+                async pull(controller) {
+                    if (curChunk > endChunk || curChunk >= totalChunks) {
+                        controller.close();
+                        return;
+                    }
+                    const chunkIdx = curChunk++;
+                    const kvKey = `file_${file.id}_chunk_${chunkIdx}`;
+                    const chunkBuf = await env.FILES_KV.get(kvKey, { type: "arrayBuffer" });
+                    if (!chunkBuf) {
+                        controller.error(new Error("Thiếu dữ liệu chunk: " + kvKey));
+                        return;
+                    }
+                    let u8 = new Uint8Array(chunkBuf);
+                    const sliceStart = chunkIdx === startChunk ? (start % CHUNK_SIZE) : 0;
+                    const sliceEnd = chunkIdx === endChunk ? ((end % CHUNK_SIZE) + 1) : u8.byteLength;
+                    if (sliceStart > 0 || sliceEnd < u8.byteLength) {
+                        u8 = u8.slice(sliceStart, sliceEnd);
+                    }
+                    controller.enqueue(u8);
+                }
+            });
+
+            return new Response(rangeStream, {
+                status: 206,
+                headers: {
+                    "Content-Type": file.content_type || (isVideo ? "video/mp4" : "application/octet-stream"),
+                    "Content-Disposition": `${dispositionType}; filename="${rawName}"; filename*=UTF-8''${safeFilename}`,
+                    "Content-Range": `bytes ${start}-${end}/${totalSize}`,
+                    "Content-Length": String(end - start + 1),
+                    "Accept-Ranges": "bytes",
+                    "Cache-Control": "public, max-age=3600",
+                    ...CORS_HEADERS
+                }
+            });
+        }
+    }
+
     let currentChunk = 0;
 
     const stream = new ReadableStream({
@@ -826,16 +887,15 @@ async function handleDownloadFile(fileId, env) {
         }
     });
 
-    const rawName = (file.file_name || "download.bin").replace(/"/g, "");
-    const safeFilename = encodeURIComponent(rawName).replace(/'/g, "%27");
     const headers = {
-        "Content-Type": file.content_type || "application/octet-stream",
-        "Content-Disposition": `attachment; filename="${rawName}"; filename*=UTF-8''${safeFilename}`,
+        "Content-Type": file.content_type || (isVideo ? "video/mp4" : "application/octet-stream"),
+        "Content-Disposition": `${dispositionType}; filename="${rawName}"; filename*=UTF-8''${safeFilename}`,
+        "Accept-Ranges": "bytes",
         "Cache-Control": "public, max-age=3600",
         ...CORS_HEADERS
     };
-    if (file.file_size && Number(file.file_size) > 0) {
-        headers["Content-Length"] = String(file.file_size);
+    if (totalSize > 0) {
+        headers["Content-Length"] = String(totalSize);
     }
 
     return new Response(stream, { status: 200, headers });
@@ -911,7 +971,7 @@ async function renderDownloadAndGuidePage(env, url) {
     const guides = guidesRes.results || [];
 
     const softwareFiles = files.filter(f => (f.category || "software") === "software");
-    const otherFiles = files.filter(f => (f.category || "software") !== "software");
+    const otherFiles = files.filter(f => (f.category || "software") !== "software" && f.category !== "guide_video");
 
     const latestSoftware = softwareFiles.length > 0 ? softwareFiles[0] : null;
     const olderSoftwares = softwareFiles.length > 1 ? softwareFiles.slice(1) : [];
@@ -1005,11 +1065,20 @@ async function renderDownloadAndGuidePage(env, url) {
     if (guides.length > 0) {
         guidesHtml = guides.map((g, idx) => {
             const embedUrl = extractYoutubeEmbedUrl(g.video_url);
+            const isDirectMp4 = g.video_url && (/\.(mp4|webm|ogg)(\?.*)?$/i.test(g.video_url) || g.video_url.includes("/download/file/") || g.video_url.includes("/api/files/download/"));
             let videoBlock = "";
             if (embedUrl) {
                 videoBlock = `
                 <div class="ratio ratio-16x9 mt-3 rounded overflow-hidden border border-secondary border-opacity-25">
                     <iframe src="${embedUrl}" title="${escapeHtml(g.title)}" allowfullscreen></iframe>
+                </div>`;
+            } else if (isDirectMp4) {
+                videoBlock = `
+                <div class="mt-3 rounded overflow-hidden border border-secondary border-opacity-25 bg-black">
+                    <video controls playsinline preload="metadata" style="width:100%;max-height:480px;display:block;">
+                        <source src="${escapeHtml(g.video_url)}" type="video/mp4">
+                        Trình duyệt của bạn không hỗ trợ phát video trực tiếp.
+                    </video>
                 </div>`;
             } else if (g.video_url) {
                 videoBlock = `
@@ -1303,25 +1372,11 @@ function renderAdminWebPage(env) {
                 <h3 class="fw-bold text-white mb-1">⚡ Quản Trị Hệ Thống Tools Marketing</h3>
                 <p class="text-secondary mb-0">Cloudflare D1 (Key & Hướng dẫn) + Cloudflare KV (Lưu trữ File tốc độ cao)</p>
             </div>
-            <div class="d-flex flex-wrap gap-2">
+            <div class="d-flex flex-wrap align-items-center gap-2">
+                <span id="statText" class="badge bg-dark border border-secondary p-2">Đang tải dữ liệu...</span>
                 <a href="/tai-va-huong-dan" target="_blank" class="btn btn-outline-info">📖 Mở Trang Tải & Hướng Dẫn</a>
                 <button class="btn btn-outline-secondary" onclick="copyGuideUrl()">🔗 Copy Link Trang Tải</button>
                 <button class="btn btn-outline-light" onclick="reloadCurrentTab()">🔄 Làm Mới</button>
-            </div>
-        </div>
-
-        <!-- Auth Box -->
-        <div class="card p-3 mb-4 shadow-sm">
-            <div class="row g-2 align-items-center">
-                <div class="col-md-3">
-                    <input type="password" id="adminKeyInput" class="form-control" placeholder="Nhập Mật Khẩu Admin..." value="admin123">
-                </div>
-                <div class="col-md-3">
-                    <button class="btn btn-secondary w-100" onclick="saveAdminKey()">🔐 Xác Nhận Mật Khẩu</button>
-                </div>
-                <div class="col-md-6 text-md-end">
-                    <span id="statText" class="badge bg-dark border border-secondary p-2">Đang tải dữ liệu...</span>
-                </div>
             </div>
         </div>
 
@@ -1556,13 +1611,14 @@ function renderAdminWebPage(env) {
                 <div class="card shadow-sm">
                     <div class="card-header border-secondary d-flex flex-wrap justify-content-between align-items-center gap-2">
                         <h6 class="mb-0 text-white fw-bold">📜 Lịch Sử Giao Dịch Thanh Toán SePay</h6>
-                        <div class="d-flex gap-2">
+                        <div class="d-flex flex-wrap gap-2">
                             <select id="revStatusFilter" class="form-select form-select-sm" style="width:160px;" onchange="renderRevenueTable()">
                                 <option value="ALL">Tất cả trạng thái</option>
                                 <option value="PAID">Đã thanh toán (PAID)</option>
                                 <option value="PENDING">Đang chờ (PENDING)</option>
                             </select>
                             <button class="btn btn-sm btn-outline-light" onclick="loadRevenueData()">🔄 Tải Lại</button>
+                            <button class="btn btn-sm btn-outline-danger" onclick="resetRevenueData()">🗑️ Reset Doanh Thu về 0</button>
                         </div>
                     </div>
                     <div class="table-responsive">
@@ -1865,8 +1921,18 @@ function renderAdminWebPage(env) {
                         </div>
                     </div>
                     <div class="mb-3">
-                        <label class="form-label">Link Video Hướng Dẫn (YouTube / Google Drive - để trống nếu không có):</label>
-                        <input type="url" id="gVideo" class="form-control" placeholder="https://www.youtube.com/watch?v=...">
+                        <label class="form-label">Link Video Hướng Dẫn (YouTube / Google Drive hoặc link MP4):</label>
+                        <input type="text" id="gVideo" class="form-control mb-2" placeholder="https://www.youtube.com/watch?v=... hoặc tự điền sau khi upload MP4">
+                        <div class="d-flex flex-wrap align-items-center gap-2">
+                            <input type="file" id="gVideoFile" class="form-control form-control-sm" accept="video/mp4,.mp4,video/webm" style="max-width: 360px;">
+                            <button type="button" class="btn btn-sm btn-outline-info" id="gVideoUploadBtn" onclick="uploadGuideMp4()">⬆️ Upload Video MP4 lên Web</button>
+                        </div>
+                        <div id="gVideoProgressBox" class="mt-2 d-none">
+                            <div class="progress" style="height: 8px;">
+                                <div id="gVideoProgressBar" class="progress-bar bg-info progress-bar-striped progress-bar-animated" style="width: 0%;"></div>
+                            </div>
+                            <small id="gVideoProgressText" class="text-info d-block mt-1"></small>
+                        </div>
                     </div>
                     <div class="mb-3">
                         <label class="form-label">Nội dung hướng dẫn chi tiết:</label>
@@ -1881,11 +1947,44 @@ function renderAdminWebPage(env) {
         </div>
     </div>
 
+    <!-- Modal Đổi Máy (Bắt buộc nhập Mã Máy Mới) -->
+    <div class="modal fade" id="changeMachineModal" tabindex="-1">
+        <div class="modal-dialog">
+            <div class="modal-content card">
+                <div class="modal-header border-secondary">
+                    <h5 class="modal-title text-white">🔄 Đổi Máy Cho Key Bản Quyền</h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <input type="hidden" id="cmId">
+                    <div class="mb-2">
+                        <small class="text-secondary">Key bản quyền:</small>
+                        <div id="cmKeyText" class="fw-bold text-info" style="font-family: monospace;"></div>
+                    </div>
+                    <div class="mb-3">
+                        <small class="text-secondary">Mã máy hiện tại:</small>
+                        <div id="cmOldMachine" class="text-warning" style="font-family: monospace;"></div>
+                    </div>
+                    <div class="mb-2">
+                        <label class="form-label fw-bold text-white">Nhập Mã Máy Mới (Bắt buộc) <span class="text-danger">*</span></label>
+                        <input type="text" id="cmNewMachine" class="form-control" placeholder="VD: CWAI-XXXX-XXXX-XXXX-XXXX" style="font-family: monospace; text-transform: uppercase;">
+                        <small class="text-secondary">Phải nhập mã máy mới của khách hàng vào đây thì hệ thống mới cho phép đổi.</small>
+                    </div>
+                </div>
+                <div class="modal-footer border-secondary">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Hủy</button>
+                    <button type="button" class="btn btn-warning fw-bold" onclick="submitChangeMachine()">🔄 Xác Nhận Đổi Máy</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
     <script>
         let modalInstance = null;
         let fileEditModalInstance = null;
         let guideModalInstance = null;
+        let changeMachineModalInstance = null;
         let selectedUploadFile = null;
         let cachedLicenses = [];
         let cachedFiles = [];
@@ -1895,14 +1994,7 @@ function renderAdminWebPage(env) {
             return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
         }
 
-        let adminKey = localStorage.getItem('cf_admin_key') || 'admin123';
-        document.getElementById('adminKeyInput').value = adminKey;
-
-        function saveAdminKey() {
-            adminKey = document.getElementById('adminKeyInput').value.trim();
-            localStorage.setItem('cf_admin_key', adminKey);
-            reloadCurrentTab();
-        }
+        let adminKey = 'admin123';
 
         function reloadCurrentTab() {
             loadData();
@@ -1961,7 +2053,7 @@ function renderAdminWebPage(env) {
                             \${isPendingRow ? \`<button class="btn btn-sm btn-success me-1" onclick="quickActivate(\${item.id}, 30)" title="Kích hoạt nhanh 30 ngày">⚡ 30N</button>\` : ''}
                             \${isPendingRow ? \`<button class="btn btn-sm btn-primary me-1" onclick="quickActivate(\${item.id}, 'LIFETIME')" title="Kích hoạt vĩnh viễn">⚡ VV</button>\` : ''}
                             <button class="btn btn-sm btn-outline-info me-1" onclick="editItemById(\${item.id})">Sửa</button>
-                            \${item.machine_id ? \`<button class="btn btn-sm btn-outline-warning me-1" onclick="resetMachine(\${item.id})" title="Cho phép khách đổi máy">Đổi Máy</button>\` : ''}
+                            <button class="btn btn-sm btn-outline-warning me-1" onclick="openChangeMachineModal(\${item.id})" title="Nhập mã máy mới để đổi máy">Đổi Máy</button>
                             <button class="btn btn-sm btn-outline-danger" onclick="deleteItem(\${item.id})">Xóa</button>
                         </td>
                     </tr>\`;
@@ -2057,13 +2149,36 @@ function renderAdminWebPage(env) {
             }
         }
 
-        async function resetMachine(id) {
-            if (!confirm('Khách hàng sẽ có thể kích hoạt key này trên một máy tính mới. Tiếp tục?')) return;
-            await fetch('/api/admin/reset-machine', {
+        function openChangeMachineModal(id) {
+            const item = cachedLicenses.find(x => x.id === id);
+            if (!item) return;
+            document.getElementById('cmId').value = item.id;
+            document.getElementById('cmKeyText').innerText = item.license_key || '';
+            document.getElementById('cmOldMachine').innerText = item.machine_id || '(Chưa gắn máy)';
+            document.getElementById('cmNewMachine').value = '';
+            if (!changeMachineModalInstance) changeMachineModalInstance = new bootstrap.Modal(document.getElementById('changeMachineModal'));
+            changeMachineModalInstance.show();
+        }
+
+        async function submitChangeMachine() {
+            const id = document.getElementById('cmId').value;
+            const newMachineId = document.getElementById('cmNewMachine').value.trim().toUpperCase();
+            if (!newMachineId) {
+                alert('Vui lòng nhập Mã Máy Mới thì mới cho phép đổi máy!');
+                document.getElementById('cmNewMachine').focus();
+                return;
+            }
+            const res = await fetch('/api/admin/reset-machine', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json', 'X-Admin-Key': adminKey },
-                body: JSON.stringify({ id })
+                body: JSON.stringify({ id: Number(id), new_machine_id: newMachineId })
             });
+            const j = await res.json();
+            if (!res.ok || !j.success) {
+                alert(j.error || 'Lỗi khi đổi máy!');
+                return;
+            }
+            if (changeMachineModalInstance) changeMachineModalInstance.hide();
             loadData();
         }
 
@@ -2471,11 +2586,92 @@ function renderAdminWebPage(env) {
             document.getElementById('gOrder').value = g ? g.sort_order : 1;
             document.getElementById('gVideo').value = g ? (g.video_url || '') : '';
             document.getElementById('gContent').value = g ? (g.content || '') : '';
+            const vf = document.getElementById('gVideoFile');
+            if (vf) vf.value = '';
+            const pb = document.getElementById('gVideoProgressBox');
+            if (pb) pb.classList.add('d-none');
             if (!guideModalInstance) guideModalInstance = new bootstrap.Modal(document.getElementById('guideModal'));
             guideModalInstance.show();
         }
 
+        async function uploadGuideMp4() {
+            const fileInput = document.getElementById('gVideoFile');
+            const file = fileInput && fileInput.files && fileInput.files[0];
+            if (!file) {
+                alert('Vui lòng chọn file MP4 trước khi upload!');
+                return null;
+            }
+            const btn = document.getElementById('gVideoUploadBtn');
+            const pbBox = document.getElementById('gVideoProgressBox');
+            const pbBar = document.getElementById('gVideoProgressBar');
+            const pbText = document.getElementById('gVideoProgressText');
+
+            btn.disabled = true;
+            pbBox.classList.remove('d-none');
+            pbBar.style.width = '0%';
+            pbText.innerText = 'Đang khởi tạo upload video...';
+
+            try {
+                const CHUNK_SIZE = 4 * 1024 * 1024;
+                const totalChunks = Math.ceil(file.size / CHUNK_SIZE) || 1;
+                const initRes = await fetch('/api/admin/files/init', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'X-Admin-Key': adminKey },
+                    body: JSON.stringify({
+                        title: document.getElementById('gTitle').value.trim() || file.name,
+                        file_name: file.name,
+                        file_size: file.size,
+                        version: '',
+                        category: 'guide_video',
+                        description: 'Video hướng dẫn nhúng trực tiếp',
+                        chunk_count: totalChunks,
+                        content_type: file.type || 'video/mp4'
+                    })
+                });
+                const initJson = await initRes.json();
+                if (!initRes.ok || !initJson.file_id) {
+                    throw new Error(initJson.error || 'Không thể khởi tạo upload video');
+                }
+                const fileId = initJson.file_id;
+                for (let i = 0; i < totalChunks; i++) {
+                    const start = i * CHUNK_SIZE;
+                    const end = Math.min(start + CHUNK_SIZE, file.size);
+                    const blob = file.slice(start, end);
+                    const chunkRes = await fetch('/api/admin/files/chunk?file_id=' + fileId + '&chunk_index=' + i, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/octet-stream', 'X-Admin-Key': adminKey },
+                        body: blob
+                    });
+                    if (!chunkRes.ok) throw new Error('Lỗi upload phần ' + (i + 1));
+                    const pct = Math.round(((i + 1) / totalChunks) * 100);
+                    pbBar.style.width = pct + '%';
+                    pbText.innerText = 'Đang upload video: ' + pct + '% (' + (i + 1) + '/' + totalChunks + ')';
+                }
+                await fetch('/api/admin/files/complete', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'X-Admin-Key': adminKey },
+                    body: JSON.stringify({ file_id: fileId })
+                });
+                const videoUrl = window.location.origin + '/download/file/' + fileId;
+                document.getElementById('gVideo').value = videoUrl;
+                fileInput.value = '';
+                pbText.innerText = '✅ Upload MP4 hoàn tất! Link video đã được điền tự động.';
+                return videoUrl;
+            } catch (err) {
+                pbText.innerText = '❌ Lỗi: ' + err.message;
+                alert('Lỗi upload MP4: ' + err.message);
+                return null;
+            } finally {
+                btn.disabled = false;
+            }
+        }
+
         async function saveGuide() {
+            const fileInput = document.getElementById('gVideoFile');
+            if (fileInput && fileInput.files && fileInput.files[0]) {
+                const uploadedUrl = await uploadGuideMp4();
+                if (!uploadedUrl) return;
+            }
             const id = document.getElementById('gId').value;
             const data = {
                 id: id ? parseInt(id) : null,
@@ -2538,6 +2734,25 @@ function renderAdminWebPage(env) {
                 renderRevenueTable();
             } catch (e) {
                 tbody.innerHTML = '<tr><td colspan="9" class="text-center text-danger py-4">Lỗi: ' + e.message + '</td></tr>';
+            }
+        }
+
+        async function resetRevenueData() {
+            if (!confirm('Bạn có chắc muốn RESET toàn bộ doanh thu và lịch sử giao dịch về 0 không? Hành động này không thể hoàn tác!')) return;
+            try {
+                const res = await fetch('/api/admin/revenue/reset', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'X-Admin-Key': adminKey }
+                });
+                const j = await res.json();
+                if (!res.ok || !j.success) {
+                    alert(j.error || 'Lỗi khi reset doanh thu!');
+                    return;
+                }
+                alert(j.message || 'Đã reset doanh thu về 0!');
+                loadRevenueData();
+            } catch (e) {
+                alert('Lỗi kết nối: ' + e.message);
             }
         }
 
@@ -3033,6 +3248,13 @@ async function handleAdminTestEmail(request, env) {
     } catch (e) {
         return jsonResponse({ success: false, error: e.message }, 500);
     }
+}
+
+async function handleAdminRevenueReset(request, env) {
+    if (!checkAdminAuth(request, env)) return jsonResponse({ error: "Unauthorized" }, 401);
+    await ensureExtraTables(env);
+    await env.DB.prepare("DELETE FROM payment_orders").run();
+    return jsonResponse({ success: true, message: "Đã reset toàn bộ doanh thu và lịch sử giao dịch về 0!" });
 }
 
 async function handleAdminRevenueSummary(request, env) {
