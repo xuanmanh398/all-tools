@@ -568,17 +568,18 @@ class LicenseDialog(QDialog):
 class SePayCreateOrderThread(QThread):
     finished_signal = Signal(bool, dict, bytes, str)
 
-    def __init__(self, worker_url: str, machine_id: str, package_id: str):
+    def __init__(self, worker_url: str, machine_id: str, package_id: str, voucher_code: str = ""):
         super().__init__()
         self.worker_url = worker_url.rstrip("/")
         self.machine_id = machine_id
         self.package_id = package_id
+        self.voucher_code = voucher_code
 
     def run(self):
         try:
             res = requests.post(
                 f"{self.worker_url}/api/payment/create-order",
-                json={"machine_id": self.machine_id, "package_id": self.package_id},
+                json={"machine_id": self.machine_id, "package_id": self.package_id, "voucher_code": self.voucher_code},
                 timeout=15
             )
             data = res.json()
@@ -640,34 +641,42 @@ class SePayPaymentDialog(QDialog):
         self.poll_timer.timeout.connect(self.check_payment_status)
 
         self.setWindowTitle("💳 Nạp & Gia Hạn Bản Quyền Tự Động (SePay)")
-        self.setFixedSize(480, 620)
+        self.setFixedSize(490, 680)
         self.setStyleSheet(DARK_DIALOG_QSS)
         self.init_ui()
         self.load_packages()
 
     def init_ui(self):
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 18, 20, 18)
-        layout.setSpacing(12)
+        layout.setContentsMargins(20, 16, 20, 16)
+        layout.setSpacing(10)
 
         title = QLabel("💳 QUÉT QR TỰ ĐỘNG GIA HẠN (SEPAY)")
         title.setAlignment(Qt.AlignCenter)
         title.setStyleSheet("font-size: 16px; font-weight: bold; color: #34d399;")
         layout.addWidget(title)
 
-        sub = QLabel("Chọn gói và quét mã VietQR. Hệ thống tự động cộng ngày sau 3-5 giây khi chuyển khoản đúng nội dung.")
+        self.lbl_sale_banner = QLabel("")
+        self.lbl_sale_banner.setAlignment(Qt.AlignCenter)
+        self.lbl_sale_banner.setStyleSheet("font-size: 12px; font-weight: bold; color: #f9e2af; background-color: #3b2f1e; border: 1px solid #f9e2af; border-radius: 6px; padding: 4px;")
+        self.lbl_sale_banner.hide()
+        layout.addWidget(self.lbl_sale_banner)
+
+        sub = QLabel("Chọn gói, nhập mã giảm giá (nếu có) và quét mã VietQR. Hệ thống tự động cộng ngày sau 3-5 giây.")
         sub.setWordWrap(True)
         sub.setAlignment(Qt.AlignCenter)
         sub.setStyleSheet("font-size: 12px; color: #a6adc8;")
         layout.addWidget(sub)
 
-        # Package selector
+        # Package selector & Voucher
         pkg_card = QFrame()
         pkg_card.setProperty("class", "card")
-        pkg_layout = QHBoxLayout(pkg_card)
-        pkg_layout.setContentsMargins(12, 10, 12, 10)
-        pkg_layout.setSpacing(10)
+        pkg_vbox = QVBoxLayout(pkg_card)
+        pkg_vbox.setContentsMargins(12, 10, 12, 10)
+        pkg_vbox.setSpacing(8)
 
+        pkg_layout = QHBoxLayout()
+        pkg_layout.setSpacing(10)
         self.cmb_pkg = QComboBox()
         self.cmb_pkg.setStyleSheet("background-color: #11111b; border: 1px solid #45475a; border-radius: 6px; padding: 6px 10px; color: #cdd6f4;")
         self.cmb_pkg.addItem("Gói 1 Tháng (30 ngày) - 149.000đ", "1m")
@@ -680,6 +689,25 @@ class SePayPaymentDialog(QDialog):
         self.btn_gen_qr.setCursor(Qt.PointingHandCursor)
         self.btn_gen_qr.clicked.connect(self.create_order)
         pkg_layout.addWidget(self.btn_gen_qr)
+        pkg_vbox.addLayout(pkg_layout)
+
+        vc_layout = QHBoxLayout()
+        vc_layout.setSpacing(8)
+        self.txt_voucher = QLineEdit()
+        self.txt_voucher.setPlaceholderText("🎟️ Nhập mã giảm giá / Voucher (tùy chọn)...")
+        vc_layout.addWidget(self.txt_voucher, 1)
+
+        self.btn_apply_vc = QPushButton("Áp Dụng")
+        self.btn_apply_vc.setCursor(Qt.PointingHandCursor)
+        self.btn_apply_vc.clicked.connect(self.apply_voucher)
+        vc_layout.addWidget(self.btn_apply_vc)
+        pkg_vbox.addLayout(vc_layout)
+
+        self.lbl_vc_status = QLabel("")
+        self.lbl_vc_status.setStyleSheet("font-size: 11.5px; color: #a6e3a1; border: none;")
+        self.lbl_vc_status.hide()
+        pkg_vbox.addWidget(self.lbl_vc_status)
+
         layout.addWidget(pkg_card)
 
         # QR Box
@@ -732,6 +760,11 @@ class SePayPaymentDialog(QDialog):
             r = requests.get(f"{self.worker_url}/api/payment/packages", timeout=5)
             if r.ok:
                 j = r.json()
+                sale_pct = int(j.get("sale_percent", 0) or 0)
+                sale_lbl = j.get("sale_label") or ""
+                if sale_pct > 0:
+                    self.lbl_sale_banner.setText(f"🔥 {sale_lbl or f'Đang khuyến mãi giảm {sale_pct}% toàn bộ gói!'}")
+                    self.lbl_sale_banner.show()
                 pkgs = j.get("packages") or []
                 if pkgs:
                     self.cmb_pkg.clear()
@@ -741,13 +774,41 @@ class SePayPaymentDialog(QDialog):
         except Exception:
             pass
 
+    def apply_voucher(self):
+        code = self.txt_voucher.text().strip().upper()
+        pkg_id = self.cmb_pkg.currentData() or "1m"
+        if not code:
+            self.lbl_vc_status.hide()
+            return
+        try:
+            r = requests.post(
+                f"{self.worker_url}/api/payment/apply-voucher",
+                json={"package_id": pkg_id, "voucher_code": code},
+                timeout=8
+            )
+            j = r.json()
+            if r.ok and j.get("success"):
+                final_str = f"{int(j.get('final_amount', 0)):,}".replace(",", ".")
+                self.lbl_vc_status.setText(f"✅ {j.get('message', 'Áp dụng thành công!')} → Còn: {final_str}đ")
+                self.lbl_vc_status.setStyleSheet("font-size: 11.5px; color: #a6e3a1; border: none;")
+                self.lbl_vc_status.show()
+            else:
+                self.lbl_vc_status.setText(f"❌ {j.get('error', 'Mã giảm giá không hợp lệ!')}")
+                self.lbl_vc_status.setStyleSheet("font-size: 11.5px; color: #f38ba8; border: none;")
+                self.lbl_vc_status.show()
+        except Exception as e:
+            self.lbl_vc_status.setText(f"❌ Lỗi kiểm tra mã: {str(e)}")
+            self.lbl_vc_status.setStyleSheet("font-size: 11.5px; color: #f38ba8; border: none;")
+            self.lbl_vc_status.show()
+
     def create_order(self):
         self.poll_timer.stop()
         self.btn_gen_qr.setEnabled(False)
         self.lbl_poll_status.setText("⏳ Đang tạo mã QR thanh toán...")
         self.lbl_poll_status.setStyleSheet("font-size: 12.5px; font-weight: bold; color: #fab387; border: none;")
         pkg_id = self.cmb_pkg.currentData() or "1m"
-        self.create_thread = SePayCreateOrderThread(self.worker_url, self.machine_id, pkg_id)
+        vc_code = self.txt_voucher.text().strip().upper()
+        self.create_thread = SePayCreateOrderThread(self.worker_url, self.machine_id, pkg_id, vc_code)
         self.create_thread.finished_signal.connect(self.on_order_created)
         self.create_thread.start()
 

@@ -1,3 +1,5 @@
+import { connect } from "cloudflare:sockets";
+
 /**
  * Cloudflare Worker: Hệ Thống Bản Quyền, Quản Lý Upload File & Trang Tải/Hướng Dẫn
  * (Cloudflare D1 + Cloudflare KV Streaming)
@@ -105,8 +107,26 @@ export default {
             if (path === "/api/admin/sepay/orders") {
                 return await handleAdminSepayOrders(request, env);
             }
+            if (path === "/api/admin/sepay/test-email" && request.method === "POST") {
+                return await handleAdminTestEmail(request, env);
+            }
+            if (path === "/api/admin/revenue/summary") {
+                return await handleAdminRevenueSummary(request, env);
+            }
+            if (path === "/api/admin/vouchers/list") {
+                return await handleAdminVouchersList(request, env);
+            }
+            if (path === "/api/admin/vouchers/save" && request.method === "POST") {
+                return await handleAdminVouchersSave(request, env);
+            }
+            if (path === "/api/admin/vouchers/delete" && request.method === "POST") {
+                return await handleAdminVouchersDelete(request, env);
+            }
             if (path === "/api/payment/packages") {
                 return await handlePaymentPackages(env);
+            }
+            if (path === "/api/payment/apply-voucher" && request.method === "POST") {
+                return await handlePaymentApplyVoucher(request, env);
             }
             if (path === "/api/payment/create-order" && request.method === "POST") {
                 return await handlePaymentCreateOrder(request, env);
@@ -200,12 +220,33 @@ async function ensureExtraTables(env) {
             machine_id TEXT NOT NULL,
             license_key TEXT DEFAULT '',
             package_id TEXT DEFAULT '1m',
+            original_amount INTEGER DEFAULT 0,
+            discount_amount INTEGER DEFAULT 0,
+            voucher_code TEXT DEFAULT '',
             amount INTEGER NOT NULL,
             days_to_add INTEGER NOT NULL,
             status TEXT DEFAULT 'PENDING',
             sepay_tx_id TEXT DEFAULT '',
             created_at DATETIME DEFAULT (datetime('now', '+7 hours')),
             paid_at DATETIME DEFAULT NULL
+        )
+    `).run();
+
+    await env.DB.prepare("ALTER TABLE payment_orders ADD COLUMN original_amount INTEGER DEFAULT 0").run().catch(() => {});
+    await env.DB.prepare("ALTER TABLE payment_orders ADD COLUMN discount_amount INTEGER DEFAULT 0").run().catch(() => {});
+    await env.DB.prepare("ALTER TABLE payment_orders ADD COLUMN voucher_code TEXT DEFAULT ''").run().catch(() => {});
+
+    await env.DB.prepare(`
+        CREATE TABLE IF NOT EXISTS vouchers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code TEXT UNIQUE NOT NULL,
+            discount_type TEXT DEFAULT 'percent',
+            discount_value INTEGER NOT NULL,
+            max_uses INTEGER DEFAULT 0,
+            used_count INTEGER DEFAULT 0,
+            expires_at TEXT DEFAULT '',
+            is_active INTEGER DEFAULT 1,
+            created_at DATETIME DEFAULT (datetime('now', '+7 hours'))
         )
     `).run();
 
@@ -1202,10 +1243,32 @@ function renderAdminWebPage(env) {
     <title>Quản Trị Hệ Thống - Tools Marketing (Cloudflare D1 & KV)</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <style>
-        body { background-color: #0b0f19; color: #cbd5e1; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
-        .card { background-color: #111827; border: 1px solid #1f2937; color: #cbd5e1; border-radius: 10px; }
-        .table { color: #cbd5e1; border-color: #1f2937; }
-        .table-dark { background-color: #111827; }
+        body { background-color: #0b0f19; color: #e2e8f0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+        .card { background-color: #111827; border: 1px solid #1f2937; color: #e2e8f0; border-radius: 10px; }
+        .table {
+            --bs-table-bg: #0f172a;
+            --bs-table-striped-bg: #162033;
+            --bs-table-hover-bg: #1e293b;
+            --bs-table-color: #f1f5f9;
+            --bs-table-hover-color: #ffffff;
+            --bs-table-border-color: #273449;
+            color: #f1f5f9;
+            border-color: #273449;
+        }
+        .table > :not(caption) > * > * {
+            background-color: var(--bs-table-bg) !important;
+            color: #f1f5f9 !important;
+            border-bottom-color: #273449 !important;
+        }
+        .table-hover > tbody > tr:hover > * {
+            background-color: #1e293b !important;
+            color: #ffffff !important;
+        }
+        .table-dark th, .table thead th {
+            background-color: #1e293b !important;
+            color: #f8fafc !important;
+            border-color: #334155 !important;
+        }
         .badge-active { background-color: #059669; }
         .badge-blocked { background-color: #dc2626; }
         .badge-expired { background-color: #d97706; }
@@ -1280,8 +1343,13 @@ function renderAdminWebPage(env) {
                 </button>
             </li>
             <li class="nav-item">
+                <button class="nav-link" id="tab-revenue-btn" data-bs-toggle="tab" data-bs-target="#tab-revenue" type="button" onclick="loadRevenueData()">
+                    📊 Doanh Thu &amp; Giao Dịch
+                </button>
+            </li>
+            <li class="nav-item">
                 <button class="nav-link" id="tab-sepay-btn" data-bs-toggle="tab" data-bs-target="#tab-sepay" type="button" onclick="loadSepayData()">
-                    💳 Nạp Tự Động (SePay)
+                    💳 SePay, Email &amp; Sale/Voucher
                 </button>
             </li>
         </ul>
@@ -1452,28 +1520,96 @@ function renderAdminWebPage(env) {
                 </div>
             </div>
 
-            <!-- TAB 4: CẤU HÌNH SEPAY & ĐƠN NẠP TỰ ĐỘNG -->
+            <!-- TAB 4: DASHBOARD DOANH THU & LỊCH SỬ GIAO DỊCH -->
+            <div class="tab-pane fade" id="tab-revenue">
+                <div class="row g-3 mb-4">
+                    <div class="col-md-3">
+                        <div class="card p-3" style="border-left: 4px solid #10b981;">
+                            <div class="small text-secondary">Doanh Thu Hôm Nay</div>
+                            <h4 class="fw-bold text-success mb-0 mt-1" id="revToday">0đ</h4>
+                            <small class="text-secondary" id="revTodayCount">0 đơn</small>
+                        </div>
+                    </div>
+                    <div class="col-md-3">
+                        <div class="card p-3" style="border-left: 4px solid #3b82f6;">
+                            <div class="small text-secondary">Doanh Thu Tháng Này</div>
+                            <h4 class="fw-bold text-info mb-0 mt-1" id="revMonth">0đ</h4>
+                            <small class="text-secondary" id="revMonthCount">0 đơn</small>
+                        </div>
+                    </div>
+                    <div class="col-md-3">
+                        <div class="card p-3" style="border-left: 4px solid #f59e0b;">
+                            <div class="small text-secondary">Tổng Doanh Thu</div>
+                            <h4 class="fw-bold text-warning mb-0 mt-1" id="revTotal">0đ</h4>
+                            <small class="text-secondary" id="revTotalCount">0 đơn thành công</small>
+                        </div>
+                    </div>
+                    <div class="col-md-3">
+                        <div class="card p-3" style="border-left: 4px solid #a855f7;">
+                            <div class="small text-secondary">Tổng Tiền Giảm (Sale/Voucher)</div>
+                            <h4 class="fw-bold text-white mb-0 mt-1" id="revDiscount">0đ</h4>
+                            <small class="text-secondary" id="revPendingCount">0 đơn đang chờ</small>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card shadow-sm">
+                    <div class="card-header border-secondary d-flex flex-wrap justify-content-between align-items-center gap-2">
+                        <h6 class="mb-0 text-white fw-bold">📜 Lịch Sử Giao Dịch Thanh Toán SePay</h6>
+                        <div class="d-flex gap-2">
+                            <select id="revStatusFilter" class="form-select form-select-sm" style="width:160px;" onchange="renderRevenueTable()">
+                                <option value="ALL">Tất cả trạng thái</option>
+                                <option value="PAID">Đã thanh toán (PAID)</option>
+                                <option value="PENDING">Đang chờ (PENDING)</option>
+                            </select>
+                            <button class="btn btn-sm btn-outline-light" onclick="loadRevenueData()">🔄 Tải Lại</button>
+                        </div>
+                    </div>
+                    <div class="table-responsive">
+                        <table class="table table-hover align-middle mb-0">
+                            <thead class="table-dark">
+                                <tr>
+                                    <th>Mã Đơn</th>
+                                    <th>Mã Máy</th>
+                                    <th>Gói</th>
+                                    <th>Giá Gốc</th>
+                                    <th>Voucher / Giảm</th>
+                                    <th>Thực Thu</th>
+                                    <th>Trạng Thái</th>
+                                    <th>Mã GD SePay</th>
+                                    <th>Thời Gian</th>
+                                </tr>
+                            </thead>
+                            <tbody id="revenueOrdersBody">
+                                <tr><td colspan="9" class="text-center py-4">Bấm tab để tải lịch sử giao dịch...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <!-- TAB 5: CẤU HÌNH SEPAY, EMAIL, SALE & VOUCHER -->
             <div class="tab-pane fade" id="tab-sepay">
                 <div class="row g-4 mb-4">
                     <div class="col-lg-6">
                         <div class="card p-4 h-100">
-                            <h5 class="text-white fw-bold mb-3">🏦 Cấu Hình Tài Khoản Nhận Tiền (SePay VietQR)</h5>
+                            <h5 class="text-white fw-bold mb-3">🏦 Cấu Hình Tài Khoản Nhận Tiền &amp; Sale %</h5>
                             <div class="row g-3">
                                 <div class="col-md-6">
-                                    <label class="form-label small">Mã Ngân Hàng (VD: MB, VCB, ACB, TCB):</label>
-                                    <input type="text" id="spBankCode" class="form-control" placeholder="VD: MB">
+                                    <label class="form-label small">Mã Ngân Hàng (VD: BIDV, MB, VCB):</label>
+                                    <input type="text" id="spBankCode" class="form-control" placeholder="VD: BIDV">
                                 </div>
                                 <div class="col-md-6">
-                                    <label class="form-label small">Số Tài Khoản Ngân Hàng:</label>
-                                    <input type="text" id="spBankAccount" class="form-control" placeholder="VD: 0963913615">
+                                    <label class="form-label small">Số Tài Khoản (hoặc số VA BIDV):</label>
+                                    <input type="text" id="spBankAccount" class="form-control" placeholder="VD: 96247...">
                                 </div>
-                                <div class="col-12">
+                                <div class="col-md-6">
                                     <label class="form-label small">Tên Chủ Tài Khoản:</label>
-                                    <input type="text" id="spBankOwner" class="form-control" placeholder="VD: NGUYEN VAN A">
+                                    <input type="text" id="spBankOwner" class="form-control" placeholder="VD: DANG VAN MANH">
                                 </div>
-                                <div class="col-12">
-                                    <label class="form-label small">SePay Webhook API Key (để trống nếu không dùng Apikey):</label>
-                                    <input type="text" id="spApiKey" class="form-control" placeholder="Nhập API Key cấu hình trên SePay...">
+                                <div class="col-md-6">
+                                    <label class="form-label small">SePay Webhook API Key (tùy chọn):</label>
+                                    <input type="text" id="spApiKey" class="form-control" placeholder="Để trống nếu không dùng">
                                 </div>
                                 <div class="col-md-4">
                                     <label class="form-label small">Giá 1 Tháng (30 ngày):</label>
@@ -1487,49 +1623,97 @@ function renderAdminWebPage(env) {
                                     <label class="form-label small">Giá 1 Năm (365 ngày):</label>
                                     <input type="number" id="spPrice1y" class="form-control" value="1290000">
                                 </div>
+                                <div class="col-md-4">
+                                    <label class="form-label small text-warning fw-bold">🔥 Sale % Toàn Hệ Thống (0-90):</label>
+                                    <input type="number" id="spSalePercent" class="form-control" min="0" max="90" value="0">
+                                </div>
+                                <div class="col-md-8">
+                                    <label class="form-label small text-warning fw-bold">Nhãn Sale hiển thị (VD: Flash Sale -20%):</label>
+                                    <input type="text" id="spSaleLabel" class="form-control" placeholder="VD: Ưu đãi hôm nay">
+                                </div>
                                 <div class="col-12">
-                                    <button class="btn btn-primary w-100 fw-bold" onclick="saveSepaySettings()">💾 Lưu Cấu Hình SePay</button>
+                                    <label class="form-label small">🔗 Webhook URL dán vào SePay:</label>
+                                    <div class="input-group">
+                                        <input type="text" id="spWebhookUrl" class="form-control font-monospace text-info" readonly>
+                                        <button class="btn btn-outline-info" onclick="navigator.clipboard.writeText(document.getElementById('spWebhookUrl').value).then(() => alert('Đã copy Webhook URL!'))">📋 Copy</button>
+                                    </div>
                                 </div>
                             </div>
                         </div>
                     </div>
+
                     <div class="col-lg-6">
                         <div class="card p-4 h-100">
-                            <h5 class="text-white fw-bold mb-3">🔗 Hướng Dẫn Kết Nối Webhook SePay</h5>
-                            <p class="text-secondary small">Dán đường dẫn Webhook dưới đây vào mục <strong>Tích hợp Webhook</strong> trên trang quản trị SePay để hệ thống tự động gia hạn bản quyền ngay khi khách chuyển khoản:</p>
-                            <div class="input-group mb-3">
-                                <input type="text" id="spWebhookUrl" class="form-control font-monospace text-info" readonly>
-                                <button class="btn btn-outline-info" onclick="navigator.clipboard.writeText(document.getElementById('spWebhookUrl').value).then(() => alert('Đã copy Webhook URL!'))">📋 Copy</button>
+                            <h5 class="text-white fw-bold mb-3">📧 Cấu Hình Email SMTP &amp; Người Nhận Thông Báo</h5>
+                            <div class="row g-3">
+                                <div class="col-md-6">
+                                    <label class="form-label small">Gmail SMTP Gửi Đi:</label>
+                                    <input type="email" id="spSmtpUser" class="form-control" value="dangxuanmanh3105@gmail.com">
+                                </div>
+                                <div class="col-md-6">
+                                    <label class="form-label small">App Password (16 ký tự):</label>
+                                    <input type="text" id="spSmtpPass" class="form-control" value="senh eotx snse hquh">
+                                </div>
+                                <div class="col-12">
+                                    <label class="form-label small">Danh sách Email nhận thông báo khi có thanh toán mới (<strong>mỗi email 1 dòng</strong>):</label>
+                                    <textarea id="spNotifyEmails" class="form-control font-monospace" rows="4" placeholder="email1@gmail.com&#10;email2@gmail.com"></textarea>
+                                </div>
+                                <div class="col-md-7">
+                                    <button class="btn btn-primary w-100 fw-bold" onclick="saveSepaySettings()">💾 Lưu Tất Cả Cấu Hình SePay &amp; Email</button>
+                                </div>
+                                <div class="col-md-5">
+                                    <button class="btn btn-outline-success w-100 fw-bold" onclick="sendTestEmail()">✉️ Gửi Email Thử</button>
+                                </div>
                             </div>
-                            <ul class="small text-secondary mb-0">
-                                <li>Kiểu xác thực: <strong>API Key</strong> (nếu có nhập API Key ở bên trái) hoặc Không cần.</li>
-                                <li>Sự kiện bắn webhook: <strong>Tiền vào (In)</strong>.</li>
-                                <li>Khi khách quét mã QR trong phần mềm, hệ thống tạo mã đơn <code>CWAIxxxxxx</code>. Khi tiền vào khớp mã đơn, bản quyền tự động cộng ngày ngay lập tức!</li>
-                            </ul>
                         </div>
                     </div>
                 </div>
 
-                <div class="card shadow-sm">
-                    <div class="card-header border-secondary d-flex justify-content-between align-items-center">
-                        <h6 class="mb-0 text-white fw-bold">📜 Lịch Sử Đơn Nạp Tự Động (50 đơn gần nhất)</h6>
-                        <button class="btn btn-sm btn-outline-light" onclick="loadSepayData()">🔄 Tải Lại</button>
+                <!-- QUẢN LÝ VOUCHER -->
+                <div class="card p-4 mb-4">
+                    <h5 class="text-white fw-bold mb-3">🎟️ Quản Lý Mã Giảm Giá (Voucher)</h5>
+                    <div class="row g-2 align-items-end mb-3">
+                        <div class="col-md-3">
+                            <label class="form-label small">Mã Voucher (VD: VIP20):</label>
+                            <input type="text" id="vcCode" class="form-control text-uppercase" placeholder="VD: SALE20">
+                        </div>
+                        <div class="col-md-2">
+                            <label class="form-label small">Loại giảm:</label>
+                            <select id="vcType" class="form-select">
+                                <option value="percent">Theo %</option>
+                                <option value="fixed">Số tiền (VNĐ)</option>
+                            </select>
+                        </div>
+                        <div class="col-md-2">
+                            <label class="form-label small">Giá trị (% hoặc đ):</label>
+                            <input type="number" id="vcValue" class="form-control" placeholder="20">
+                        </div>
+                        <div class="col-md-2">
+                            <label class="form-label small">Giới hạn lượt (0=∞):</label>
+                            <input type="number" id="vcMaxUses" class="form-control" value="0">
+                        </div>
+                        <div class="col-md-2">
+                            <label class="form-label small">Hạn dùng (tùy chọn):</label>
+                            <input type="date" id="vcExpires" class="form-control">
+                        </div>
+                        <div class="col-md-1">
+                            <button class="btn btn-success w-100 fw-bold" onclick="saveVoucher()">➕ Tạo</button>
+                        </div>
                     </div>
                     <div class="table-responsive">
                         <table class="table table-hover align-middle mb-0">
                             <thead class="table-dark">
                                 <tr>
-                                    <th>Mã Đơn</th>
-                                    <th>Mã Máy</th>
-                                    <th>Số Tiền</th>
-                                    <th>Số Ngày</th>
+                                    <th>Mã Voucher</th>
+                                    <th>Giảm Giá</th>
+                                    <th>Đã Dùng / Tối Đa</th>
+                                    <th>Hạn Sử Dụng</th>
                                     <th>Trạng Thái</th>
-                                    <th>Tạo Lúc</th>
-                                    <th>Thanh Toán Lúc</th>
+                                    <th class="text-center">Thao Tác</th>
                                 </tr>
                             </thead>
-                            <tbody id="sepayOrdersBody">
-                                <tr><td colspan="7" class="text-center py-4">Bấm tab để tải đơn nạp...</td></tr>
+                            <tbody id="vouchersTableBody">
+                                <tr><td colspan="6" class="text-center py-3">Đang tải voucher...</td></tr>
                             </tbody>
                         </table>
                     </div>
@@ -1721,76 +1905,7 @@ function renderAdminWebPage(env) {
         }
 
         function reloadCurrentTab() {
-            // ==================== SEPAY AUTO RENEWAL ====================
-        async function loadSepayData() {
-            const whEl = document.getElementById('spWebhookUrl');
-            if (whEl) whEl.value = window.location.origin + '/api/sepay/webhook';
-            try {
-                const sRes = await fetch('/api/admin/sepay/settings', { headers: { 'X-Admin-Key': adminKey } });
-                if (sRes.ok) {
-                    const sj = await sRes.json();
-                    const s = sj.data || {};
-                    document.getElementById('spBankCode').value = s.bank_code || '';
-                    document.getElementById('spBankAccount').value = s.bank_account || '';
-                    document.getElementById('spBankOwner').value = s.bank_owner || '';
-                    document.getElementById('spApiKey').value = s.sepay_api_key || '';
-                    document.getElementById('spPrice1m').value = s.price_1m || '149000';
-                    document.getElementById('spPrice3m').value = s.price_3m || '399000';
-                    document.getElementById('spPrice1y').value = s.price_1y || '1290000';
-                }
-            } catch (e) {}
-
-            const tbody = document.getElementById('sepayOrdersBody');
-            try {
-                const oRes = await fetch('/api/admin/sepay/orders', { headers: { 'X-Admin-Key': adminKey } });
-                if (oRes.status === 401) {
-                    tbody.innerHTML = '<tr><td colspan="7" class="text-center text-danger py-4">❌ Sai mật khẩu Admin!</td></tr>';
-                    return;
-                }
-                const oj = await oRes.json();
-                const list = oj.data || [];
-                if (list.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="7" class="text-center py-4 text-secondary">Chưa có đơn nạp tự động nào.</td></tr>';
-                    return;
-                }
-                tbody.innerHTML = list.map(o => \`<tr>
-                    <td><code class="text-info fw-bold">\${escHtml(o.order_code)}</code></td>
-                    <td><code class="text-secondary">\${escHtml(o.machine_id)}</code></td>
-                    <td class="fw-bold text-warning">\${Number(o.amount || 0).toLocaleString('vi-VN')}đ</td>
-                    <td>+\${o.days_to_add} ngày</td>
-                    <td>\${o.status === 'PAID' ? '<span class="badge bg-success">PAID</span>' : '<span class="badge bg-warning text-dark">PENDING</span>'}</td>
-                    <td class="small text-secondary">\${escHtml(o.created_at || '')}</td>
-                    <td class="small text-success">\${escHtml(o.paid_at || '--')}</td>
-                </tr>\`).join('');
-            } catch (e) {
-                tbody.innerHTML = '<tr><td colspan="7" class="text-center text-danger py-4">Lỗi: ' + e.message + '</td></tr>';
-            }
-        }
-
-        async function saveSepaySettings() {
-            const data = {
-                bank_code: document.getElementById('spBankCode').value.trim().toUpperCase(),
-                bank_account: document.getElementById('spBankAccount').value.trim(),
-                bank_owner: document.getElementById('spBankOwner').value.trim().toUpperCase(),
-                sepay_api_key: document.getElementById('spApiKey').value.trim(),
-                price_1m: document.getElementById('spPrice1m').value.trim() || '149000',
-                price_3m: document.getElementById('spPrice3m').value.trim() || '399000',
-                price_1y: document.getElementById('spPrice1y').value.trim() || '1290000'
-            };
-            const res = await fetch('/api/admin/sepay/settings', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json', 'X-Admin-Key': adminKey },
-                body: JSON.stringify(data)
-            });
-            const j = await res.json();
-            if (j.success) {
-                alert('✅ Đã lưu cấu hình SePay thành công!');
-            } else {
-                alert('❌ ' + (j.error || 'Lỗi lưu cấu hình!'));
-            }
-        }
-
-        loadData();
+            loadData();
             loadFiles();
             loadGuides();
         }
@@ -1936,76 +2051,7 @@ function renderAdminWebPage(env) {
             const j = await res.json();
             if (j.success) {
                 if (modalInstance) modalInstance.hide();
-                // ==================== SEPAY AUTO RENEWAL ====================
-        async function loadSepayData() {
-            const whEl = document.getElementById('spWebhookUrl');
-            if (whEl) whEl.value = window.location.origin + '/api/sepay/webhook';
-            try {
-                const sRes = await fetch('/api/admin/sepay/settings', { headers: { 'X-Admin-Key': adminKey } });
-                if (sRes.ok) {
-                    const sj = await sRes.json();
-                    const s = sj.data || {};
-                    document.getElementById('spBankCode').value = s.bank_code || '';
-                    document.getElementById('spBankAccount').value = s.bank_account || '';
-                    document.getElementById('spBankOwner').value = s.bank_owner || '';
-                    document.getElementById('spApiKey').value = s.sepay_api_key || '';
-                    document.getElementById('spPrice1m').value = s.price_1m || '149000';
-                    document.getElementById('spPrice3m').value = s.price_3m || '399000';
-                    document.getElementById('spPrice1y').value = s.price_1y || '1290000';
-                }
-            } catch (e) {}
-
-            const tbody = document.getElementById('sepayOrdersBody');
-            try {
-                const oRes = await fetch('/api/admin/sepay/orders', { headers: { 'X-Admin-Key': adminKey } });
-                if (oRes.status === 401) {
-                    tbody.innerHTML = '<tr><td colspan="7" class="text-center text-danger py-4">❌ Sai mật khẩu Admin!</td></tr>';
-                    return;
-                }
-                const oj = await oRes.json();
-                const list = oj.data || [];
-                if (list.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="7" class="text-center py-4 text-secondary">Chưa có đơn nạp tự động nào.</td></tr>';
-                    return;
-                }
-                tbody.innerHTML = list.map(o => \`<tr>
-                    <td><code class="text-info fw-bold">\${escHtml(o.order_code)}</code></td>
-                    <td><code class="text-secondary">\${escHtml(o.machine_id)}</code></td>
-                    <td class="fw-bold text-warning">\${Number(o.amount || 0).toLocaleString('vi-VN')}đ</td>
-                    <td>+\${o.days_to_add} ngày</td>
-                    <td>\${o.status === 'PAID' ? '<span class="badge bg-success">PAID</span>' : '<span class="badge bg-warning text-dark">PENDING</span>'}</td>
-                    <td class="small text-secondary">\${escHtml(o.created_at || '')}</td>
-                    <td class="small text-success">\${escHtml(o.paid_at || '--')}</td>
-                </tr>\`).join('');
-            } catch (e) {
-                tbody.innerHTML = '<tr><td colspan="7" class="text-center text-danger py-4">Lỗi: ' + e.message + '</td></tr>';
-            }
-        }
-
-        async function saveSepaySettings() {
-            const data = {
-                bank_code: document.getElementById('spBankCode').value.trim().toUpperCase(),
-                bank_account: document.getElementById('spBankAccount').value.trim(),
-                bank_owner: document.getElementById('spBankOwner').value.trim().toUpperCase(),
-                sepay_api_key: document.getElementById('spApiKey').value.trim(),
-                price_1m: document.getElementById('spPrice1m').value.trim() || '149000',
-                price_3m: document.getElementById('spPrice3m').value.trim() || '399000',
-                price_1y: document.getElementById('spPrice1y').value.trim() || '1290000'
-            };
-            const res = await fetch('/api/admin/sepay/settings', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json', 'X-Admin-Key': adminKey },
-                body: JSON.stringify(data)
-            });
-            const j = await res.json();
-            if (j.success) {
-                alert('✅ Đã lưu cấu hình SePay thành công!');
-            } else {
-                alert('❌ ' + (j.error || 'Lỗi lưu cấu hình!'));
-            }
-        }
-
-        loadData();
+                loadData();
             } else {
                 alert(j.error || 'Lỗi khi lưu');
             }
@@ -2018,76 +2064,7 @@ function renderAdminWebPage(env) {
                 headers: { 'Content-Type': 'application/json', 'X-Admin-Key': adminKey },
                 body: JSON.stringify({ id })
             });
-            // ==================== SEPAY AUTO RENEWAL ====================
-        async function loadSepayData() {
-            const whEl = document.getElementById('spWebhookUrl');
-            if (whEl) whEl.value = window.location.origin + '/api/sepay/webhook';
-            try {
-                const sRes = await fetch('/api/admin/sepay/settings', { headers: { 'X-Admin-Key': adminKey } });
-                if (sRes.ok) {
-                    const sj = await sRes.json();
-                    const s = sj.data || {};
-                    document.getElementById('spBankCode').value = s.bank_code || '';
-                    document.getElementById('spBankAccount').value = s.bank_account || '';
-                    document.getElementById('spBankOwner').value = s.bank_owner || '';
-                    document.getElementById('spApiKey').value = s.sepay_api_key || '';
-                    document.getElementById('spPrice1m').value = s.price_1m || '149000';
-                    document.getElementById('spPrice3m').value = s.price_3m || '399000';
-                    document.getElementById('spPrice1y').value = s.price_1y || '1290000';
-                }
-            } catch (e) {}
-
-            const tbody = document.getElementById('sepayOrdersBody');
-            try {
-                const oRes = await fetch('/api/admin/sepay/orders', { headers: { 'X-Admin-Key': adminKey } });
-                if (oRes.status === 401) {
-                    tbody.innerHTML = '<tr><td colspan="7" class="text-center text-danger py-4">❌ Sai mật khẩu Admin!</td></tr>';
-                    return;
-                }
-                const oj = await oRes.json();
-                const list = oj.data || [];
-                if (list.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="7" class="text-center py-4 text-secondary">Chưa có đơn nạp tự động nào.</td></tr>';
-                    return;
-                }
-                tbody.innerHTML = list.map(o => \`<tr>
-                    <td><code class="text-info fw-bold">\${escHtml(o.order_code)}</code></td>
-                    <td><code class="text-secondary">\${escHtml(o.machine_id)}</code></td>
-                    <td class="fw-bold text-warning">\${Number(o.amount || 0).toLocaleString('vi-VN')}đ</td>
-                    <td>+\${o.days_to_add} ngày</td>
-                    <td>\${o.status === 'PAID' ? '<span class="badge bg-success">PAID</span>' : '<span class="badge bg-warning text-dark">PENDING</span>'}</td>
-                    <td class="small text-secondary">\${escHtml(o.created_at || '')}</td>
-                    <td class="small text-success">\${escHtml(o.paid_at || '--')}</td>
-                </tr>\`).join('');
-            } catch (e) {
-                tbody.innerHTML = '<tr><td colspan="7" class="text-center text-danger py-4">Lỗi: ' + e.message + '</td></tr>';
-            }
-        }
-
-        async function saveSepaySettings() {
-            const data = {
-                bank_code: document.getElementById('spBankCode').value.trim().toUpperCase(),
-                bank_account: document.getElementById('spBankAccount').value.trim(),
-                bank_owner: document.getElementById('spBankOwner').value.trim().toUpperCase(),
-                sepay_api_key: document.getElementById('spApiKey').value.trim(),
-                price_1m: document.getElementById('spPrice1m').value.trim() || '149000',
-                price_3m: document.getElementById('spPrice3m').value.trim() || '399000',
-                price_1y: document.getElementById('spPrice1y').value.trim() || '1290000'
-            };
-            const res = await fetch('/api/admin/sepay/settings', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json', 'X-Admin-Key': adminKey },
-                body: JSON.stringify(data)
-            });
-            const j = await res.json();
-            if (j.success) {
-                alert('✅ Đã lưu cấu hình SePay thành công!');
-            } else {
-                alert('❌ ' + (j.error || 'Lỗi lưu cấu hình!'));
-            }
-        }
-
-        loadData();
+            loadData();
         }
 
         async function deleteItem(id) {
@@ -2097,76 +2074,7 @@ function renderAdminWebPage(env) {
                 headers: { 'Content-Type': 'application/json', 'X-Admin-Key': adminKey },
                 body: JSON.stringify({ id })
             });
-            // ==================== SEPAY AUTO RENEWAL ====================
-        async function loadSepayData() {
-            const whEl = document.getElementById('spWebhookUrl');
-            if (whEl) whEl.value = window.location.origin + '/api/sepay/webhook';
-            try {
-                const sRes = await fetch('/api/admin/sepay/settings', { headers: { 'X-Admin-Key': adminKey } });
-                if (sRes.ok) {
-                    const sj = await sRes.json();
-                    const s = sj.data || {};
-                    document.getElementById('spBankCode').value = s.bank_code || '';
-                    document.getElementById('spBankAccount').value = s.bank_account || '';
-                    document.getElementById('spBankOwner').value = s.bank_owner || '';
-                    document.getElementById('spApiKey').value = s.sepay_api_key || '';
-                    document.getElementById('spPrice1m').value = s.price_1m || '149000';
-                    document.getElementById('spPrice3m').value = s.price_3m || '399000';
-                    document.getElementById('spPrice1y').value = s.price_1y || '1290000';
-                }
-            } catch (e) {}
-
-            const tbody = document.getElementById('sepayOrdersBody');
-            try {
-                const oRes = await fetch('/api/admin/sepay/orders', { headers: { 'X-Admin-Key': adminKey } });
-                if (oRes.status === 401) {
-                    tbody.innerHTML = '<tr><td colspan="7" class="text-center text-danger py-4">❌ Sai mật khẩu Admin!</td></tr>';
-                    return;
-                }
-                const oj = await oRes.json();
-                const list = oj.data || [];
-                if (list.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="7" class="text-center py-4 text-secondary">Chưa có đơn nạp tự động nào.</td></tr>';
-                    return;
-                }
-                tbody.innerHTML = list.map(o => \`<tr>
-                    <td><code class="text-info fw-bold">\${escHtml(o.order_code)}</code></td>
-                    <td><code class="text-secondary">\${escHtml(o.machine_id)}</code></td>
-                    <td class="fw-bold text-warning">\${Number(o.amount || 0).toLocaleString('vi-VN')}đ</td>
-                    <td>+\${o.days_to_add} ngày</td>
-                    <td>\${o.status === 'PAID' ? '<span class="badge bg-success">PAID</span>' : '<span class="badge bg-warning text-dark">PENDING</span>'}</td>
-                    <td class="small text-secondary">\${escHtml(o.created_at || '')}</td>
-                    <td class="small text-success">\${escHtml(o.paid_at || '--')}</td>
-                </tr>\`).join('');
-            } catch (e) {
-                tbody.innerHTML = '<tr><td colspan="7" class="text-center text-danger py-4">Lỗi: ' + e.message + '</td></tr>';
-            }
-        }
-
-        async function saveSepaySettings() {
-            const data = {
-                bank_code: document.getElementById('spBankCode').value.trim().toUpperCase(),
-                bank_account: document.getElementById('spBankAccount').value.trim(),
-                bank_owner: document.getElementById('spBankOwner').value.trim().toUpperCase(),
-                sepay_api_key: document.getElementById('spApiKey').value.trim(),
-                price_1m: document.getElementById('spPrice1m').value.trim() || '149000',
-                price_3m: document.getElementById('spPrice3m').value.trim() || '399000',
-                price_1y: document.getElementById('spPrice1y').value.trim() || '1290000'
-            };
-            const res = await fetch('/api/admin/sepay/settings', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json', 'X-Admin-Key': adminKey },
-                body: JSON.stringify(data)
-            });
-            const j = await res.json();
-            if (j.success) {
-                alert('✅ Đã lưu cấu hình SePay thành công!');
-            } else {
-                alert('❌ ' + (j.error || 'Lỗi lưu cấu hình!'));
-            }
-        }
-
-        loadData();
+            loadData();
         }
 
         function generateRandomKey() {
@@ -2604,7 +2512,64 @@ function renderAdminWebPage(env) {
             loadGuides();
         }
 
-        // ==================== SEPAY AUTO RENEWAL ====================
+        // ==================== REVENUE, SEPAY, EMAIL, SALE & VOUCHER ====================
+        let cachedOrders = [];
+
+        async function loadRevenueData() {
+            const tbody = document.getElementById('revenueOrdersBody');
+            try {
+                const res = await fetch('/api/admin/revenue/summary', { headers: { 'X-Admin-Key': adminKey } });
+                if (res.status === 401) {
+                    tbody.innerHTML = '<tr><td colspan="9" class="text-center text-danger py-4">❌ Sai mật khẩu Admin!</td></tr>';
+                    return;
+                }
+                const j = await res.json();
+                const st = j.stats || {};
+                document.getElementById('revToday').innerText = Number(st.today_revenue || 0).toLocaleString('vi-VN') + 'đ';
+                document.getElementById('revTodayCount').innerText = (st.today_count || 0) + ' đơn hôm nay';
+                document.getElementById('revMonth').innerText = Number(st.month_revenue || 0).toLocaleString('vi-VN') + 'đ';
+                document.getElementById('revMonthCount').innerText = (st.month_count || 0) + ' đơn tháng này';
+                document.getElementById('revTotal').innerText = Number(st.total_revenue || 0).toLocaleString('vi-VN') + 'đ';
+                document.getElementById('revTotalCount').innerText = (st.total_paid_count || 0) + ' đơn thành công';
+                document.getElementById('revDiscount').innerText = Number(st.total_discount || 0).toLocaleString('vi-VN') + 'đ';
+                document.getElementById('revPendingCount').innerText = (st.pending_count || 0) + ' đơn đang chờ';
+
+                cachedOrders = j.orders || [];
+                renderRevenueTable();
+            } catch (e) {
+                tbody.innerHTML = '<tr><td colspan="9" class="text-center text-danger py-4">Lỗi: ' + e.message + '</td></tr>';
+            }
+        }
+
+        function renderRevenueTable() {
+            const tbody = document.getElementById('revenueOrdersBody');
+            const filter = document.getElementById('revStatusFilter').value;
+            const list = filter === 'ALL' ? cachedOrders : cachedOrders.filter(o => o.status === filter);
+            if (list.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="9" class="text-center py-4 text-secondary">Chưa có giao dịch nào.</td></tr>';
+                return;
+            }
+            tbody.innerHTML = list.map(o => {
+                const orig = Number(o.original_amount || o.amount || 0);
+                const disc = Number(o.discount_amount || 0);
+                const vc = o.voucher_code ? \`<span class="badge bg-info text-dark">\${escHtml(o.voucher_code)}</span> \` : '';
+                const statusBadge = o.status === 'PAID'
+                    ? '<span class="badge bg-success">PAID</span>'
+                    : '<span class="badge bg-warning text-dark">PENDING</span>';
+                return \`<tr>
+                    <td><code class="text-info fw-bold">\${escHtml(o.order_code)}</code></td>
+                    <td><code class="text-light">\${escHtml(o.machine_id)}</code></td>
+                    <td>+\${o.days_to_add} ngày</td>
+                    <td class="text-secondary">\${orig.toLocaleString('vi-VN')}đ</td>
+                    <td>\${vc}\${disc > 0 ? \`<span class="text-danger">-\${disc.toLocaleString('vi-VN')}đ</span>\` : '<span class="text-muted">--</span>'}</td>
+                    <td class="fw-bold text-warning">\${Number(o.amount || 0).toLocaleString('vi-VN')}đ</td>
+                    <td>\${statusBadge}</td>
+                    <td class="small text-secondary">\${escHtml(o.sepay_tx_id || '--')}</td>
+                    <td class="small">\${o.paid_at ? \`<span class="text-success">\${escHtml(o.paid_at)}</span>\` : \`<span class="text-secondary">\${escHtml(o.created_at || '')}</span>\`}</td>
+                </tr>\`;
+            }).join('');
+        }
+
         async function loadSepayData() {
             const whEl = document.getElementById('spWebhookUrl');
             if (whEl) whEl.value = window.location.origin + '/api/sepay/webhook';
@@ -2620,34 +2585,14 @@ function renderAdminWebPage(env) {
                     document.getElementById('spPrice1m').value = s.price_1m || '149000';
                     document.getElementById('spPrice3m').value = s.price_3m || '399000';
                     document.getElementById('spPrice1y').value = s.price_1y || '1290000';
+                    document.getElementById('spSalePercent').value = s.sale_percent || '0';
+                    document.getElementById('spSaleLabel').value = s.sale_label || '';
+                    document.getElementById('spSmtpUser').value = s.smtp_user || 'dangxuanmanh3105@gmail.com';
+                    document.getElementById('spSmtpPass').value = s.smtp_pass || 'senh eotx snse hquh';
+                    document.getElementById('spNotifyEmails').value = s.notify_emails || 'dangxuanmanh3105@gmail.com';
                 }
             } catch (e) {}
-
-            const tbody = document.getElementById('sepayOrdersBody');
-            try {
-                const oRes = await fetch('/api/admin/sepay/orders', { headers: { 'X-Admin-Key': adminKey } });
-                if (oRes.status === 401) {
-                    tbody.innerHTML = '<tr><td colspan="7" class="text-center text-danger py-4">❌ Sai mật khẩu Admin!</td></tr>';
-                    return;
-                }
-                const oj = await oRes.json();
-                const list = oj.data || [];
-                if (list.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="7" class="text-center py-4 text-secondary">Chưa có đơn nạp tự động nào.</td></tr>';
-                    return;
-                }
-                tbody.innerHTML = list.map(o => \`<tr>
-                    <td><code class="text-info fw-bold">\${escHtml(o.order_code)}</code></td>
-                    <td><code class="text-secondary">\${escHtml(o.machine_id)}</code></td>
-                    <td class="fw-bold text-warning">\${Number(o.amount || 0).toLocaleString('vi-VN')}đ</td>
-                    <td>+\${o.days_to_add} ngày</td>
-                    <td>\${o.status === 'PAID' ? '<span class="badge bg-success">PAID</span>' : '<span class="badge bg-warning text-dark">PENDING</span>'}</td>
-                    <td class="small text-secondary">\${escHtml(o.created_at || '')}</td>
-                    <td class="small text-success">\${escHtml(o.paid_at || '--')}</td>
-                </tr>\`).join('');
-            } catch (e) {
-                tbody.innerHTML = '<tr><td colspan="7" class="text-center text-danger py-4">Lỗi: ' + e.message + '</td></tr>';
-            }
+            loadVouchers();
         }
 
         async function saveSepaySettings() {
@@ -2658,7 +2603,12 @@ function renderAdminWebPage(env) {
                 sepay_api_key: document.getElementById('spApiKey').value.trim(),
                 price_1m: document.getElementById('spPrice1m').value.trim() || '149000',
                 price_3m: document.getElementById('spPrice3m').value.trim() || '399000',
-                price_1y: document.getElementById('spPrice1y').value.trim() || '1290000'
+                price_1y: document.getElementById('spPrice1y').value.trim() || '1290000',
+                sale_percent: document.getElementById('spSalePercent').value.trim() || '0',
+                sale_label: document.getElementById('spSaleLabel').value.trim(),
+                smtp_user: document.getElementById('spSmtpUser').value.trim(),
+                smtp_pass: document.getElementById('spSmtpPass').value.trim(),
+                notify_emails: document.getElementById('spNotifyEmails').value.trim()
             };
             const res = await fetch('/api/admin/sepay/settings', {
                 method: 'POST',
@@ -2667,10 +2617,88 @@ function renderAdminWebPage(env) {
             });
             const j = await res.json();
             if (j.success) {
-                alert('✅ Đã lưu cấu hình SePay thành công!');
+                alert('✅ Đã lưu cấu hình SePay, Email & Sale thành công!');
             } else {
                 alert('❌ ' + (j.error || 'Lỗi lưu cấu hình!'));
             }
+        }
+
+        async function sendTestEmail() {
+            await saveSepaySettings();
+            const res = await fetch('/api/admin/sepay/test-email', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'X-Admin-Key': adminKey }
+            });
+            const j = await res.json();
+            if (j.success) {
+                alert('✅ ' + (j.message || 'Đã gửi email thử thành công!'));
+            } else {
+                alert('❌ Lỗi gửi email: ' + (j.error || 'Không rõ lỗi'));
+            }
+        }
+
+        async function loadVouchers() {
+            const tbody = document.getElementById('vouchersTableBody');
+            try {
+                const res = await fetch('/api/admin/vouchers/list', { headers: { 'X-Admin-Key': adminKey } });
+                if (res.status === 401) {
+                    tbody.innerHTML = '<tr><td colspan="6" class="text-center text-danger py-3">❌ Sai mật khẩu Admin!</td></tr>';
+                    return;
+                }
+                const j = await res.json();
+                const list = j.data || [];
+                if (list.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="6" class="text-center py-3 text-secondary">Chưa có mã Voucher nào.</td></tr>';
+                    return;
+                }
+                tbody.innerHTML = list.map(v => \`<tr>
+                    <td><code class="text-warning fw-bold fs-6">\${escHtml(v.code)}</code></td>
+                    <td>\${v.discount_type === 'percent' ? \`<span class="badge bg-info text-dark">-\${v.discount_value}%</span>\` : \`<span class="badge bg-primary">-\${Number(v.discount_value).toLocaleString('vi-VN')}đ</span>\`}</td>
+                    <td>\${v.used_count || 0} / \${v.max_uses > 0 ? v.max_uses : '∞'}</td>
+                    <td>\${v.expires_at ? escHtml(v.expires_at) : '<span class="text-secondary">Không giới hạn</span>'}</td>
+                    <td>\${v.is_active ? '<span class="badge bg-success">Đang bật</span>' : '<span class="badge bg-secondary">Đã tắt</span>'}</td>
+                    <td class="text-center">
+                        <button class="btn btn-sm btn-outline-danger" onclick="deleteVoucher(\${v.id})">Xóa</button>
+                    </td>
+                </tr>\`).join('');
+            } catch (e) {
+                tbody.innerHTML = '<tr><td colspan="6" class="text-center text-danger py-3">Lỗi: ' + e.message + '</td></tr>';
+            }
+        }
+
+        async function saveVoucher() {
+            const code = document.getElementById('vcCode').value.trim().toUpperCase();
+            const discount_type = document.getElementById('vcType').value;
+            const discount_value = parseInt(document.getElementById('vcValue').value || '0');
+            const max_uses = parseInt(document.getElementById('vcMaxUses').value || '0');
+            const expires_at = document.getElementById('vcExpires').value.trim();
+            if (!code || discount_value <= 0) {
+                alert('Vui lòng nhập Mã Voucher và Giá trị giảm hợp lệ!');
+                return;
+            }
+            const res = await fetch('/api/admin/vouchers/save', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'X-Admin-Key': adminKey },
+                body: JSON.stringify({ code, discount_type, discount_value, max_uses, expires_at })
+            });
+            const j = await res.json();
+            if (j.success) {
+                document.getElementById('vcCode').value = '';
+                document.getElementById('vcValue').value = '';
+                loadVouchers();
+            } else {
+                alert('❌ ' + (j.error || 'Lỗi tạo voucher!'));
+            }
+        }
+
+        async function deleteVoucher(id) {
+            if (!confirm('Xóa mã Voucher này?')) return;
+            await fetch('/api/admin/vouchers/delete', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'X-Admin-Key': adminKey },
+                body: JSON.stringify({ id })
+            });
+            loadVouchers();
         }
 
         loadData();
@@ -2856,12 +2884,105 @@ async function getSepaySettingsMap(env) {
         sepay_api_key: "",
         price_1m: "149000",
         price_3m: "399000",
-        price_1y: "1290000"
+        price_1y: "1290000",
+        sale_percent: "0",
+        sale_label: "",
+        smtp_user: "dangxuanmanh3105@gmail.com",
+        smtp_pass: "senh eotx snse hquh",
+        notify_emails: "dangxuanmanh3105@gmail.com"
     };
     for (const r of (results || [])) {
         if (r.key) map[r.key] = r.value || "";
     }
     return map;
+}
+
+function utf8ToBase64(str) {
+    const bytes = new TextEncoder().encode(str);
+    let bin = "";
+    for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    return btoa(bin);
+}
+
+async function sendGmailSmtp({ smtpUser, smtpPass, recipients, subject, htmlBody }) {
+    const user = String(smtpUser || "").trim();
+    const pass = String(smtpPass || "").replace(/\s+/g, "");
+    const list = (recipients || []).map(e => String(e || "").trim()).filter(e => e.includes("@"));
+    if (!user || !pass || list.length === 0) {
+        return { sent: false, reason: "Thiếu thông tin SMTP hoặc danh sách email nhận!" };
+    }
+
+    const socket = connect({ hostname: "smtp.gmail.com", port: 465 }, { secureTransport: "on", allowHalfOpen: false });
+    const reader = socket.readable.getReader();
+    const writer = socket.writable.getWriter();
+    const decoder = new TextDecoder();
+    const encoder = new TextEncoder();
+
+    let buf = "";
+    const readResp = async () => {
+        while (true) {
+            const lines = buf.split("\r\n");
+            if (lines.length > 1) {
+                for (let i = 0; i < lines.length - 1; i++) {
+                    if (/^\d{3} /.test(lines[i])) {
+                        const full = lines.slice(0, i + 1).join("\r\n");
+                        buf = lines.slice(i + 1).join("\r\n");
+                        return full;
+                    }
+                }
+            }
+            const { value, done } = await reader.read();
+            if (done) throw new Error("SMTP connection closed unexpectedly");
+            buf += decoder.decode(value, { stream: true });
+        }
+    };
+
+    const sendCmd = async (cmd, expectedPrefix) => {
+        await writer.write(encoder.encode(cmd + "\r\n"));
+        const resp = await readResp();
+        if (expectedPrefix && !resp.startsWith(expectedPrefix)) {
+            throw new Error(`SMTP error (${cmd.split(" ")[0]}): ${resp}`);
+        }
+        return resp;
+    };
+
+    try {
+        const greet = await readResp();
+        if (!greet.startsWith("220")) throw new Error("SMTP greeting error: " + greet);
+        await sendCmd("EHLO link.truyennha.id.vn", "250");
+        await sendCmd("AUTH LOGIN", "334");
+        await sendCmd(btoa(user), "334");
+        await sendCmd(btoa(pass), "235");
+        await sendCmd(`MAIL FROM:<${user}>`, "250");
+        for (const rcpt of list) {
+            await sendCmd(`RCPT TO:<${rcpt}>`, "250");
+        }
+        await sendCmd("DATA", "354");
+
+        const encodedSubj = `=?UTF-8?B?${utf8ToBase64(subject)}?=`;
+        const b64Body = utf8ToBase64(htmlBody).replace(/(.{76})/g, "$1\r\n");
+        const message = [
+            `From: "Tools Marketing Auto Post" <${user}>`,
+            `To: ${list.join(", ")}`,
+            `Subject: ${encodedSubj}`,
+            `MIME-Version: 1.0`,
+            `Content-Type: text/html; charset=UTF-8`,
+            `Content-Transfer-Encoding: base64`,
+            ``,
+            b64Body,
+            `.`
+        ].join("\r\n");
+
+        await writer.write(encoder.encode(message + "\r\n"));
+        const dataResp = await readResp();
+        if (!dataResp.startsWith("250")) throw new Error("SMTP DATA error: " + dataResp);
+        await sendCmd("QUIT", "221").catch(() => {});
+        return { sent: true, count: list.length };
+    } finally {
+        try { reader.releaseLock(); } catch {}
+        try { writer.releaseLock(); } catch {}
+        try { await socket.close(); } catch {}
+    }
 }
 
 async function handleAdminSepaySettings(request, env) {
@@ -2873,7 +2994,12 @@ async function handleAdminSepaySettings(request, env) {
     if (request.method === "POST") {
         await ensureExtraTables(env);
         const body = await request.json().catch(() => ({}));
-        const keys = ["bank_code", "bank_account", "bank_owner", "sepay_api_key", "price_1m", "price_3m", "price_1y"];
+        const keys = [
+            "bank_code", "bank_account", "bank_owner", "sepay_api_key",
+            "price_1m", "price_3m", "price_1y",
+            "sale_percent", "sale_label",
+            "smtp_user", "smtp_pass", "notify_emails"
+        ];
         for (const k of keys) {
             if (body[k] !== undefined) {
                 await env.DB.prepare(
@@ -2881,9 +3007,185 @@ async function handleAdminSepaySettings(request, env) {
                 ).bind(k, String(body[k] || "").trim()).run();
             }
         }
-        return jsonResponse({ success: true, message: "Đã lưu cấu hình SePay!" });
+        return jsonResponse({ success: true, message: "Đã lưu cấu hình SePay & Email!" });
     }
     return jsonResponse({ error: "Method not allowed" }, 405);
+}
+
+async function handleAdminTestEmail(request, env) {
+    if (!checkAdminAuth(request, env)) return jsonResponse({ error: "Unauthorized" }, 401);
+    const s = await getSepaySettingsMap(env);
+    const recipients = String(s.notify_emails || "").split(/\r?\n/).map(x => x.trim()).filter(Boolean);
+    try {
+        const res = await sendGmailSmtp({
+            smtpUser: s.smtp_user,
+            smtpPass: s.smtp_pass,
+            recipients,
+            subject: "[Auto Post] Kiểm tra gửi Email thông báo thanh toán SePay",
+            htmlBody: `<div style="font-family:Arial,sans-serif;padding:16px;background:#0f172a;color:#f8fafc;border-radius:8px;">
+                <h2 style="color:#34d399;">✅ Kết nối Gmail SMTP thành công!</h2>
+                <p>Hệ thống <strong>Tools Marketing &amp; Auto Post</strong> sẽ tự động gửi thông báo về các email này mỗi khi có giao dịch thanh toán SePay thành công.</p>
+                <p style="color:#94a3b8;font-size:12px;">Thời gian kiểm tra: ${getVietnamDateString()}</p>
+            </div>`
+        });
+        if (!res.sent) return jsonResponse({ success: false, error: res.reason }, 400);
+        return jsonResponse({ success: true, message: `Đã gửi email thử tới ${res.count} địa chỉ!` });
+    } catch (e) {
+        return jsonResponse({ success: false, error: e.message }, 500);
+    }
+}
+
+async function handleAdminRevenueSummary(request, env) {
+    if (!checkAdminAuth(request, env)) return jsonResponse({ error: "Unauthorized" }, 401);
+    await ensureExtraTables(env);
+    const todayIso = getVietnamDateString();
+    const monthPrefix = todayIso.slice(0, 7);
+
+    const { results } = await env.DB.prepare("SELECT * FROM payment_orders ORDER BY id DESC LIMIT 200").all();
+    const orders = results || [];
+
+    let todayRevenue = 0, todayCount = 0;
+    let monthRevenue = 0, monthCount = 0;
+    let totalRevenue = 0, totalPaidCount = 0;
+    let totalDiscount = 0, pendingCount = 0;
+
+    for (const o of orders) {
+        if (o.status === "PAID") {
+            const amt = Number(o.amount || 0);
+            const disc = Number(o.discount_amount || 0);
+            totalRevenue += amt;
+            totalDiscount += disc;
+            totalPaidCount += 1;
+            const paidDate = String(o.paid_at || o.created_at || "").slice(0, 10);
+            if (paidDate === todayIso) {
+                todayRevenue += amt;
+                todayCount += 1;
+            }
+            if (paidDate.startsWith(monthPrefix)) {
+                monthRevenue += amt;
+                monthCount += 1;
+            }
+        } else {
+            pendingCount += 1;
+        }
+    }
+
+    return jsonResponse({
+        success: true,
+        stats: {
+            today_revenue: todayRevenue,
+            today_count: todayCount,
+            month_revenue: monthRevenue,
+            month_count: monthCount,
+            total_revenue: totalRevenue,
+            total_paid_count: totalPaidCount,
+            total_discount: totalDiscount,
+            pending_count: pendingCount
+        },
+        orders
+    });
+}
+
+async function handleAdminVouchersList(request, env) {
+    if (!checkAdminAuth(request, env)) return jsonResponse({ error: "Unauthorized" }, 401);
+    await ensureExtraTables(env);
+    const { results } = await env.DB.prepare("SELECT * FROM vouchers ORDER BY id DESC").all();
+    return jsonResponse({ success: true, data: results || [] });
+}
+
+async function handleAdminVouchersSave(request, env) {
+    if (!checkAdminAuth(request, env)) return jsonResponse({ error: "Unauthorized" }, 401);
+    await ensureExtraTables(env);
+    const body = await request.json().catch(() => ({}));
+    const code = String(body.code || "").trim().toUpperCase();
+    const discountType = body.discount_type === "fixed" ? "fixed" : "percent";
+    const discountValue = Number(body.discount_value || 0);
+    const maxUses = Number(body.max_uses || 0);
+    const expiresAt = String(body.expires_at || "").trim();
+
+    if (!code || discountValue <= 0) {
+        return jsonResponse({ success: false, error: "Mã voucher và giá trị giảm không hợp lệ!" }, 400);
+    }
+
+    await env.DB.prepare(`
+        INSERT INTO vouchers (code, discount_type, discount_value, max_uses, expires_at, is_active)
+        VALUES (?, ?, ?, ?, ?, 1)
+        ON CONFLICT(code) DO UPDATE SET
+            discount_type = excluded.discount_type,
+            discount_value = excluded.discount_value,
+            max_uses = excluded.max_uses,
+            expires_at = excluded.expires_at,
+            is_active = 1
+    `).bind(code, discountType, discountValue, maxUses, expiresAt).run();
+
+    return jsonResponse({ success: true, message: "Đã lưu mã Voucher!" });
+}
+
+async function handleAdminVouchersDelete(request, env) {
+    if (!checkAdminAuth(request, env)) return jsonResponse({ error: "Unauthorized" }, 401);
+    const body = await request.json().catch(() => ({}));
+    if (!body.id) return jsonResponse({ error: "Thiếu id" }, 400);
+    await env.DB.prepare("DELETE FROM vouchers WHERE id = ?").bind(body.id).run();
+    return jsonResponse({ success: true });
+}
+
+async function validateAndComputeOrderPrice(env, s, packageId, voucherCodeRaw) {
+    const pkgMap = {
+        "1m": { label: "Gói 1 Tháng (30 ngày)", days: 30, base: Number(s.price_1m || 149000) },
+        "3m": { label: "Gói 3 Tháng (90 ngày)", days: 90, base: Number(s.price_3m || 399000) },
+        "1y": { label: "Gói 1 Năm (365 ngày)", days: 365, base: Number(s.price_1y || 1290000) }
+    };
+    const pkg = pkgMap[packageId] || pkgMap["1m"];
+    const originalAmount = pkg.base;
+
+    const salePercent = Math.min(90, Math.max(0, Number(s.sale_percent || 0)));
+    const saleDiscount = Math.round(originalAmount * salePercent / 100);
+    let afterSale = Math.max(2000, originalAmount - saleDiscount);
+
+    let voucherDiscount = 0;
+    let validVoucherCode = "";
+    let voucherMsg = "";
+
+    const vcCode = String(voucherCodeRaw || "").trim().toUpperCase();
+    if (vcCode) {
+        const vRes = await env.DB.prepare("SELECT * FROM vouchers WHERE code = ? AND is_active = 1 LIMIT 1").bind(vcCode).all();
+        if (!vRes.results || vRes.results.length === 0) {
+            return { ok: false, error: `Mã giảm giá '${vcCode}' không tồn tại hoặc đã bị tắt!` };
+        }
+        const v = vRes.results[0];
+        const todayIso = getVietnamDateString();
+        if (v.expires_at && v.expires_at < todayIso) {
+            return { ok: false, error: `Mã giảm giá '${vcCode}' đã hết hạn (${v.expires_at})!` };
+        }
+        if (Number(v.max_uses || 0) > 0 && Number(v.used_count || 0) >= Number(v.max_uses)) {
+            return { ok: false, error: `Mã giảm giá '${vcCode}' đã hết lượt sử dụng!` };
+        }
+        if (v.discount_type === "percent") {
+            const pct = Math.min(90, Math.max(0, Number(v.discount_value || 0)));
+            voucherDiscount = Math.round(afterSale * pct / 100);
+            voucherMsg = `Áp dụng mã ${vcCode} (-${pct}%) thành công!`;
+        } else {
+            voucherDiscount = Math.min(afterSale - 2000, Math.max(0, Number(v.discount_value || 0)));
+            voucherMsg = `Áp dụng mã ${vcCode} (-${voucherDiscount.toLocaleString("vi-VN")}đ) thành công!`;
+        }
+        validVoucherCode = vcCode;
+    }
+
+    const totalDiscount = saleDiscount + voucherDiscount;
+    const finalAmount = Math.max(2000, originalAmount - totalDiscount);
+
+    return {
+        ok: true,
+        pkg,
+        original_amount: originalAmount,
+        sale_percent: salePercent,
+        sale_discount: saleDiscount,
+        voucher_code: validVoucherCode,
+        voucher_discount: voucherDiscount,
+        total_discount: totalDiscount,
+        final_amount: finalAmount,
+        voucher_message: voucherMsg
+    };
 }
 
 async function handleAdminSepayOrders(request, env) {
@@ -2895,14 +3197,40 @@ async function handleAdminSepayOrders(request, env) {
 
 async function handlePaymentPackages(env) {
     const s = await getSepaySettingsMap(env);
+    const salePercent = Math.min(90, Math.max(0, Number(s.sale_percent || 0)));
+    const calc = (base) => {
+        const b = Number(base);
+        return salePercent > 0 ? Math.max(2000, Math.round(b * (100 - salePercent) / 100)) : b;
+    };
     return jsonResponse({
         success: true,
         configured: Boolean(s.bank_code && s.bank_account),
+        sale_percent: salePercent,
+        sale_label: s.sale_label || (salePercent > 0 ? `🔥 Đang giảm ${salePercent}%` : ""),
         packages: [
-            { id: "1m", label: "Gói 1 Tháng (30 ngày)", days: 30, amount: Number(s.price_1m || 149000) },
-            { id: "3m", label: "Gói 3 Tháng (90 ngày)", days: 90, amount: Number(s.price_3m || 399000) },
-            { id: "1y", label: "Gói 1 Năm (365 ngày)", days: 365, amount: Number(s.price_1y || 1290000) }
+            { id: "1m", label: "Gói 1 Tháng (30 ngày)", days: 30, original_amount: Number(s.price_1m || 149000), amount: calc(s.price_1m || 149000) },
+            { id: "3m", label: "Gói 3 Tháng (90 ngày)", days: 90, original_amount: Number(s.price_3m || 399000), amount: calc(s.price_3m || 399000) },
+            { id: "1y", label: "Gói 1 Năm (365 ngày)", days: 365, original_amount: Number(s.price_1y || 1290000), amount: calc(s.price_1y || 1290000) }
         ]
+    });
+}
+
+async function handlePaymentApplyVoucher(request, env) {
+    const body = await request.json().catch(() => ({}));
+    const packageId = String(body.package_id || "1m").trim();
+    const voucherCode = String(body.voucher_code || "").trim().toUpperCase();
+    const s = await getSepaySettingsMap(env);
+    const calc = await validateAndComputeOrderPrice(env, s, packageId, voucherCode);
+    if (!calc.ok) return jsonResponse({ success: false, error: calc.error }, 400);
+    return jsonResponse({
+        success: true,
+        original_amount: calc.original_amount,
+        sale_discount: calc.sale_discount,
+        voucher_discount: calc.voucher_discount,
+        total_discount: calc.total_discount,
+        final_amount: calc.final_amount,
+        voucher_code: calc.voucher_code,
+        message: calc.voucher_message
     });
 }
 
@@ -2910,6 +3238,7 @@ async function handlePaymentCreateOrder(request, env) {
     const body = await request.json().catch(() => ({}));
     const machineId = String(body.machine_id || "").trim();
     const packageId = String(body.package_id || "1m").trim();
+    const voucherCode = String(body.voucher_code || "").trim().toUpperCase();
     if (!machineId) return jsonResponse({ success: false, error: "Thiếu machine_id!" }, 400);
 
     const s = await getSepaySettingsMap(env);
@@ -2920,12 +3249,8 @@ async function handlePaymentCreateOrder(request, env) {
         }, 400);
     }
 
-    const pkgMap = {
-        "1m": { label: "Gói 1 Tháng (30 ngày)", days: 30, amount: Number(s.price_1m || 149000) },
-        "3m": { label: "Gói 3 Tháng (90 ngày)", days: 90, amount: Number(s.price_3m || 399000) },
-        "1y": { label: "Gói 1 Năm (365 ngày)", days: 365, amount: Number(s.price_1y || 1290000) }
-    };
-    const pkg = pkgMap[packageId] || pkgMap["1m"];
+    const calc = await validateAndComputeOrderPrice(env, s, packageId, voucherCode);
+    if (!calc.ok) return jsonResponse({ success: false, error: calc.error }, 400);
 
     const digits = "0123456789ABCDEFGHJKLMNPQRSTUVWXYZ";
     let randCode = "";
@@ -2936,18 +3261,21 @@ async function handlePaymentCreateOrder(request, env) {
     const existingKey = (licRes.results && licRes.results[0]) ? licRes.results[0].license_key : "";
 
     await env.DB.prepare(`
-        INSERT INTO payment_orders (order_code, machine_id, license_key, package_id, amount, days_to_add, status, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, 'PENDING', datetime('now', '+7 hours'))
-    `).bind(orderCode, machineId, existingKey, packageId, pkg.amount, pkg.days).run();
+        INSERT INTO payment_orders (order_code, machine_id, license_key, package_id, original_amount, discount_amount, voucher_code, amount, days_to_add, status, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', datetime('now', '+7 hours'))
+    `).bind(orderCode, machineId, existingKey, packageId, calc.original_amount, calc.total_discount, calc.voucher_code, calc.final_amount, calc.pkg.days).run();
 
-    const qrUrl = `https://qr.sepay.vn/img?acc=${encodeURIComponent(s.bank_account)}&bank=${encodeURIComponent(s.bank_code)}&amount=${pkg.amount}&des=${encodeURIComponent(orderCode)}`;
+    const qrUrl = `https://qr.sepay.vn/img?acc=${encodeURIComponent(s.bank_account)}&bank=${encodeURIComponent(s.bank_code)}&amount=${calc.final_amount}&des=${encodeURIComponent(orderCode)}`;
 
     return jsonResponse({
         success: true,
         order_code: orderCode,
-        amount: pkg.amount,
-        days_to_add: pkg.days,
-        package_label: pkg.label,
+        original_amount: calc.original_amount,
+        discount_amount: calc.total_discount,
+        voucher_code: calc.voucher_code,
+        amount: calc.final_amount,
+        days_to_add: calc.pkg.days,
+        package_label: calc.pkg.label,
         bank_code: s.bank_code,
         bank_account: s.bank_account,
         bank_owner: s.bank_owner,
@@ -3024,19 +3352,26 @@ async function handleSepayWebhook(request, env) {
         "UPDATE payment_orders SET status = 'PAID', sepay_tx_id = ?, paid_at = datetime('now', '+7 hours') WHERE id = ?"
     ).bind(txId, matched.id).run();
 
+    if (matched.voucher_code) {
+        await env.DB.prepare("UPDATE vouchers SET used_count = used_count + 1 WHERE code = ?").bind(matched.voucher_code).run().catch(() => {});
+    }
+
     // Gia hạn hoặc kích hoạt bản quyền cho machine_id
     const todayIso = getVietnamDateString();
+    let newExpiryDisplay = "";
     const licRes = await env.DB.prepare("SELECT * FROM licenses WHERE machine_id = ? LIMIT 1").bind(matched.machine_id).all();
     if (licRes.results && licRes.results.length > 0) {
         const row = licRes.results[0];
         const curExp = String(row.expiry_date || "").trim().toUpperCase();
         if (curExp === "LIFETIME") {
+            newExpiryDisplay = "Vĩnh viễn";
             await env.DB.prepare("UPDATE licenses SET status = 'ACTIVE', note = ? WHERE id = ?")
                 .bind(`Gia hạn SePay ${matched.order_code}`, row.id).run();
         } else {
             const baseDateStr = (curExp >= todayIso && /^\d{4}-\d{2}-\d{2}$/.test(curExp)) ? curExp : todayIso;
             const baseMs = Date.parse(baseDateStr + "T00:00:00Z");
             const newExpiry = new Date(baseMs + Number(matched.days_to_add) * 86400 * 1000).toISOString().slice(0, 10);
+            newExpiryDisplay = formatDMY(newExpiry);
             await env.DB.prepare(
                 "UPDATE licenses SET expiry_date = ?, status = 'ACTIVE', last_verified_at = datetime('now', '+7 hours'), note = ? WHERE id = ?"
             ).bind(newExpiry, `Gia hạn SePay ${matched.order_code} (+${matched.days_to_add} ngày)`, row.id).run();
@@ -3051,10 +3386,38 @@ async function handleSepayWebhook(request, env) {
         const newKey = `CWAI-${randPart()}-${randPart()}-${randPart()}`;
         const baseMs = Date.parse(todayIso + "T00:00:00Z");
         const newExpiry = new Date(baseMs + Number(matched.days_to_add) * 86400 * 1000).toISOString().slice(0, 10);
+        newExpiryDisplay = formatDMY(newExpiry);
         await env.DB.prepare(`
             INSERT INTO licenses (license_key, machine_id, customer_name, expiry_date, status, last_verified_at, note)
             VALUES (?, ?, 'Khách nạp SePay', ?, 'ACTIVE', datetime('now', '+7 hours'), ?)
         `).bind(newKey, matched.machine_id, newExpiry, `Nạp SePay ${matched.order_code} (+${matched.days_to_add} ngày)`).run();
+    }
+
+    // Gửi Email thông báo thanh toán mới tới danh sách email cấu hình
+    try {
+        const recipients = String(s.notify_emails || "").split(/\r?\n/).map(x => x.trim()).filter(Boolean);
+        if (recipients.length > 0 && s.smtp_user && s.smtp_pass) {
+            const amtFmt = Number(matched.amount || 0).toLocaleString("vi-VN") + "đ";
+            await sendGmailSmtp({
+                smtpUser: s.smtp_user,
+                smtpPass: s.smtp_pass,
+                recipients,
+                subject: `[Auto Post] Thanh toán mới +${amtFmt} (${matched.order_code})`,
+                htmlBody: `<div style="font-family:Arial,sans-serif;padding:18px;background:#0f172a;color:#f8fafc;border-radius:10px;max-width:560px;">
+                    <h2 style="color:#34d399;margin-top:0;">💰 Thanh Toán SePay Thành Công!</h2>
+                    <table style="width:100%;border-collapse:collapse;color:#e2e8f0;">
+                        <tr><td style="padding:6px 0;color:#94a3b8;">Mã đơn:</td><td><strong>${matched.order_code}</strong></td></tr>
+                        <tr><td style="padding:6px 0;color:#94a3b8;">Mã máy:</td><td><code>${matched.machine_id}</code></td></tr>
+                        <tr><td style="padding:6px 0;color:#94a3b8;">Số tiền thực nhận:</td><td style="color:#fde047;font-weight:bold;">${amtFmt}</td></tr>
+                        <tr><td style="padding:6px 0;color:#94a3b8;">Voucher áp dụng:</td><td>${matched.voucher_code || "Không có"}</td></tr>
+                        <tr><td style="padding:6px 0;color:#94a3b8;">Cộng thêm:</td><td>+${matched.days_to_add} ngày (Hạn mới: <strong>${newExpiryDisplay}</strong>)</td></tr>
+                        <tr><td style="padding:6px 0;color:#94a3b8;">Mã GD SePay:</td><td>${txId || "--"}</td></tr>
+                    </table>
+                </div>`
+            });
+        }
+    } catch (emailErr) {
+        // Không làm lỗi webhook nếu gửi email thất bại
     }
 
     return jsonResponse({ success: true, message: `Đã gia hạn tự động cho đơn ${matched.order_code}` });
